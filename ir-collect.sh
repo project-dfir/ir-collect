@@ -37,6 +37,7 @@ SKIP_AD=0
 DEFER_MEM=0
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_DIR="$SCRIPT_DIR/tools"
+BIN="$TOOL_DIR/bin"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,6 +63,11 @@ STAMP="$(date -u +%Y%m%d_%H%M%SZ)"
 BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 if [ -d "$TOOL_DIR/bin" ]; then export PATH="$TOOL_DIR/bin:$BASE_PATH"; TRUSTED_BIN=1
 else export PATH="$BASE_PATH"; TRUSTED_BIN=0; fi
+# Require bash 4+ (associative arrays). Re-exec a carried bash if the host bash is too old/absent.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
+  if [ -x "$BIN/bash" ]; then exec "$BIN/bash" "$0" "$@"; fi
+  echo "WARNING: bash 4+ recommended (associative arrays). Carry a static bash in tools/bin." >&2
+fi
 # Neutralize userland-rootkit hooks + non-deterministic locale for our own process.
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT 2>/dev/null
 export LC_ALL=C LANG=C          # deterministic tool output / sorting / decimal separators
@@ -119,7 +125,7 @@ find_tool() {  # find_tool name1 name2 ...
 # so the collector fixes its own kit rather than trusting host binaries.
 repair_toolkit() {
   [ -d "$TOOL_DIR" ] || { echo "Toolkit: no tools/ dir - build it with fetch-tools.sh on a trusted box."; return; }
-  chmod +x "$BIN"/* 2>/dev/null
+  [ -d "$BIN" ] && chmod +x "$BIN"/* 2>/dev/null
   find "$TOOL_DIR" -maxdepth 3 -type f \( -name 'avml' -o -name 'velociraptor*' -o -name 'busybox' -o -name 'CyLR' -o -name 'uac' -o -name 'chainsaw' -o -name 'hayabusa*' \) -exec chmod +x {} \; 2>/dev/null
   for z in "$BIN"/*.zip; do [ -f "$z" ] && { unzip -oq "$z" -d "${z%.zip}" 2>/dev/null && rm -f "$z" && echo "Toolkit: extracted $(basename "$z")"; }; done
   for t in "$BIN"/*.tar.gz; do [ -f "$t" ] && { tar xzf "$t" -C "$BIN" 2>/dev/null && rm -f "$t" && echo "Toolkit: extracted $(basename "$t")"; }; done
@@ -146,6 +152,7 @@ if command -v timeout >/dev/null 2>&1; then
   have_timeout=1
   timeout -k 1 1 true >/dev/null 2>&1 && TMO_K="-k 5"
 fi
+SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid"
 
 run_step() {
   local name="$1" outfile="$2" dir="$3" tmo="$4" retries="$5"; shift 5
@@ -159,17 +166,21 @@ run_step() {
       if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo" "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG"; rc=$?
       else timeout $TMO_K "$tmo" "$@" </dev/null >"$target" 2>>"$ERRLOG"; rc=$?; fi
     else
-      # no `timeout` binary: manual watchdog so a hung command can't block the run
-      if [ "$target" = "/dev/null" ]; then "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG" &
-      else "$@" </dev/null >"$target" 2>>"$ERRLOG" & fi
-      local pid=$!; ( sleep "$tmo"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-      local wd=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$wd" 2>/dev/null
+      # no `timeout` binary: manual watchdog. setsid runs the command in its own process
+      # group so we can kill the WHOLE pipeline (dd|gzip), not just the parent shell.
+      if [ "$target" = "/dev/null" ]; then $SETSID "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG" &
+      else $SETSID "$@" </dev/null >"$target" 2>>"$ERRLOG" & fi
+      local pid=$! kt; kt="$pid"; [ -n "$SETSID" ] && kt="-$pid"
+      ( sleep "$tmo"; kill -TERM "$kt" 2>/dev/null; sleep 5; kill -KILL "$kt" 2>/dev/null ) >/dev/null 2>&1 &
+      local wd=$!
+      wait "$pid" 2>/dev/null; rc=$?
+      kill "$wd" 2>/dev/null; pkill -P "$wd" 2>/dev/null
     fi
     local dur=$(( $(date +%s) - start ))
     if [ "$rc" = "0" ]; then
       audit "STEP $id OK   | $name | ${dur}s | try $attempt${outfile:+ -> $outfile}"
       STEPS_OK=$((STEPS_OK+1)); return 0
-    elif [ "$rc" = "124" ]; then
+    elif [ "$rc" = "124" ] || [ "$rc" = "137" ] || [ "$rc" = "143" ]; then
       audit "STEP $id WARN | $name | TIMEOUT ${tmo}s | try $attempt"
     else
       audit "STEP $id ERR  | $name | rc=$rc | try $attempt"
@@ -246,7 +257,7 @@ rapid_volatile() {
   run_sh   meta-clock       clock_provenance.txt "$D_META" 20 1 'echo "Host local: $(date +%FT%T%z 2>/dev/null || date)"; echo "Host UTC:   $(date -u +%FT%T.%3NZ 2>/dev/null || date -u)"; echo "NOTE: compare to trusted time source; record offset for timeline defensibility."'
   # CRITICAL while live: LUKS/dm-crypt status. A dead-box image of an encrypted disk is unreadable
   # without the key - capture encryption state (and note master keys live in RAM we are imaging).
-  run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; echo "NOTE: LUKS master key is in the RAM image; extract before shutdown."'
+  run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; if lsblk -o FSTYPE,TYPE 2>/dev/null | grep -qiE "crypto_LUKS|(^|[[:space:]])crypt([[:space:]]|$)"; then echo "ENCRYPTED=yes"; else echo "ENCRYPTED=no"; fi; echo "NOTE: if encrypted, the master key is in the RAM image; extract before shutdown."'
 
   # --- RAM IMAGE FIRST (RFC 3227: memory is the most volatile capturable artifact) ---
   if [ "$DEFER_MEM" = "0" ]; then
@@ -359,7 +370,7 @@ job_persistence() {
 }
 job_filehashes() {
   audit "--- HEAVY: full filesystem SHA-256 inventory ---"
-  run_sh hash-all filehashes.csv "$D_ART" 7200 0 'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,$f"; done'
+  run_sh hash-all filehashes.csv "$D_ART" 7200 0 'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,\"$f\""; done'
   DONE[filehashes]=1
 }
 job_ad() {
@@ -387,7 +398,7 @@ job_diskimage() {
   if command -v dd >/dev/null 2>&1; then
     for disk in $(lsblk -dnp -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
       n="$(basename "$disk")"
-      run_sh disk-$n - "$D_DISK" 36000 0 "dd if=$disk conv=noerror,sync bs=4M status=progress 2>>'$AUDIT' | gzip > '$D_DISK/${n}.raw.gz'; sha256sum '$D_DISK/${n}.raw.gz' > '$D_DISK/${n}.sha256'"
+      run_sh disk-$n - "$D_DISK" 36000 0 "set -o pipefail; dd if=$disk conv=noerror,sync bs=4M status=progress 2>>'$AUDIT' | gzip > '$D_DISK/${n}.raw.gz' && sha256sum '$D_DISK/${n}.raw.gz' > '$D_DISK/${n}.sha256'"
     done
   else
     run_sh disk-note DISK_NOT_IMAGED.txt "$D_DISK" 30 0 'echo "dd not found - cannot image."'
@@ -494,7 +505,7 @@ EOF
 SEALED=0
 volatile_green_gate() {
   local vol_files; vol_files=$(find "$D_VOL" "$D_NET" -type f 2>/dev/null | wc -l | tr -d ' ')
-  local enc=0; grep -qiE 'crypt|luks' "$D_META/encryption.txt" 2>/dev/null && enc=1
+  local enc=0; grep -q '^ENCRYPTED=yes' "$D_META/encryption.txt" 2>/dev/null && enc=1
   local memnote; [ "${MEM_OK:-0}" = "1" ] && memnote="RAM: VERIFIED ($((MEM_BYTES/1024/1024)) MB)" || memnote="RAM: NOT verified - capture failed/absent"
   echo
   if [ "$enc" = "1" ] && [ "${MEM_OK:-0}" != "1" ]; then

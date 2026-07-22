@@ -59,7 +59,9 @@ if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSyste
     $sysnative = Join-Path $env:WINDIR 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
     if (Test-Path $sysnative) {
         Write-Host "Relaunching under 64-bit PowerShell (avoids WOW64 redirection)..." -ForegroundColor Yellow
-        & $sysnative -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @args
+        $fwd=@(); foreach($kv in $PSBoundParameters.GetEnumerator()){ if($kv.Key -eq 'Cred'){continue}
+            if($kv.Value -is [switch]){ if($kv.Value.IsPresent){ $fwd+="-$($kv.Key)" } } else { $fwd+="-$($kv.Key)"; $fwd+="$($kv.Value)" } }
+        & $sysnative -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @fwd
         exit $LASTEXITCODE
     }
 }
@@ -189,7 +191,7 @@ function Invoke-Step {
             if (Wait-Job $job -Timeout $TimeoutSec) {
                 $out = Receive-Job $job -ErrorAction SilentlyContinue 2>&1
                 Remove-Job $job -Force -ErrorAction SilentlyContinue
-                if ($target -and $null -ne $out) { try { $out | Out-File -FilePath $target -Encoding UTF8 -Width 4096 } catch {} }
+                if ($target -and $null -ne $out) { try { [IO.File]::WriteAllText($target, (($out | Out-String -Width 4096)), (New-Object Text.UTF8Encoding($false))) } catch { try { $out | Out-File -FilePath $target -Encoding UTF8 -Width 4096 } catch {} } }
                 $dur = [int]((Get-Date) - $start).TotalSeconds
                 $lines = if ($out) { @($out).Count } else { 0 }
                 Write-Audit ("STEP $id OK   | $Name | ${dur}s | try $attempt | lines=$lines" + $(if($target){" -> $(Split-Path $target -Leaf)"}))
@@ -270,7 +272,7 @@ try { $info | ConvertTo-Json | Out-File (Join-Path $Dirs.metadata 'collection_in
 # --- destination preflight: write-test + FAT32 4GB cap -----------------------
 try {
     $tf = Join-Path $OutputRoot ('.irwrite_' + $stamp); Set-Content $tf 'x' -ErrorAction Stop; Remove-Item $tf -Force -ErrorAction SilentlyContinue
-} catch { Write-Audit "PREFLIGHT: destination $OutputRoot NOT writable - $($_.Exception.Message)" }
+} catch { Write-Audit "PREFLIGHT: destination NOT writable - $($_.Exception.Message)"; Write-Host "!!! DESTINATION NOT WRITABLE: $OutputRoot - fix the drive/path; this collection may capture nothing !!!" -ForegroundColor Red }
 try {
     $destRoot = [System.IO.Path]::GetPathRoot((Resolve-Path $OutputRoot).Path)
     $vol = Get-Volume -FilePath $OutputRoot -ErrorAction SilentlyContinue
@@ -292,14 +294,14 @@ function Invoke-RapidVolatile {
     # --- host identity (fast) ---
     Collect 'systeminfo'     { systeminfo } 'systeminfo.txt' $M
     Collect 'os-cim'         { Get-CimInstance Win32_OperatingSystem | Format-List *; Get-CimInstance Win32_ComputerSystem | Format-List * } 'os_computer.txt' $M
-    Collect 'timezone'       { Get-TimeZone | Format-List *; 'UTC now: '+(Now-Utc); 'Local now: '+(Get-Date).ToString('o') } 'timezone.txt' $M
+    Collect 'timezone'       { Get-TimeZone | Format-List *; 'UTC now: '+((Get-Date).ToUniversalTime().ToString('o')); 'Local now: '+(Get-Date).ToString('o') } 'timezone.txt' $M
     Collect 'boot-uptime'    { $os=Get-CimInstance Win32_OperatingSystem; 'LastBoot: '+$os.LastBootUpTime; 'Install: '+$os.InstallDate } 'boot.txt' $M
     Collect 'env'            { Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize } 'environment.txt' $M
     # CRITICAL while live: BitLocker status + recovery keys. If the disk is encrypted and you go
     # dead-box without these, the image is unreadable. Capture protectors/keys NOW.
     Collect 'bitlocker'      { Get-BitLockerVolume 2>$null | Format-List MountPoint,VolumeStatus,ProtectionStatus,EncryptionMethod,EncryptionPercentage,KeyProtector; '=== Recovery key protectors (manage-bde) ==='; foreach($d in (Get-Volume | Where-Object DriveLetter).DriveLetter){ "--- $d`: ---"; manage-bde -protectors -get "$($d):" 2>$null } } 'bitlocker_keys.txt' $M
     # host clock vs collection clock (timeline provenance / skew)
-    Collect 'clock-skew'     { 'Host local time : '+(Get-Date).ToString('o'); 'Host UTC time   : '+(Now-Utc); 'NOTE: compare against a trusted external time source and record offset for timeline defensibility.' } 'clock_provenance.txt' $M
+    Collect 'clock-skew'     { 'Host local time : '+(Get-Date).ToString('o'); 'Host UTC time   : '+((Get-Date).ToUniversalTime().ToString('o')); 'NOTE: compare against a trusted external time source and record offset for timeline defensibility.' } 'clock_provenance.txt' $M
 
     # --- RAM IMAGE FIRST (RFC 3227: memory is the most volatile capturable artifact) ---
     # Every command below perturbs RAM, so image it before the volatile-command battery.
@@ -323,7 +325,7 @@ function Invoke-RapidVolatile {
     Collect 'klist'          { klist; '=== TGT ==='; klist tgt } 'kerberos_tickets.txt' $V
     Collect 'local-users'    { Get-CimInstance Win32_UserAccount -Filter "LocalAccount=true" | Format-Table Name,SID,Disabled,Lockout -AutoSize } 'local_users.txt' $V
     Collect 'local-admins'   { net localgroup Administrators } 'local_admins.txt' $V
-    Collect 'clipboard'      { Get-Clipboard -Raw 2>$null } 'clipboard.txt' $V
+    try { Get-Clipboard -Raw -ErrorAction SilentlyContinue | Set-Content (Join-Path $V 'clipboard.txt') -Encoding UTF8; Write-Audit 'STEP clipboard captured (STA main scope)' } catch { Write-Audit 'clipboard capture failed' }
     if ($TOOL.psloggedon) { Collect 'sys-psloggedon' ([scriptblock]::Create("& '$($TOOL.psloggedon)' -accepteula")) 'psloggedon.txt' $V }
 
     # --- network state (routing/arp/dns before disk) ---
@@ -399,11 +401,11 @@ function Job-Artifacts {
         }
         Invoke-Step 'copy-evtx'     ([scriptblock]::Create("robocopy '$env:WINDIR\System32\winevt\Logs' '$A\evtx' *.evtx /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 900 -Retries 0 | Out-Null
         Invoke-Step 'copy-prefetch' ([scriptblock]::Create("robocopy '$env:WINDIR\Prefetch' '$A\prefetch' *.pf /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 600 -Retries 0 | Out-Null
-        Collect 'amcache-copy' { Copy-Item "$env:WINDIR\AppCompat\Programs\Amcache.hve" "$A\Amcache.hve" -Force 2>$null; 'copied if present' } 'amcache_note.txt' $A
+        Collect 'amcache-copy' ([scriptblock]::Create("Copy-Item '$env:WINDIR\AppCompat\Programs\Amcache.hve' '$A\Amcache.hve' -Force -ErrorAction SilentlyContinue; 'copied if present'")) 'amcache_note.txt' $A
         # per-user hives (UserAssist/ShellBags/RunMRU/TypedPaths...) + PowerShell history + USB history
         Invoke-Step 'copy-userhives' ([scriptblock]::Create("robocopy 'C:\Users' '$A\userhives' NTUSER.DAT UsrClass.dat /S /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 600 -Retries 0 | Out-Null
         Invoke-Step 'copy-pshistory' ([scriptblock]::Create("robocopy 'C:\Users' '$A\ps_history' ConsoleHost_history.txt /S /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 300 -Retries 0 | Out-Null
-        Collect 'usb-history' { Copy-Item "$env:WINDIR\INF\setupapi.dev.log" "$A\setupapi.dev.log" -Force 2>$null; '=== USBSTOR (also in SYSTEM hive) ==='; Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*' 2>$null | Select-Object FriendlyName,PSChildName | Format-Table -AutoSize } 'usb_devices.txt' $A
+        Collect 'usb-history' ([scriptblock]::Create("Copy-Item '$env:WINDIR\INF\setupapi.dev.log' '$A\setupapi.dev.log' -Force -ErrorAction SilentlyContinue; '=== USBSTOR (also in SYSTEM hive) ==='; Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*' -ErrorAction SilentlyContinue | Select-Object FriendlyName,PSChildName | Format-Table -AutoSize")) 'usb_devices.txt' $A
         Collect 'ps-transcript-note' { 'Note: full NTFS metadata ($MFT/$UsnJrnl/$LogFile), SRUM, and locked per-user hives are best captured by the Velociraptor/CyLR triage path (uses VSS/raw). This native fallback is best-effort.' } '_TRIAGE_LIMITATIONS.txt' $A
     }
     $script:Done['artifacts']=$true
@@ -571,13 +573,6 @@ function Invoke-Menu {
 # ===========================================================================
 function Invoke-Seal {
     Write-Audit "--- SEAL: manifest + report ---"; $L=$Dirs.logs
-    Invoke-Step 'manifest-sha256' ([scriptblock]::Create(@"
-Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
-  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256|audit\.log' } |
-  ForEach-Object { try { `$h=(Get-FileHash `$_.FullName -Algorithm SHA256).Hash } catch { `$h='ERR' }
-    '{0},{1},{2}' -f `$h, `$_.Length, `$_.FullName.Replace('$($OutDir.Replace("\","\\"))','') }
-"@)) 'MANIFEST-SHA256.csv' $L -TimeoutSec 1800 | Out-Null
-
     $endUtc=Now-Utc
     $doneList=($script:Done.GetEnumerator()|Where-Object{$_.Value}|ForEach-Object{$_.Key}) -join ', '
     $summary=@"
@@ -598,11 +593,19 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
     try { $summary | Out-File (Join-Path $OutDir 'SUMMARY.md') -Encoding UTF8 } catch {}
     try { $info.endUtc=$endUtc; $info.stepsOk=$script:StepsOk; $info.stepsFail=$script:StepsFail; $info.stepsTotal=$script:StepNum; $info.heavyJobs=$doneList
           $info | ConvertTo-Json | Out-File (Join-Path $Dirs.metadata 'collection_info.json') -Encoding UTF8 } catch {}
+    # manifest LAST so it covers SUMMARY.md + final collection_info.json (fixed literal path strip)
+    Invoke-Step 'manifest-sha256' ([scriptblock]::Create(@"
+Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
+  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256|audit\.log' } |
+  ForEach-Object { try { `$h=(Get-FileHash `$_.FullName -Algorithm SHA256).Hash } catch { `$h='ERR' }
+    '{0},{1},{2}' -f `$h, `$_.Length, `$_.FullName.Replace('$OutDir','') }
+"@)) 'MANIFEST-SHA256.csv' $L -TimeoutSec 1800 | Out-Null
+
     # --- ship to network destination if requested ---
     if ($NetworkDest) {
         Write-Audit "Shipping evidence to network destination $NetworkDest"
         $zip = "$OutDir.zip"
-        Invoke-Step 'seal-zip' ([scriptblock]::Create("Compress-Archive -Path '$OutDir\*' -DestinationPath '$zip' -Force")) $null $Dirs.logs -TimeoutSec 3600 -Retries 0 | Out-Null
+        Invoke-Step 'seal-zip' ([scriptblock]::Create("Add-Type -AssemblyName System.IO.Compression.FileSystem; if(Test-Path '$zip'){Remove-Item '$zip' -Force}; [System.IO.Compression.ZipFile]::CreateFromDirectory('$OutDir','$zip')")) $null $Dirs.logs -TimeoutSec 3600 -Retries 0 | Out-Null
         try { (Get-FileHash $zip -Algorithm SHA256).Hash | Out-File "$zip.sha256" -Encoding ASCII } catch {}
         # map the share (with creds if provided), copy, unmap
         try {

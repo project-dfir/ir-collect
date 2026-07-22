@@ -46,6 +46,7 @@ function Get-Tool {
     param([string]$Label,[string]$Repo,[string]$Pattern,[switch]$Unzip)
     Write-Host ("--- {0} ({1}) ---" -f $Label,$Repo) -ForegroundColor Cyan
     try {
+        $dest = $null
         $a = Get-LatestAsset -Repo $Repo -Pattern $Pattern
         $dest = Join-Path $ToolDir $a.Name
         Invoke-WebRequest -Uri $a.Url -OutFile $dest -Headers @{ 'User-Agent'='ir-collect' } -TimeoutSec 300
@@ -56,6 +57,7 @@ function Get-Tool {
             try { Expand-Archive -Path $dest -DestinationPath $ex -Force; Remove-Item $dest -Force; Log ("    extracted -> $Label\") } catch { Log "    unzip failed: $($_.Exception.Message)" }
         }
     } catch {
+        if ($dest -and (Test-Path $dest)) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }  # drop partial download
         Log ("ERR {0,-14} {1} : {2}" -f $Label,$Repo,$_.Exception.Message)
         Write-Host "  skipped (continuing)" -ForegroundColor Yellow
     }
@@ -71,7 +73,7 @@ Get-Tool -Label 'CyLR'        -Repo 'orlikoski/CyLR'           -Pattern 'win.*(x
 # --- Active Directory attack paths ---
 Get-Tool -Label 'SharpHound'  -Repo 'SpecterOps/SharpHound'    -Pattern 'SharpHound.*\.zip$' -Unzip
 # --- event-log / evtx hunting (open source) ---
-Get-Tool -Label 'chainsaw'    -Repo 'WithSecureLabs/chainsaw'  -Pattern 'chainsaw.*windows.*\.zip$' -Unzip
+Get-Tool -Label 'chainsaw'    -Repo 'WithSecureLabs/chainsaw'  -Pattern 'chainsaw.*x86_64.*windows.*\.zip$' -Unzip
 Get-Tool -Label 'hayabusa'    -Repo 'Yamato-Security/hayabusa' -Pattern 'win-x64.*\.zip$' -Unzip
 
 # Eric Zimmerman tools (MIT, open source) - use the official downloader

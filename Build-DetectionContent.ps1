@@ -53,6 +53,7 @@ function Add-IOC {
     $Value = $Value.Trim()
     $k = "$Type|$Value"
     if (-not $IOC.ContainsKey($k)) { $IOC[$k] = [ordered]@{ type=$Type; value=$Value; source=$Source; host=$Hn } }
+    elseif (($IOC[$k].host -split ';') -notcontains $Hn) { $IOC[$k].host = "$($IOC[$k].host);$Hn" }
 }
 
 # public-IP test (exclude RFC1918 / loopback / link-local / multicast / broadcast)
@@ -65,11 +66,12 @@ function Test-PublicIP {
     if ($o[0] -eq 192 -and $o[1] -eq 168) { return $false }
     if ($o[0] -eq 127 -or $o[0] -eq 0 -or $o[0] -ge 224) { return $false }
     if ($o[0] -eq 169 -and $o[1] -eq 254) { return $false }
+    if ($o[0] -eq 100 -and $o[1] -ge 64 -and $o[1] -le 127) { return $false }
     if ($ip -eq '255.255.255.255') { return $false }
     return $true
 }
 
-$ipRe   = '((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)'
+$ipRe   = '(?<![\d.])((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])'
 $domRe  = '(?i)\b([a-z0-9](-?[a-z0-9])*\.)+[a-z]{2,}\b'
 $hashRe = '\b([a-fA-F0-9]{64}|[a-fA-F0-9]{40}|[a-fA-F0-9]{32})\b'
 $suspDirRe = '(?i)(\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Windows\\Temp\\|/tmp/|/dev/shm/|/var/tmp/)'
@@ -95,6 +97,7 @@ foreach ($f in $folders) {
             # Coarse first pass - the follow-on team enriches (VT/GreyNoise/prevalence) before arming.
             if ($d -match '\.(local|arpa|lan|internal|corp|home)$') { continue }
             if ($d -match '(^|\.)(microsoft|windows|windowsupdate|msftconnecttest|msftncsi|office365|office|live|azure|azureedge|msedge|bing|skype|xboxlive|apple|icloud|mzstatic|google|googleapis|gstatic|gvt1|gvt2|youtube|akamai|akamaiedge|akamaized|cloudflare|cloudfront|fastly|amazonaws|digicert|verisign|globalsign|sectigo|ocsp|mozilla|ubuntu|debian|canonical|entrust)\.[a-z.]+$') { continue }
+            if ($d -match '\.(exe|dll|dat|ini|log|tmp|sys|bat|ps1|txt|csv|xml|json|lnk|pf|evtx)$') { continue }
             Add-IOC 'domain' $d $rel $hostn
         }
     }
@@ -103,7 +106,7 @@ foreach ($f in $folders) {
         $txt = Read-Src $rel
         foreach ($line in ($txt -split "`n")) {
             if ($line -match $suspDirRe) {
-                foreach ($pm in [regex]::Matches($line, '(?i)[a-z]:\\[^,"\r\n]+\.(exe|dll|ps1|bat|scr|vbs)')) { Add-IOC 'file-path' $pm.Value $rel $hostn }
+                foreach ($pm in [regex]::Matches($line, '(?i)[a-z]:\\[^,"\r\n ]+\.(exe|dll|ps1|bat|scr|vbs)')) { Add-IOC 'file-path' $pm.Value $rel $hostn }
                 foreach ($pm in [regex]::Matches($line, '(?i)/(tmp|dev/shm|var/tmp)/[^\s,"]+')) { Add-IOC 'file-path' $pm.Value $rel $hostn }
             }
             foreach ($hm in [regex]::Matches($line, $hashRe)) { Add-IOC 'hash' $hm.Value $rel $hostn }
@@ -130,7 +133,7 @@ foreach ($i in $all) {
     $pat = switch ($i.type) {
         'ipv4-c2'  { "[network-traffic:dst_ref.type = 'ipv4-addr' AND network-traffic:dst_ref.value = '$($i.value)']" }
         'domain'   { "[domain-name:value = '$($i.value)']" }
-        'hash'     { "[file:hashes.'SHA-256' = '$($i.value)']" }
+        'hash'     { $alg = if($i.value.Length -eq 40){'SHA-1'}elseif($i.value.Length -eq 32){'MD5'}else{'SHA-256'}; "[file:hashes.'$alg' = '$($i.value)']" }
         'file-path'{ "[file:name = '$(( $i.value -split '[\\/]')[-1])']" }
         default    { $null }
     }
@@ -188,36 +191,36 @@ action.notable.param.severity = high
 cron_schedule = */10 * * * *
 description = Endpoint contacted an IP captured from a compromised host during IR triage.
 "@
-$corr | Out-File (Join-Path $OutDir 'splunk\savedsearches.conf') -Encoding UTF8
+if ($ips.Count) { $corr | Out-File (Join-Path $OutDir 'splunk\savedsearches.conf') -Encoding UTF8 } else { '# no external IPs captured - no correlation search generated' | Out-File (Join-Path $OutDir 'splunk\savedsearches.conf') -Encoding UTF8 }
 
 # ---------------------------------------------------------------------------
 # 3. Sigma rules (vendor-neutral -> convert to Splunk or Sec Onion with pySigma)
 # ---------------------------------------------------------------------------
 if ($ips.Count -or $domains.Count) {
-@"
+    $det=@(); $cond=@()
+    if ($ips.Count) { $det += '  selection_ip:'; $det += '    DestinationIp:'; $ips | ForEach-Object { $det += "      - $_" }; $cond += 'selection_ip' }
+    if ($domains.Count) { $det += '  selection_dns:'; $det += '    query:'; $domains | ForEach-Object { $det += "      - $_" }; $cond += 'selection_dns' }
+    $y = @"
 title: IR-Collect C2 network indicators
 id: $([guid]::NewGuid())
 status: experimental
 description: Network indicators captured from compromised host(s) during IR triage.
-references:
-  - IR-Collect triage collection
 logsource:
   category: network_connection
 detection:
-  selection_ip:
-    DestinationIp:
-$(($ips | ForEach-Object { "      - $_" }) -join "`n")
-  selection_dns:
-    query:
-$(($domains | ForEach-Object { "      - $_" }) -join "`n")
-  condition: selection_ip or selection_dns
+$($det -join "`n")
+  condition: $($cond -join ' or ')
 level: high
 tags:
   - attack.command_and_control
-"@ | Out-File (Join-Path $OutDir 'sigma\c2_network_indicators.yml') -Encoding UTF8
+"@
+    [IO.File]::WriteAllText((Join-Path $OutDir 'sigma\c2_network_indicators.yml'), $y, (New-Object Text.UTF8Encoding($false)))
 }
 if ($hashes.Count -or $paths.Count) {
-@"
+    $det=@(); $cond=@()
+    if ($hashes.Count) { $det += '  selection_hash:'; $det += '    Hashes|contains:'; $hashes | ForEach-Object { $det += "      - $_" }; $cond += 'selection_hash' }
+    if ($paths.Count) { $det += '  selection_image:'; $det += '    Image|endswith:'; ($paths | ForEach-Object { ($_ -split '[\/]')[-1] } | Select-Object -Unique) | ForEach-Object { $det += "      - $_" }; $cond += 'selection_image' }
+    $y = @"
 title: IR-Collect malicious process indicators
 id: $([guid]::NewGuid())
 status: experimental
@@ -225,17 +228,13 @@ description: Process/file indicators captured from compromised host(s) during IR
 logsource:
   category: process_creation
 detection:
-  selection_hash:
-    Hashes|contains:
-$(($hashes | ForEach-Object { "      - $_" }) -join "`n")
-  selection_image:
-    Image|endswith:
-$(($paths | ForEach-Object { "      - $(($_ -split '[\\/]')[-1])" } | Select-Object -Unique) -join "`n")
-  condition: selection_hash or selection_image
+$($det -join "`n")
+  condition: $($cond -join ' or ')
 level: high
 tags:
   - attack.execution
-"@ | Out-File (Join-Path $OutDir 'sigma\malicious_process_indicators.yml') -Encoding UTF8
+"@
+    [IO.File]::WriteAllText((Join-Path $OutDir 'sigma\malicious_process_indicators.yml'), $y, (New-Object Text.UTF8Encoding($false)))
 }
 
 # ---------------------------------------------------------------------------
@@ -252,7 +251,7 @@ foreach ($d in $domains) {
     [void]$sur.AppendLine("alert dns `$HOME_NET any -> any any (msg:`"IR-Collect C2 domain $d`"; dns.query; content:`"$d`"; nocase; classtype:trojan-activity; sid:$sid; rev:1; metadata:source ir-collect;)")
     $sid++
 }
-$sur.ToString() | Out-File (Join-Path $OutDir 'suricata\local.rules') -Encoding UTF8
+[IO.File]::WriteAllText((Join-Path $OutDir 'suricata\local.rules'), $sur.ToString(), (New-Object Text.UTF8Encoding($false)))
 
 # ---------------------------------------------------------------------------
 # 5. Zeek Intelligence Framework feed (Security Onion)
@@ -261,8 +260,8 @@ $zeek = New-Object System.Text.StringBuilder
 [void]$zeek.AppendLine("#fields`tindicator`tindicator_type`tmeta.source`tmeta.desc")
 foreach ($ip in $ips)     { [void]$zeek.AppendLine("$ip`tIntel::ADDR`tIR-Collect`tC2 IP from IR triage") }
 foreach ($d in $domains)  { [void]$zeek.AppendLine("$d`tIntel::DOMAIN`tIR-Collect`tC2 domain from IR triage") }
-foreach ($h in $hashes)   { [void]$zeek.AppendLine("$h`tIntel::FILE_HASH`tIR-Collect`tfile hash from IR triage") }
-$zeek.ToString() | Out-File (Join-Path $OutDir 'zeek\ircollect.intel') -Encoding UTF8
+foreach ($h in $hashes)   { $alg = if($h.Length -eq 40){'sha1'}elseif($h.Length -eq 32){'md5'}else{'sha256'}; [void]$zeek.AppendLine("$h`tIntel::FILE_HASH`tIR-Collect`t$alg hash from IR triage (Zeek matches its computed algo)") }
+[IO.File]::WriteAllText((Join-Path $OutDir 'zeek\ircollect.intel'), $zeek.ToString(), (New-Object Text.UTF8Encoding($false)))
 
 # ---------------------------------------------------------------------------
 # HANDOFF.md for the follow-on team

@@ -26,3 +26,6 @@ audit.log
 .DS_Store
 Thumbs.db
 *.swp
+
+# local Claude settings (not committed)
+.claude/

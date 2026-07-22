@@ -43,10 +43,12 @@ gh_asset() { # gh_asset <label> <repo> <pattern> <dest_basename> [chmod]
     [ "$doexec" = "x" ] && chmod +x "$out"
     log "OK  $(printf '%-14s' "$label") $(sha256sum "$out" | cut -c1-16)  $url"
   else
+    rm -f "$out" 2>/dev/null   # drop partial download
     log "ERR $label: download failed $url"
   fi
 }
 
+command -v unzip >/dev/null 2>&1 || echo "WARNING: unzip not found - zip tools (CyLR/hayabusa) will not extract. Install unzip." >&2
 echo "Assembling IR-Collect open-source payload into $BIN"
 
 # --- static busybox: our trusted core userland (ps/ss/ls/find/cat/netstat...) ---
