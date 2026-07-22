@@ -1,0 +1,28 @@
+# --- Downloaded tool payload (fetched by fetch-tools.*, NOT committed) ---
+# Third-party binaries are not redistributed here; build the kit with fetch-tools.
+tools/**
+!tools/README.md
+!tools/.gitkeep
+
+# --- Collection output / evidence (never commit real evidence) ---
+_staging/
+_detection/
+*_evidence/
+**/00_metadata/
+**/99_logs/
+*.raw
+*.lime
+*.mem
+*.dmp
+*.aff4
+*.E01
+*.zip
+*.tar.gz
+MANIFEST-SHA256*
+PROVENANCE-*.txt
+audit.log
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
