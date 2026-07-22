@@ -85,8 +85,14 @@ if (Test-IsIP $Dest)            { $NetworkDest = "\\$Dest\$Share" }
 elseif ($Dest -like '\\*')      { $NetworkDest = $Dest }
 
 if ($NetworkDest) {
-    $OutputRoot = Join-Path $PSScriptRoot '_staging'   # collect locally first
-    try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch { $OutputRoot = $env:TEMP }
+    $OutputRoot = Join-Path $PSScriptRoot '_staging'   # collect locally first (on the collection media, NOT the target)
+    try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {
+        # last resort only: staging on the TARGET's own disk contaminates the subject - never do it silently
+        $OutputRoot = Join-Path $env:TEMP '_ir_staging'
+        try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {}
+        Write-Host "!!! CONTAMINATION WARNING: cannot stage on the collection media - falling back to the TARGET disk ($OutputRoot)." -ForegroundColor Red
+        Write-Host "    This writes evidence onto the subject host. Attach writable removable media and re-run if at all possible. !!!" -ForegroundColor Red
+    }
 } else {
     $OutputRoot = $Dest
 }
@@ -178,7 +184,8 @@ function Invoke-Step {
         [string]$OutFile,
         [string]$Dir = $Dirs.volatile,
         [int]$TimeoutSec = $StepTimeoutSec,
-        [int]$Retries = 1
+        [int]$Retries = 1,
+        [string[]]$KillOnTimeout = @()
     )
     $script:StepNum++
     $id = '{0:000}' -f $script:StepNum
@@ -198,6 +205,9 @@ function Invoke-Step {
                 $script:StepsOk++; return $out
             } else {
                 Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue
+                # Start-Job cannot kill the NATIVE grandchild (e.g. winpmem) it launched; do it by name
+                # so a hung imager stops appending to its file before the size/stability verify runs.
+                foreach($pn in $KillOnTimeout){ try { Get-Process -Name $pn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {} }
                 Write-Audit "STEP $id WARN | $Name | TIMEOUT ${TimeoutSec}s | try $attempt"
                 if ($attempt -gt $Retries) { Add-Content $ErrLog "$(Now-Utc) [$id] $Name : timeout ${TimeoutSec}s"; $script:StepsFail++; return $null }
             }
@@ -267,7 +277,8 @@ $info = [ordered]@{
     authorizer=$Authorizer; legalBasis=$LegalBasis; scope=$ScopeNote
 }
 if (-not $Authorizer) { Write-Audit "CUSTODY WARNING: no -Authorizer recorded. Pass -Authorizer/-LegalBasis/-ScopeNote for a defensible chain of custody." }
-try { $info | ConvertTo-Json | Out-File (Join-Path $Dirs.metadata 'collection_info.json') -Encoding UTF8 } catch {}
+try { [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
+try { if (-not (Test-Path (Join-Path $Dirs.metadata 'intake.json'))) { $di=[ordered]@{ case_id=$CaseId; scenario='U'; scenario_name='Unknown / broad triage'; host_role='unknown'; scope='single'; connectivity='connected'; generated_by='IR-Collect.ps1 (non-guided)'; known_bad_ips=@(); known_bad_domains=@(); known_bad_hashes=@(); known_bad_accounts=@(); known_bad_paths=@(); attack_tags=@() }; [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($di | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } } catch {}
 
 # --- destination preflight: write-test + FAT32 4GB cap -----------------------
 try {
@@ -298,12 +309,8 @@ function Invoke-RapidVolatile {
     Write-Audit "===== STAGE 1: rapid volatile grab ====="
     $M=$Dirs.metadata; $V=$Dirs.volatile; $N=$Dirs.network
 
-    # --- host identity (fast) ---
-    Collect 'systeminfo'     { systeminfo } 'systeminfo.txt' $M
-    Collect 'os-cim'         { Get-CimInstance Win32_OperatingSystem | Format-List *; Get-CimInstance Win32_ComputerSystem | Format-List * } 'os_computer.txt' $M
-    Collect 'timezone'       { Get-TimeZone | Format-List *; 'UTC now: '+((Get-Date).ToUniversalTime().ToString('o')); 'Local now: '+(Get-Date).ToString('o') } 'timezone.txt' $M
-    Collect 'boot-uptime'    { $os=Get-CimInstance Win32_OperatingSystem; 'LastBoot: '+$os.LastBootUpTime; 'Install: '+$os.InstallDate } 'boot.txt' $M
-    Collect 'env'            { Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize } 'environment.txt' $M
+    # --- pre-image essentials ONLY: encryption keys + clock. Everything else perturbs RAM, so the
+    #     identity battery (systeminfo/os/tz/boot/env) runs AFTER the memory image below (RFC 3227). ---
     # CRITICAL while live: BitLocker status + recovery keys. If the disk is encrypted and you go
     # dead-box without these, the image is unreadable. Capture protectors/keys NOW.
     Collect 'bitlocker'      { Get-BitLockerVolume 2>$null | Format-List MountPoint,VolumeStatus,ProtectionStatus,EncryptionMethod,EncryptionPercentage,KeyProtector; '=== Recovery key protectors (manage-bde) ==='; foreach($d in (Get-Volume | Where-Object DriveLetter).DriveLetter){ "--- $d`: ---"; manage-bde -protectors -get "$($d):" 2>$null } } 'bitlocker_keys.txt' $M
@@ -316,6 +323,13 @@ function Invoke-RapidVolatile {
         Write-Host "Capturing physical memory first (order of volatility)..." -ForegroundColor Cyan
         Job-Memory
     } else { Write-Audit "DeferMemory set - RAM will be captured after volatile commands." }
+
+    # --- host identity (post-image: safe now that the most-volatile artifact is secured) ---
+    Collect 'systeminfo'     { systeminfo } 'systeminfo.txt' $M
+    Collect 'os-cim'         { Get-CimInstance Win32_OperatingSystem | Format-List *; Get-CimInstance Win32_ComputerSystem | Format-List * } 'os_computer.txt' $M
+    Collect 'timezone'       { Get-TimeZone | Format-List *; 'UTC now: '+((Get-Date).ToUniversalTime().ToString('o')); 'Local now: '+(Get-Date).ToString('o') } 'timezone.txt' $M
+    Collect 'boot-uptime'    { $os=Get-CimInstance Win32_OperatingSystem; 'LastBoot: '+$os.LastBootUpTime; 'Install: '+$os.InstallDate } 'boot.txt' $M
+    Collect 'env'            { Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize } 'environment.txt' $M
 
     # --- processes (most volatile after memory) ---
     Collect 'processes'      { Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | Sort-Object ProcessId | Format-Table -AutoSize -Wrap } 'processes.txt' $V
@@ -368,25 +382,37 @@ function Job-Memory {
     $ram = try { (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
     if (-not (Test-Space $D ($ram*1.1) 'RAM-image')) { Collect 'mem-skip-space' { 'RAM image skipped: insufficient destination free space.' } 'RAM_SKIPPED_NO_SPACE.txt' $D; $script:Done['memory']=$true; return }
     $img = Join-Path $D 'memory.raw'
-    if     ($TOOL.winpmem) { $wp=$TOOL.winpmem; Invoke-Step 'mem-winpmem' ([scriptblock]::Create("& '$wp' acquire '$img' 2>&1; if(-not (Test-Path '$img')){ & '$wp' '$img' 2>&1 }")) $null $D -TimeoutSec 3600 -Retries 0 | Out-Null }
-    elseif ($TOOL.dumpit)  { Invoke-Step 'mem-dumpit'  ([scriptblock]::Create("& '$($TOOL.dumpit)' /OUTPUT '$($D)\memory.dmp' /QUIET")) $null $D -TimeoutSec 3600 -Retries 0 | Out-Null }
-    elseif ($TOOL.magnetram){Invoke-Step 'mem-magnet'  ([scriptblock]::Create("& '$($TOOL.magnetram)' /accepteula /go '$D'")) $null $D -TimeoutSec 3600 -Retries 0 | Out-Null }
+    if     ($TOOL.winpmem) { $wp=$TOOL.winpmem; Invoke-Step 'mem-winpmem' ([scriptblock]::Create("& '$wp' acquire '$img' 2>&1; if(-not (Test-Path '$img')){ & '$wp' '$img' 2>&1 }")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($wp)) | Out-Null }
+    elseif ($TOOL.dumpit)  { Invoke-Step 'mem-dumpit'  ([scriptblock]::Create("& '$($TOOL.dumpit)' /OUTPUT '$($D)\memory.dmp' /QUIET")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($TOOL.dumpit)) | Out-Null }
+    elseif ($TOOL.magnetram){Invoke-Step 'mem-magnet'  ([scriptblock]::Create("& '$($TOOL.magnetram)' /accepteula /go '$D'")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($TOOL.magnetram)) | Out-Null }
     else { Write-Audit "RAM: no memory tool found (place winpmem.exe/DumpIt.exe in .\tools). Capturing pagefile-config + hiberfil note only."
            Collect 'mem-fallback' { 'No native full-RAM capture. Recommended: WinPmem or DumpIt.'; Get-CimInstance Win32_PageFileUsage | Format-List * } 'RAM_NOT_CAPTURED.txt' $D }
     # verify a REAL image was produced. Classic silent failure: driver blocked by Secure Boot/HVCI/EDR
     # writes a tiny error file, mem-hash dutifully hashes it, and the collection seals GREEN with no RAM.
-    $script:MemBytes = 0
-    try { $script:MemBytes = [int64]((Get-ChildItem $D -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.raw','.dmp','.aff4','.lime','.mem' } | Measure-Object Length -Sum).Sum) } catch {}
-    $need = try { [int64]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory * 0.4) } catch { 500MB }
-    if ($script:MemBytes -ge $need) {
+    $imgFile = try { Get-ChildItem $D -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.raw','.dmp','.aff4','.lime','.mem','.zip' } | Sort-Object Length -Descending | Select-Object -First 1 } catch { $null }
+    $script:MemBytes = if ($imgFile) { [int64]$imgFile.Length } else { 0 }
+    $totalRam = try { [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
+    # stability + lock check: a hung imager (orphaned past the job timeout) leaves a growing/locked partial.
+    $stable = $false; $locked = $false
+    if ($imgFile) {
+        $s1 = $imgFile.Length; Start-Sleep -Seconds 3
+        try { $s2 = (Get-Item $imgFile.FullName -ErrorAction Stop).Length } catch { $s2 = $s1 }
+        $stable = ($s1 -eq $s2)
+        try { $fsx=[IO.File]::Open($imgFile.FullName,'Open','Read','None'); $fsx.Close() } catch { $locked = $true }
+    }
+    # threshold is FORMAT-AWARE: a compressed AFF4/zip is legitimately far smaller than raw RAM.
+    $compressed = $imgFile -and ($imgFile.Extension -in '.aff4','.zip')
+    $need = if ($compressed) { [int64][math]::Max(200MB, $totalRam*0.05) } else { [int64]($totalRam*0.4) }
+    if ($script:MemBytes -ge $need -and $stable -and -not $locked) {
         $script:MemOk = $true
-        Write-Audit ("RAM VERIFIED: {0:N1} GB image written (>= 40% of physical RAM)." -f ($script:MemBytes/1GB))
+        Write-Audit ("RAM VERIFIED: {0:N1} GB {1} image, stable + not locked (threshold {2:N1} GB)." -f ($script:MemBytes/1GB), $(if($compressed){'compressed'}else{'raw'}), ($need/1GB))
         # post-acquisition verify: re-read + hash (SHA-256 + MD5) so a truncated image can't seal silently
         Invoke-Step 'mem-hash-verify' ([scriptblock]::Create("Get-ChildItem '$D' -File | Where-Object { `$_.Length -gt 1MB } | ForEach-Object { 'SHA256 ' + (Get-FileHash `$_.FullName -Algorithm SHA256).Hash + '  ' + `$_.Name; 'MD5    ' + (Get-FileHash `$_.FullName -Algorithm MD5).Hash + '  ' + `$_.Name }")) 'memory_hashes.txt' $D -TimeoutSec 1800 | Out-Null
     } else {
         $script:MemOk = $false
-        Write-Audit ("RAM WARNING: only {0:N1} MB produced - capture likely FAILED (Secure Boot/HVCI/EDR blocked the driver, or no imager). *** Do NOT power off an encrypted host without a recovery key - the FVEK is only in RAM. ***" -f ($script:MemBytes/1MB))
-        Collect 'mem-fail-warning' { 'RAM CAPTURE FAILED OR INCOMPLETE. Causes: Secure Boot / HVCI / VBS blocking the kernel driver, EDR quarantine, or no imager present. If the disk is encrypted, DO NOT power off without a recovery key.' } 'RAM_CAPTURE_FAILED.txt' $D
+        $why = if ($locked) { 'imager still holds the file (hung/incomplete)' } elseif (-not $stable) { 'file still growing (imager not finished)' } elseif ($imgFile) { 'image too small for its format' } else { 'no image produced' }
+        Write-Audit ("RAM WARNING: {0:N1} MB - capture NOT verified ({1}). Secure Boot/HVCI/EDR may have blocked the driver. *** Do NOT power off an encrypted host without a recovery key - the FVEK is only in RAM. ***" -f ($script:MemBytes/1MB), $why)
+        Collect 'mem-fail-warning' ([scriptblock]::Create("'RAM CAPTURE NOT VERIFIED: $why. Causes: Secure Boot/HVCI/VBS blocking the driver, EDR quarantine, hung imager, or no imager. If the disk is encrypted, DO NOT power off without a recovery key.'")) 'RAM_CAPTURE_FAILED.txt' $D
     }
     $script:Done['memory']=$true
 }
@@ -445,6 +471,7 @@ function Job-Persistence {
 
 function Job-FileHashes {
     Write-Audit "--- HEAVY: full filesystem hash inventory ---"; $A=$Dirs.artifacts
+    if ($script:DoNoHarm) { Write-Audit 'filehashes skipped (do-no-harm / OT-ICS mode)'; Collect 'hash-skip-ot' { 'Skipped: do-no-harm (OT/ICS) mode - a full live-filesystem hash walk is too intrusive for control systems.' } 'FILEHASH_SKIPPED_OT.txt' $A; $script:Done['filehashes']=$true; return }
     foreach ($drv in (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3').DeviceID) {
         Invoke-Step "hash-$drv" ([scriptblock]::Create(@"
 Get-ChildItem '$drv\' -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -524,6 +551,7 @@ if(`$g -and `$g.Count -gt 0){ `$dn=`$g[0].Properties.distinguishedname[0]
 
 function Job-DiskImage {
     Write-Audit "--- HEAVY: full disk image ---"; $D=$Dirs.disk
+    if ($script:DoNoHarm) { Write-Audit 'disk image skipped (do-no-harm / OT-ICS mode)'; Collect 'disk-skip-ot' { 'Skipped: do-no-harm (OT/ICS) mode - live disk imaging risks control-system availability.' } 'DISK_SKIPPED_OT.txt' $D; $script:Done['diskimage']=$true; return }
     if ($TOOL.ftkimager) {
         foreach($pd in (Get-CimInstance Win32_DiskDrive | Select-Object -ExpandProperty DeviceID)) {
             $n=($pd -replace '[\\\.]','_'); Invoke-Step "disk-$n" ([scriptblock]::Create("& '$($TOOL.ftkimager)' '$pd' '$D\$n' --e01 --frag 2G --verify")) $null $D -TimeoutSec 36000 -Retries 0 | Out-Null }
@@ -534,18 +562,39 @@ function Job-DiskImage {
     $script:Done['diskimage']=$true
 }
 
+function Job-VSS {
+    Write-Audit "--- HEAVY: Volume Shadow Copy state (ransomware anti-recovery evidence) ---"; $P=$Dirs.persistence
+    Collect 'vss-list' { '=== vssadmin list shadows ==='; vssadmin list shadows 2>&1; '=== Win32_ShadowCopy ==='; Get-CimInstance Win32_ShadowCopy 2>$null | Select-Object ID,InstallDate,VolumeName,DeviceObject | Format-List *; '=== vssadmin list shadowstorage ==='; vssadmin list shadowstorage 2>&1 } 'shadow_copies.txt' $P -Timeout 180
+    # T1490 inhibit-recovery: evidence that shadows/backups were (or can be) deleted
+    Collect 'vss-recovery-config' { '=== bcdedit (recoveryenabled flags) ==='; bcdedit /enum 2>&1; '=== wbadmin catalog ==='; wbadmin get versions 2>&1 } 'recovery_config.txt' $P -Timeout 120
+    $script:Done['vss']=$true
+}
+function Job-WebLogs {
+    Write-Audit "--- HEAVY: web-server logs + webroot timeline (webshell hunt) ---"; $A=$Dirs.artifacts; $w=Join-Path $A 'webserver'; try{New-Item -ItemType Directory -Force $w|Out-Null}catch{}
+    Invoke-Step 'web-iis-logs'   ([scriptblock]::Create("robocopy '$env:SystemDrive\inetpub\logs\LogFiles' '$w\iis_logs' /S /R:1 /W:1 /NFL /NDL /NP")) $null $w -TimeoutSec 900 -Retries 0 | Out-Null
+    Invoke-Step 'web-iis-config' ([scriptblock]::Create("Copy-Item '$env:WINDIR\System32\inetsrv\config\applicationHost.config' '$w\applicationHost.config' -Force -ErrorAction SilentlyContinue; 'copied applicationHost.config if present'")) 'iis_config_note.txt' $w -TimeoutSec 60 | Out-Null
+    # webroot recent-file timeline: dropped .aspx/.asp/.php/.jsp shells sort to the top by mtime
+    Collect 'web-root-timeline' {
+        $roots=@("$env:SystemDrive\inetpub\wwwroot") + (Get-ChildItem "$env:SystemDrive\inetpub" -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName)
+        foreach($r in ($roots|Select-Object -Unique)){ if(Test-Path $r){ "=== $r ==="; Get-ChildItem $r -Recurse -File -Include *.asp,*.aspx,*.ashx,*.asmx,*.php,*.jsp,*.jspx,*.war -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 500 LastWriteTimeUtc,Length,FullName | Format-Table -AutoSize } }
+    } 'webroot_script_files.txt' $A -Timeout 600
+    $script:Done['weblogs']=$true
+}
+
 # ---------------------------------------------------------------------------
 # STAGE 2 menu
 # ---------------------------------------------------------------------------
 $MenuItems = [ordered]@{
-    '1' = @{ label='Full RAM image (WinPmem/DumpIt)         [~min, LARGE]'; key='memory';      fn={Job-Memory} }
-    '2' = @{ label='Artifact triage (KAPE / hives+evtx+pf)  [~min]';        key='artifacts';   fn={Job-Artifacts} }
-    '3' = @{ label='Full event-log export (.evtx copies)    [~min]';        key='eventlogs';   fn={Job-EventLogs} }
-    '4' = @{ label='Persistence + autoruns (Sysinternals)   [fast]';        key='persistence'; fn={Job-Persistence} }
-    '5' = @{ label='Active Directory enumeration (+BloodHound if present)';  key='ad';          fn={Job-AD} }
-    '6' = @{ label='Browser artifacts (Chrome/Edge/Firefox) [~min]';        key='browser';     fn={Job-Browser} }
-    '7' = @{ label='Full filesystem SHA-256 inventory       [SLOW, hours]'; key='filehashes';  fn={Job-FileHashes} }
-    '8' = @{ label='Full disk image (FTK Imager)            [VERY SLOW]';   key='diskimage';   fn={Job-DiskImage} }
+    '1'  = @{ label='Full RAM image (WinPmem/DumpIt/Magnet - open source)  [~min, LARGE]'; key='memory';      fn={Job-Memory} }
+    '2'  = @{ label='Artifact triage (Velociraptor/CyLR - hives+evtx+MFT+SRUM) [~min]';    key='artifacts';   fn={Job-Artifacts} }
+    '3'  = @{ label='Full event-log export (.evtx copies)               [~min]';           key='eventlogs';   fn={Job-EventLogs} }
+    '4'  = @{ label='Persistence + autoruns (Autorunsc/WMI/tasks/Run)   [fast]';           key='persistence'; fn={Job-Persistence} }
+    '5'  = @{ label='Active Directory enumeration (+BloodHound if present)';                key='ad';          fn={Job-AD} }
+    '6'  = @{ label='Browser artifacts (Chrome/Edge/Firefox)            [~min]';           key='browser';     fn={Job-Browser} }
+    '7'  = @{ label='Full filesystem SHA-256 inventory                  [SLOW, hours]';     key='filehashes';  fn={Job-FileHashes} }
+    '8'  = @{ label='Full disk image (raw/E01 imager if present)        [VERY SLOW]';       key='diskimage';   fn={Job-DiskImage} }
+    '9'  = @{ label='Volume Shadow Copy state + anti-recovery (ransomware) [fast]';         key='vss';         fn={Job-VSS} }
+    '10' = @{ label='Web-server logs + webroot timeline (webshell)      [~min]';            key='weblogs';     fn={Job-WebLogs} }
 }
 function Show-Menu {
     Write-Host ""; Write-Host "================ STAGE 2: HEAVY COLLECTION MENU ================" -ForegroundColor Cyan
@@ -599,14 +648,24 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
 "@
     try { $summary | Out-File (Join-Path $OutDir 'SUMMARY.md') -Encoding UTF8 } catch {}
     try { $info.endUtc=$endUtc; $info.stepsOk=$script:StepsOk; $info.stepsFail=$script:StepsFail; $info.stepsTotal=$script:StepNum; $info.heavyJobs=$doneList
-          $info | ConvertTo-Json | Out-File (Join-Path $Dirs.metadata 'collection_info.json') -Encoding UTF8 } catch {}
+          [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
     # manifest LAST so it covers SUMMARY.md + final collection_info.json (fixed literal path strip)
     Invoke-Step 'manifest-sha256' ([scriptblock]::Create(@"
 Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
-  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256|audit\.log' } |
+  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256\.csv$' -and `$_.FullName -notmatch '99_logs\\(audit|errors)\.log$' } |
   ForEach-Object { try { `$h=(Get-FileHash `$_.FullName -Algorithm SHA256).Hash } catch { `$h='ERR' }
     '{0},{1},{2}' -f `$h, `$_.Length, `$_.FullName.Replace('$OutDir','') }
 "@)) 'MANIFEST-SHA256.csv' $L -TimeoutSec 1800 | Out-Null
+
+    # freeze + hash the custody trail itself. audit.log is excluded from the manifest above because it
+    # is still being written when the manifest runs; snapshot a frozen copy and hash THAT so the
+    # timeline record has an integrity seal too.
+    try {
+        Copy-Item $AuditLog (Join-Path $L 'audit.frozen.log') -Force -ErrorAction SilentlyContinue
+        $ah = (Get-FileHash (Join-Path $L 'audit.frozen.log') -Algorithm SHA256).Hash
+        [IO.File]::WriteAllText((Join-Path $OutDir 'MANIFEST-audit-log.sha256'), "$ah  99_logs/audit.frozen.log`n", (New-Object Text.UTF8Encoding($false)))
+        Write-Audit "Custody trail frozen + hashed: $ah"
+    } catch { Write-Audit "Could not freeze/hash audit.log: $($_.Exception.Message)" }
 
     # --- ship to network destination if requested ---
     if ($NetworkDest) {
@@ -684,46 +743,108 @@ function Show-VolatileGate {
 # ---------------------------------------------------------------------------
 function Read-Def { param([string]$Prompt,[string]$Default) $r = Read-Host "$Prompt [$Default]"; if ([string]::IsNullOrWhiteSpace($r)) { $Default } else { $r } }
 
-function Invoke-GuidedIntake {
-    Write-Host ""; Write-Host "================ GUIDED INTAKE ================" -ForegroundColor Cyan
-    Write-Host "-- Vantage check: is running on this box the right move? --" -ForegroundColor Gray
-    if ((Read-Def "Is this host a VM or cloud instance? (y/N)" 'N') -match '^[yY]') {
-        Write-Host "  -> Prefer a SNAPSHOT: VMware .vmem/.vmdk, or AWS/Azure disk snapshot attached to a clean forensic instance." -ForegroundColor Yellow
-        Write-Host "     Zero guest footprint, sidesteps Secure Boot/HVCI. Run this tool only if you can't snapshot." -ForegroundColor Yellow }
-    if ((Read-Def "Is C2 / active attacker traffic believed LIVE now? (y/N)" 'N') -match '^[yY]') {
-        Write-Host "  -> Capture NETWORK first, OFF-host (PCAP at a TAP/SPAN; firewall/proxy/DNS logs). Running me can tip the attacker." -ForegroundColor Yellow }
-    if ((Read-Def "More than a few hosts in scope? (y/N)" 'N') -match '^[yY]') {
-        Write-Host "  -> Promote to a fleet HUNT (Velociraptor is in .\tools) instead of USB-per-box." -ForegroundColor Yellow }
+# Incident SCENARIOS: each is a profile overlay on the constant RFC 3227 base collection -
+# it reprioritises which heavy jobs auto-run (plan), tags ATT&CK, and records the uniquely
+# perishable "grab first" item + a SOC-handoff caveat. 'U' = today's broad default (no change).
+$Scenarios = [ordered]@{
+  '1'  = @{ name='Ransomware / destructive';                        plan=@('1','9','2','3','4'); attack=@('T1486','T1490','T1489','T1562.001'); first='RAM FIRST (encryption keys/beacon may be resident), then PRESERVE Volume Shadow Copies (job 9) before malware or an admin deletes them, then $MFT/$UsnJrnl timeline via triage (job 2). DO NOT reboot.'; note='Also grab a ransom note + a sample encrypted file for family ID.' }
+  '2'  = @{ name='BEC / cloud (M365/Entra) account compromise';     plan=@('6','2','3');         attack=@('T1078.004','T1114.003','T1098.002','T1528','T1556.006'); first='Mostly an OFF-HOST / cloud investigation: pull the M365 Unified Audit Log + Entra sign-in/audit logs, inbox-forwarding rules, mailbox delegates, OAuth grants (see docs/SCENARIOS.md). On this host only browser tokens/cookies matter, if it was the theft origin.'; note='Endpoint collection is secondary here; detection content is cloud-log-based, not Suricata/Zeek.' }
+  '3'  = @{ name='Insider threat / data exfiltration';              plan=@('2','4','7','6');     attack=@('T1567.002','T1052.001','T1560','T1048'); first='Live process/handles + current network (rclone/scp/upload in flight) + mounted removable volumes while the session is live. Then USB history + SRUM (bytes-sent) via triage (job 2).'; note='Behaviour over IOCs (insiders use legit tools). Hash the sensitive share (job 7) to prove what left.' }
+  '4'  = @{ name='Web-server / public-app compromise (webshell)';   plan=@('10','1','2','3','4');attack=@('T1190','T1505.003','T1059','T1105'); first='Live netstat + process tree of the web service FIRST (in-memory-only shells leave nothing on disk), then web logs + webroot timeline (job 10).'; note='The tell is w3wp/httpd/php-fpm spawning cmd/powershell/sh. Web logs are outside default triage - job 10 adds them.' }
+  '5'  = @{ name='Commodity malware / C2 beacon';                   plan=@('1','2','3','4');     attack=@('T1071.001','T1071.004','T1573','T1055','T1569.002'); first='RAM FIRST (beacon config / injected shellcode is memory-only), then live net-conn->PID->binary-hash, DNS cache, named pipes.'; note='Add JA3 + beacon-interval hunts to the handoff.' }
+  '6'  = @{ name='Active Directory / Domain-Controller compromise'; plan=@('3','5','2','4');     attack=@('T1003.006','T1558.001','T1207','T1003.003'); first='EXPORT THE DC SECURITY EVENT LOG IMMEDIATELY (busy DCs roll logs in hours - the most perishable evidence here), plus current Kerberos tickets + sessions.'; note='On a DC prefer a snapshot/dead-box over live tools. AD compromise is inherently MULTI-HOST - collect from ALL DCs (fan-out).' }
+  '7'  = @{ name='Lateral movement / credential theft';             plan=@('3','2','4','5');     attack=@('T1021.001','T1021.002','T1003.001','T1550.002','T1569.002'); first='Logon telemetry (4624/4625 type 3/10, 4648, 4672), RDP artifacts, LSASS-access (Sysmon 10), cached tickets + live sessions.'; note='Correlate logon type across the host pair. Strongest single-vs-fleet trigger - promote to a Velociraptor hunt (fan-out).' }
+  '8'  = @{ name='Living-off-the-land / fileless';                  plan=@('1','3','4','2');     attack=@('T1059','T1218','T1047','T1546.003'); first='RAM + live process command lines (fileless = memory-only). Capture PowerShell scriptblock/transcript (4104/4103) and the WMI repository (OBJECTS.DATA).'; note='Emit a LOLBin execution report from 4688/Sysmon1 vs a LOLBAS list.' }
+  '9'  = @{ name='Phishing initial access (workstation)';           plan=@('6','2','3','4');     attack=@('T1566.001','T1204.002','T1059.005','T1218'); first='Browser session/cookies (AiTM token theft), running first-stage process, %TEMP% before cleanup.'; note='Hunt Office (WINWORD/EXCEL/OUTLOOK)->cmd/powershell/mshta. Often chains to C2/lateral - add those as secondary.' }
+  '10' = @{ name='Cryptomining';                                    plan=@('4','2','3');         attack=@('T1496','T1543.003','T1053.005'); first='Live high-CPU/GPU process + cmdline + pool connections, then persistence (cron/service/task).'; note='Usually a symptom of a broader compromise - consider C2-beacon as secondary. Check for rootkit-hidden PIDs.' }
+  'U'  = @{ name='Unknown / broad triage';                          plan=@();                    attack=@(); first='Standard RFC 3227 order-of-volatility triage (RAM -> processes -> network -> artifacts).'; note='Default behaviour - no reprioritisation.' }
+}
 
-    Write-Host ""; Write-Host "-- Source host --" -ForegroundColor Gray
-    Write-Host ("  OS: {0} | Host: {1} | Domain-joined: {2} | Elevated: {3}" -f $info.os,$hostName,$domainJoined,$isAdmin)
+function Invoke-GuidedIntake {
+    $script:Intake = [ordered]@{ case_id=$CaseId; generated_by='IR-Collect.ps1' }
+    Write-Host ""; Write-Host "================ GUIDED INTAKE ================" -ForegroundColor Cyan
+
+    Write-Host "-- Vantage check: is running on THIS box the right move? --" -ForegroundColor Gray
+    $isVmCloud = (Read-Def "Is this host a VM or cloud instance? (y/N)" 'N') -match '^[yY]'
+    if ($isVmCloud) { Write-Host "  -> Prefer a SNAPSHOT (VMware .vmem/.vmdk or cloud disk snapshot to a clean forensic instance). Run this only if you can't snapshot." -ForegroundColor Yellow }
+    $c2live = (Read-Def "Is C2 / active attacker traffic believed LIVE now? (y/N)" 'N') -match '^[yY]'
+    if ($c2live) { Write-Host "  -> Capture NETWORK first, OFF-host (PCAP at a TAP/SPAN; firewall/proxy/DNS logs). Running me can tip the attacker; keep enrichment PASSIVE." -ForegroundColor Yellow }
+
+    Write-Host ""; Write-Host "-- Incident scenario (drives collection order + detection handoff) --" -ForegroundColor Gray
+    foreach($k in $Scenarios.Keys){ Write-Host ("  {0,-3} {1}" -f $k, $Scenarios[$k].name) }
+    $sc = (Read-Def "Select scenario" 'U').ToUpper(); if (-not $Scenarios.Contains($sc)) { $sc='U' }
+    $scen = $Scenarios[$sc]
+    Write-Host ("  -> FIRST: {0}" -f $scen.first) -ForegroundColor Yellow
+    if ($scen.note) { Write-Host ("     NOTE:  {0}" -f $scen.note) -ForegroundColor DarkYellow }
+    $script:Intake.scenario = $sc; $script:Intake.scenario_name = $scen.name; $script:Intake.attack_tags = @($scen.attack)
+
+    Write-Host ""; Write-Host "-- Host role / environment --" -ForegroundColor Gray
+    Write-Host "  [1] Workstation  [2] Server  [3] Domain Controller  [4] Cloud VM  [5] Container/k8s node  [6] OT/ICS  [7] Network device"
+    $roleDef = if ($info.os -match 'Server') { '2' } else { '1' }
+    $role = Read-Def "Select role" $roleDef
+    $roleName = @{'1'='workstation';'2'='server';'3'='domain-controller';'4'='cloud-vm';'5'='container';'6'='ot-ics';'7'='network-device'}[$role]; if(-not $roleName){$roleName='workstation'}
+    $script:Intake.host_role = $roleName
+    switch ($roleName) {
+        'server'            { Write-Host "  -> Server: prioritising services/tasks + app/IIS logs; de-prioritising browser. Avoid live full-disk image on prod." -ForegroundColor Yellow }
+        'domain-controller' { Write-Host "  -> DC: strongly prefer a SNAPSHOT/dead-box. NTDS.dit+SYSTEM via VSS, huge Security log; never disrupt replication. Collect from ALL DCs." -ForegroundColor Yellow }
+        'cloud-vm'          { Write-Host "  -> Cloud VM: prefer a disk SNAPSHOT to a clean forensic instance; also pull cloud control-plane logs (CloudTrail/Activity/Audit)." -ForegroundColor Yellow }
+        'container'         { Write-Host "  -> Container/k8s: capture running-container state FAST (docker/crictl ps, image digests, diffs, SA tokens, kube audit) - pods are ephemeral. This tool captures the NODE." -ForegroundColor Yellow }
+        'ot-ics'            { $script:DoNoHarm=$true; Write-Host "  -> OT/ICS DO-NO-HARM mode: no filesystem-hash walk / disk image / active enum. Host-only + passive. Availability > evidence." -ForegroundColor Red }
+        'network-device'    { Write-Host "  -> Network device: collect OFF-box (config, ARP/CAM, routing, syslog, NetFlow) via console - this host tool does not apply." -ForegroundColor Yellow }
+    }
+
+    $scope = Read-Def "Scope: single host or fleet? (s/F)" 's'
+    if ($scope -match '^[fF]') { Write-Host "  -> Fleet: promote to a Velociraptor HUNT (in .\tools) - collection becomes a targeted VQL artifact set, not USB-per-box." -ForegroundColor Yellow }
+    $script:Intake.scope = $(if($scope -match '^[fF]'){'fleet'}else{'single'})
+    $conn = Read-Def "Connectivity: connected or airgapped/quarantined? (c/A)" 'c'
+    $script:Intake.connectivity = $(if($conn -match '^[aA]'){'airgapped'}else{'connected'})
+
+    Write-Host ""; Write-Host "-- Known-bad indicators you already hold (comma-separated, Enter to skip) --" -ForegroundColor Gray
+    $script:Intake.known_bad_ips      = @((Read-Def "  Malicious IPs" '')       -split '[, ]+' | Where-Object { $_ })
+    $script:Intake.known_bad_domains  = @((Read-Def "  Malicious domains" '')   -split '[, ]+' | Where-Object { $_ })
+    $script:Intake.known_bad_hashes   = @((Read-Def "  Malicious hashes" '')    -split '[, ]+' | Where-Object { $_ })
+    $script:Intake.known_bad_accounts = @((Read-Def "  Suspect accounts" '')    -split '[, ]+' | Where-Object { $_ })
+    $script:Intake.known_bad_paths    = @((Read-Def "  Suspect files/paths" '') -split ','      | Where-Object { $_ })
+
+    Write-Host ""; Write-Host "-- Scope-out (Enter to skip) --" -ForegroundColor Gray
+    $script:Intake.first_activity_utc = Read-Def "Earliest suspected activity (UTC)" ''
+    $script:Intake.detection_utc      = Read-Def "When detected (UTC)" ''
+    $script:Intake.crown_jewels       = Read-Def "Crown jewels in scope (DC/finance/PII/source?)" ''
+    $script:Intake.data_at_risk       = Read-Def "Data at risk (PII/PHI/PCI/IP/creds/none)" 'unknown'
+    $script:Intake.severity           = Read-Def "Severity 1-4 (1=critical)" '3'
+    $script:Intake.is_vm_cloud = [bool]$isVmCloud; $script:Intake.attacker_c2_live = [bool]$c2live
+
     $script:Compromised = ((Read-Def "Is this host believed COMPROMISED? (Y/n)" 'Y') -notmatch '^[nN]')
-    if ($script:Compromised) { Write-Host "  -> Trusted-tool posture (carried tools + kernel APIs). Remember: RAM + dead-box image are ground truth." -ForegroundColor Yellow }
+    if ($script:Compromised) { Write-Host "  -> Trusted-tool posture (carried tools + kernel APIs). RAM + dead-box image are ground truth." -ForegroundColor Yellow }
     $enc = $false; try { $enc = [bool](Get-BitLockerVolume 2>$null | Where-Object { $_.ProtectionStatus -eq 'On' }) } catch {}
     if ($enc) { Write-Host "  -> BitLocker DETECTED. Keys captured in Stage 1 (00_metadata\bitlocker_keys.txt) - REQUIRED before any dead-box image." -ForegroundColor Yellow }
 
-    Write-Host ""; Write-Host "-- Destination --" -ForegroundColor Gray
-    Write-Host "  Writing to: $OutDir$(if($NetworkDest){"  (ships to $NetworkDest at seal)"})"
+    # build the collection plan from scenario + role
+    $plan = @($scen.plan)
+    if (-not $plan.Count) { $plan = @('2','3','4','6'); if ($domainJoined) { $plan += '5' } }        # broad default
+    if ($roleName -in 'server','domain-controller') { $plan = @($plan | Where-Object { $_ -ne '6' }) } # drop browser on servers
+    if ($roleName -eq 'domain-controller' -and $domainJoined -and $plan -notcontains '5') { $plan += '5' }
+    if ($script:DoNoHarm) { $plan = @($plan | Where-Object { $_ -notin '7','8' }) }                    # OT: no hash-walk / disk image
+    if ($SkipAD) { $plan = @($plan | Where-Object { $_ -ne '5' }) }
+    $script:Plan = @($plan | Select-Object -Unique)
+    $script:Intake.plan = $script:Plan
 
-    Write-Host ""; Write-Host "-- Collection scope --" -ForegroundColor Gray
-    Write-Host "  [1] Volatile only        (RAM + live state, then seal - fastest)"
-    Write-Host "  [2] Volatile + triage    (RECOMMENDED: + artifacts, event logs, persistence, browser$(if($domainJoined){', AD'}))"
-    Write-Host "  [3] EVERYTHING           (+ full file-hash inventory + full disk image - hours)"
-    switch (Read-Def "Select scope" '2') {
-        '1' { $script:VolatileOnly = $true; $script:Plan = @() }
-        '3' { $script:Plan = @('2','3','4','6','7','8'); if ($domainJoined) { $script:Plan += '5' } }
-        default { $script:Plan = @('2','3','4','6'); if ($domainJoined) { $script:Plan += '5' } }
-    }
-    $planNames = if ($script:VolatileOnly) { 'seal' } else { ($script:Plan | ForEach-Object { $MenuItems[$_].key }) -join ', ' }
-    Write-Host ""; Write-Host "Plan: RAM+volatile -> GREEN gate -> $planNames" -ForegroundColor Green
+    $planNames = ($script:Plan | ForEach-Object { $MenuItems[$_].key }) -join ', '
+    Write-Host ""; Write-Host ("Plan: RAM+volatile -> GREEN gate -> {0}" -f $(if($planNames){$planNames}else{'seal (volatile only)'})) -ForegroundColor Green
+    Write-Host ("Scenario: {0}  |  Role: {1}  |  Scope: {2}  |  ATT&CK: {3}" -f $scen.name,$roleName,$script:Intake.scope,($scen.attack -join ',')) -ForegroundColor DarkGray
+    try { [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($script:Intake | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } catch {}
+    Write-Audit "INTAKE scenario=$sc role=$roleName scope=$($script:Intake.scope) plan=$($script:Plan -join ',') seedIOCs=$(($script:Intake.known_bad_ips.Count + $script:Intake.known_bad_domains.Count + $script:Intake.known_bad_hashes.Count))"
     [void](Read-Def "Press Enter to begin (Ctrl-C to abort)" '')
 }
 
 # ===========================================================================
 # MAIN  (self-heal: Seal ALWAYS runs, even if a phase throws)
 # ===========================================================================
-$script:Sealed = $false; $script:Plan = $null; $script:VolatileOnly = $false
+$script:Sealed = $false; $script:Plan = $null; $script:VolatileOnly = $false; $script:DoNoHarm = $false
 function Complete-Run { if (-not $script:Sealed) { $script:Sealed = $true; try { Invoke-Seal } catch { Write-Audit "Seal error: $($_.Exception.Message)" } } }
+# interrupt-safety: a hard Ctrl-C / console-close during the long Stage-2 phase must still seal.
+try { [Console]::add_CancelKeyPress({ param($s,$e) $e.Cancel=$true; Write-Host "`nInterrupt - sealing evidence before exit..." -ForegroundColor Yellow; try { Complete-Run } catch {} }) } catch {}
+try { Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action { try { Complete-Run } catch {} } | Out-Null } catch {}
 
 # guided intake is the default when interactive and no mode flag was given
 if (-not $Auto -and -not $RapidOnly -and -not [Console]::IsInputRedirected) {

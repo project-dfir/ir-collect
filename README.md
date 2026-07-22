@@ -9,11 +9,16 @@ missing tool is logged and skipped; the run never halts.
 - **Windows:** `IR-Collect.ps1` (PowerShell 5.1+, native CIM/.NET/ADSI)
 - **Linux:** `ir-collect.sh` (POSIX/bash, native `/proc`, `ss`, `ip`, `systemctl`…)
 
-**Start here:** the collectors default to a **guided intake** (answer a few questions about the source/
-compromised host; it drives volatile → non-volatile). Read **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a
-real collection (pre-touch decisions, encryption, authorization), **[docs/GAPS.md](docs/GAPS.md)** for what
-a single-box tool can't see (network/identity/cloud vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security Onion content,
-and **[docs/ENTERPRISE.md](docs/ENTERPRISE.md)** for deployment at scale (signing/CLM, EDR deconfliction, fleet bridge). Build the tool payload once with `fetch-tools.*`.
+**Start here:** the collectors default to a **guided intake** — pick the **incident scenario** (ransomware,
+BEC/cloud, insider-exfil, webshell, C2 beacon, AD/DC, lateral, LOLBin, phishing, cryptomining…) and the
+**host role** (workstation/server/DC/cloud-VM/container/OT), plus any indicators you already hold. That
+reprioritises the menu, adds scenario-specific collection, and tags the detection handoff with ATT&CK. Read
+**[docs/SCENARIOS.md](docs/SCENARIOS.md)** for the scenario catalog + environment matrix + cloud/off-host
+collection, **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a real collection (pre-touch decisions, encryption,
+authorization), **[docs/GAPS.md](docs/GAPS.md)** for what a single-box tool can't see (network/identity/cloud
+vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security
+Onion content, and **[docs/ENTERPRISE.md](docs/ENTERPRISE.md)** for deployment at scale (signing/CLM, EDR
+deconfliction, fleet bridge). Build the tool payload once with `fetch-tools.*`.
 
 ### Repository layout
 ```
@@ -21,17 +26,21 @@ IR-Collect.ps1 / ir-collect.sh      collectors (Windows / Linux)      -- run on 
 fetch-tools.ps1 / fetch-tools.sh    one-time kit builder              -- run on a trusted box
 Build-DetectionContent.ps1          capture -> Splunk/Sigma/Suricata/Zeek content  -- run on the analyst box
 tools/                              open-source payload (fetched, not committed)
+docs/SCENARIOS.md                   incident-scenario catalog + host-role matrix + cloud/off-host steps
 docs/RUNBOOK.md                     pre-touch field procedure + checklist
 docs/GAPS.md                        off-host vantage points (network/identity/cloud) + artifact gaps
 docs/DETECTION.md                   forward-triage -> detection-handoff doctrine + roadmap
+docs/ENTERPRISE.md                  deployment at scale (signing/CLM, EDR deconfliction, fleet bridge)
 ```
 
 ### The SOC forward-party workflow
 1. **Build the kit** once on a trusted box (`fetch-tools.*`) and carry the drive.
-2. **Forward party** runs the collector on compromised hosts — guided intake → volatile (RAM-first) →
-   GREEN gate → non-volatile. Perishable evidence secured before the main team arrives.
-3. **Generate detection content** (`Build-DetectionContent.ps1`) from the capture — IOCs, Splunk SPL,
-   Sigma, Suricata, Zeek intel.
+2. **Forward party** runs the collector on compromised hosts — guided intake (**scenario + host role +
+   known indicators**) → volatile (RAM-first) → GREEN gate → scenario-prioritised non-volatile. The
+   intake is written to `00_metadata/intake.json`. Perishable evidence secured before the main team arrives.
+3. **Generate detection content** (`Build-DetectionContent.ps1`) from the capture — it reads `intake.json`,
+   **seeds your known-bad IOCs**, and emits IOCs, Splunk SPL, Sigma (ATT&CK-tagged), Suricata, Zeek intel,
+   and an **ATT&CK Navigator layer**.
 4. **Hand off** to the follow-on team's suite (Splunk Enterprise Security + Security Onion) so they hunt
    those indicators across the enterprise and the weeks-long network baseline.
 

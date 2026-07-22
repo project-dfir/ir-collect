@@ -52,13 +52,19 @@ function New-DetId($prefix,$seed){ "$prefix--" + (New-DetUuid $seed) }
 $stixTs = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.000Z")
 $IOC = @{}   # key "type|value" -> object
 function Add-IOC {
-    param([string]$Type,[string]$Value,[string]$Source,[string]$Hn)
+    param([string]$Type,[string]$Value,[string]$Source,[string]$Hn,[int]$Confidence=50,[bool]$ToIds=$false)
     if ([string]::IsNullOrWhiteSpace($Value)) { return }
     $Value = $Value.Trim()
     $k = "$Type|$Value"
-    if (-not $IOC.ContainsKey($k)) { $IOC[$k] = [ordered]@{ type=$Type; value=$Value; source=$Source; host=$Hn; confidence=50; to_ids=$false } }
-    elseif (($IOC[$k].host -split ';') -notcontains $Hn) { $IOC[$k].host = "$($IOC[$k].host);$Hn" }
+    if (-not $IOC.ContainsKey($k)) { $IOC[$k] = [ordered]@{ type=$Type; value=$Value; source=$Source; host=$Hn; confidence=$Confidence; to_ids=$ToIds } }
+    else {
+        if (($IOC[$k].host -split ';') -notcontains $Hn) { $IOC[$k].host = "$($IOC[$k].host);$Hn" }
+        if ($Confidence -gt $IOC[$k].confidence) { $IOC[$k].confidence = $Confidence }
+        if ($ToIds) { $IOC[$k].to_ids = $true }
+    }
 }
+# intake accumulators (scenario context steers tagging + the ATT&CK Navigator layer)
+$IntakeCase = $null; $IntakeScenarios = @(); $AttackTags = @(); $SeedCount = 0
 
 # public-IP test (exclude RFC1918 / loopback / link-local / multicast / broadcast)
 function Test-PublicIP {
@@ -78,12 +84,26 @@ function Test-PublicIP {
 $ipRe   = '(?<![\d.])((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])'
 $domRe  = '(?i)\b([a-z0-9](-?[a-z0-9])*\.)+[a-z]{2,}\b'
 $hashRe = '\b([a-fA-F0-9]{64}|[a-fA-F0-9]{40}|[a-fA-F0-9]{32})\b'
+$hashReStrong = '\b([a-fA-F0-9]{64}|[a-fA-F0-9]{40})\b'   # SHA1/SHA256 only - 32-hex MD5 collides with GUIDs/CLSIDs
+$benignRe = '(^|\.)(microsoft|windows|windowsupdate|msftconnecttest|msftncsi|office365|office|live|azure|azureedge|msedge|bing|skype|xboxlive|apple|icloud|mzstatic|google|googleapis|gstatic|gvt1|gvt2|youtube|akamai|akamaiedge|akamaized|cloudflare|cloudfront|fastly|amazonaws|digicert|verisign|globalsign|sectigo|ocsp|mozilla|ubuntu|debian|canonical|entrust)\.[a-z.]+$'
 $suspDirRe = '(?i)(\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Windows\\Temp\\|/tmp/|/dev/shm/|/var/tmp/)'
 
 foreach ($f in $folders) {
     $hostn = 'unknown'
     try { $ci = Get-Content (Join-Path $f '00_metadata\collection_info.json') -Raw -ErrorAction Stop | ConvertFrom-Json; if ($ci.host) { $hostn = $ci.host } } catch {}
     Write-Host "Mining $f (host=$hostn)" -ForegroundColor Cyan
+    # intake.json: scenario context + operator's already-known indicators (seeded confidence=75, to_ids)
+    $intake = $null
+    try { $intake = Get-Content (Join-Path $f '00_metadata\intake.json') -Raw -ErrorAction Stop | ConvertFrom-Json } catch {}
+    if ($intake) {
+        if ($intake.case_id)       { $IntakeCase = $intake.case_id }
+        if ($intake.scenario_name) { $IntakeScenarios += $intake.scenario_name }
+        if ($intake.attack_tags)   { $AttackTags += @($intake.attack_tags) }
+        foreach ($x in @($intake.known_bad_ips))     { if ($x) { Add-IOC 'ipv4-c2'   "$x" 'operator-intake' $hostn 75 $true; $SeedCount++ } }
+        foreach ($x in @($intake.known_bad_domains)) { if ($x) { Add-IOC 'domain'    ("$x").ToLower() 'operator-intake' $hostn 75 $true; $SeedCount++ } }
+        foreach ($x in @($intake.known_bad_hashes))  { if ($x) { Add-IOC 'hash'      "$x" 'operator-intake' $hostn 75 $true; $SeedCount++ } }
+        foreach ($x in @($intake.known_bad_paths))   { if ($x) { Add-IOC 'file-path' "$x" 'operator-intake' $hostn 75 $true; $SeedCount++ } }
+    }
 
     function Read-Src { param([string]$rel) $p = Join-Path $f $rel; if (Test-Path $p) { try { Get-Content $p -Raw -ErrorAction Stop } catch { '' } } else { '' } }
 
@@ -113,7 +133,10 @@ foreach ($f in $folders) {
                 foreach ($pm in [regex]::Matches($line, '(?i)[a-z]:\\[^,"\r\n ]+\.(exe|dll|ps1|bat|scr|vbs)')) { Add-IOC 'file-path' $pm.Value $rel $hostn }
                 foreach ($pm in [regex]::Matches($line, '(?i)/(tmp|dev/shm|var/tmp)/[^\s,"]+')) { Add-IOC 'file-path' $pm.Value $rel $hostn }
             }
-            foreach ($hm in [regex]::Matches($line, $hashRe)) { Add-IOC 'hash' $hm.Value $rel $hostn }
+            foreach ($hm in [regex]::Matches($line, $hashReStrong)) { Add-IOC 'hash' $hm.Value $rel $hostn }
+            # C2 in a command line (e.g. powershell -enc / DownloadString('http://1.2.3.4/a'))
+            foreach ($ipm in [regex]::Matches($line, $ipRe)) { if (Test-PublicIP $ipm.Value) { Add-IOC 'ipv4-c2' $ipm.Value "$rel(cmd)" $hostn } }
+            foreach ($dm in [regex]::Matches($line, $domRe)) { $d=$dm.Value.ToLower(); if ($d -notmatch '\.(local|arpa|lan|internal|corp|home)$' -and $d -notmatch $benignRe -and $d -notmatch '\.(exe|dll|dat|ini|log|tmp|sys|bat|ps1|txt|csv|xml|json|lnk|pf|evtx)$') { Add-IOC 'domain' $d "$rel(cmd)" $hostn } }
         }
     }
     # --- autoruns hashes (Sysinternals -h output) ---
@@ -121,6 +144,8 @@ foreach ($f in $folders) {
     foreach ($hm in [regex]::Matches($ar, $hashRe)) { Add-IOC 'hash' $hm.Value '04_persistence\autoruns.csv' $hostn }
 }
 
+$AttackTags = @($AttackTags | Where-Object { $_ } | Select-Object -Unique)
+$sigTags = ($AttackTags | ForEach-Object { "  - attack.$($_.ToLower())" }) -join "`n"
 $all = @($IOC.Values | ForEach-Object { [pscustomobject]$_ })
 $ips     = @($all | Where-Object { $_.type -eq 'ipv4-c2'  } | Select-Object -Expand value -Unique)
 $domains = @($all | Where-Object { $_.type -eq 'domain'   } | Select-Object -Expand value -Unique)
@@ -230,6 +255,7 @@ $($det -join "`n")
 level: high
 tags:
   - attack.command_and_control
+$sigTags
 "@
     Save-Text (Join-Path $OutDir 'sigma\c2_ip_indicators.yml') $y
 }
@@ -248,6 +274,7 @@ $($det -join "`n")
 level: high
 tags:
   - attack.command_and_control
+$sigTags
 "@
     Save-Text (Join-Path $OutDir 'sigma\c2_dns_indicators.yml') $y
 }
@@ -268,6 +295,7 @@ $($det -join "`n")
 level: high
 tags:
   - attack.execution
+$sigTags
 "@
     Save-Text (Join-Path $OutDir 'sigma\malicious_process_indicators.yml') $y
 }
@@ -283,7 +311,7 @@ foreach ($ip in $ips) {
     $sid++
 }
 foreach ($d in $domains) {
-    [void]$sur.AppendLine("alert dns `$HOME_NET any -> any any (msg:`"IR-Collect C2 domain $d`"; dns.query; content:`"$d`"; nocase; classtype:trojan-activity; sid:$sid; rev:1; metadata:source ir-collect;)")
+    [void]$sur.AppendLine("alert dns `$HOME_NET any -> any any (msg:`"IR-Collect C2 domain $d`"; dns.query; content:`"$d`"; nocase; endswith; classtype:trojan-activity; sid:$sid; rev:1; metadata:source ir-collect;)")
     $sid++
 }
 Save-Text (Join-Path $OutDir 'suricata\local.rules') $sur.ToString()
@@ -299,13 +327,31 @@ foreach ($h in $hashes)   { $alg = if($h.Length -eq 40){'sha1'}elseif($h.Length 
 Save-Text (Join-Path $OutDir 'zeek\ircollect.intel') $zeek.ToString()
 
 # ---------------------------------------------------------------------------
+# 6. ATT&CK Navigator layer (union of scenario techniques) - one-page campaign view
+# ---------------------------------------------------------------------------
+if ($AttackTags.Count) {
+    $layer = [ordered]@{
+        name        = "IR-Collect $IntakeCase"
+        versions    = [ordered]@{ attack='14'; navigator='4.9.0'; layer='4.5' }
+        domain      = 'enterprise-attack'
+        description = "Techniques from IR-Collect forward-triage scenario(s): $($IntakeScenarios -join '; ')"
+        gradient    = [ordered]@{ colors=@('#ffffff','#fd8d3c'); minValue=0; maxValue=100 }
+        techniques  = @($AttackTags | ForEach-Object { [ordered]@{ techniqueID=$_; score=100; color='#fd8d3c'; comment='IR-Collect scenario'; enabled=$true } })
+    }
+    Save-Text (Join-Path $OutDir 'ioc\attack_layer.json') ($layer | ConvertTo-Json -Depth 6)
+}
+
+# ---------------------------------------------------------------------------
 # HANDOFF.md for the follow-on team
 # ---------------------------------------------------------------------------
 @"
 # IR-Collect -> Detection Content Handoff
 
 Generated from forward-party triage of $($folders.Count) compromised host(s).
-Observables extracted: **$($ips.Count) external IPs, $($domains.Count) domains, $($hashes.Count) hashes, $($paths.Count) suspicious paths.**
+**Case:** $IntakeCase   **Scenario(s):** $($IntakeScenarios -join '; ')
+**ATT&CK:** $($AttackTags -join ', ')
+Observables: **$($ips.Count) external IPs, $($domains.Count) domains, $($hashes.Count) hashes, $($paths.Count) suspicious paths** ($SeedCount operator-seeded from intake, confidence=75).
+- ``ioc/attack_layer.json`` - MITRE ATT&CK Navigator layer for the scenario; load at https://mitre-attack.github.io/attack-navigator/ for a one-page campaign view.
 
 ## For the Splunk Enterprise Security team
 - ``splunk/hunt_searches.spl`` - paste into Search; hunts these IOCs across your indexes / CIM data models

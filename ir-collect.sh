@@ -83,7 +83,11 @@ if echo "$DEST" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(:.*)?$' || echo "$DEST"
   # bare IP -> default remote path
   echo "$DEST" | grep -q ':' || NETWORK_DEST="${DEST}:/tmp/evidence"
   OUT_ROOT="$SCRIPT_DIR/_staging"
-  mkdir -p "$OUT_ROOT" 2>/dev/null || OUT_ROOT="/tmp"
+  if ! mkdir -p "$OUT_ROOT" 2>/dev/null; then
+    OUT_ROOT="/tmp/_ir_staging"; mkdir -p "$OUT_ROOT" 2>/dev/null
+    echo "!!! CONTAMINATION WARNING: cannot stage on the collection media - falling back to the TARGET disk ($OUT_ROOT)."
+    echo "    This writes evidence onto the subject host. Attach writable removable media and re-run if at all possible. !!!"
+  fi
 else
   OUT_ROOT="$DEST"
 fi
@@ -129,8 +133,9 @@ repair_toolkit() {
   find "$TOOL_DIR" -maxdepth 3 -type f \( -name 'avml' -o -name 'velociraptor*' -o -name 'busybox' -o -name 'CyLR' -o -name 'uac' -o -name 'chainsaw' -o -name 'hayabusa*' \) -exec chmod +x {} \; 2>/dev/null
   for z in "$BIN"/*.zip; do [ -f "$z" ] && { unzip -oq "$z" -d "${z%.zip}" 2>/dev/null && rm -f "$z" && echo "Toolkit: extracted $(basename "$z")"; }; done
   for t in "$BIN"/*.tar.gz; do [ -f "$t" ] && { tar xzf "$t" -C "$BIN" 2>/dev/null && rm -f "$t" && echo "Toolkit: extracted $(basename "$t")"; }; done
-  # Trusted enumeration reads raw /proc + /proc/net (kernel truth, immune to userland
-  # rootkits); busybox stays a coarse fallback, NOT applet-shadowed (its ps/ss lack flags).
+  # Trusted enumeration reads raw /proc + /proc/net (resists USERLAND rootkits; a kernel/DKOM
+  # rootkit can still hook these, so RAM + dead-box remain ground truth). busybox stays a coarse
+  # fallback, NOT applet-shadowed (its ps/ss lack flags).
 }
 repair_toolkit
 
@@ -163,19 +168,27 @@ run_step() {
   while [ "$attempt" -le "$retries" ]; do
     attempt=$((attempt+1))
     # stdin closed (</dev/null) so no tool can block on an interactive prompt
-    if [ "$have_timeout" = "1" ]; then
-      if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo" "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG"; rc=$?
-      else timeout $TMO_K "$tmo" "$@" </dev/null >"$target" 2>>"$ERRLOG"; rc=$?; fi
-    else
-      # no `timeout` binary: manual watchdog. setsid runs the command in its own process
-      # group so we can kill the WHOLE pipeline (dd|gzip), not just the parent shell.
+    if [ -n "$SETSID" ]; then
+      # PREFERRED: run in a NEW process group so the watchdog kills the WHOLE pipeline
+      # (dd|gzip), not just the parent shell. GNU `timeout` only signals its direct child,
+      # so pipeline grandchildren would be orphaned and keep writing - hence setsid first.
       if [ "$target" = "/dev/null" ]; then $SETSID "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG" &
       else $SETSID "$@" </dev/null >"$target" 2>>"$ERRLOG" & fi
-      local pid=$! kt; kt="$pid"; [ -n "$SETSID" ] && kt="-$pid"
+      local pid=$!; local kt="-$pid"
       ( sleep "$tmo"; kill -TERM "$kt" 2>/dev/null; sleep 5; kill -KILL "$kt" 2>/dev/null ) >/dev/null 2>&1 &
       local wd=$!
       wait "$pid" 2>/dev/null; rc=$?
       kill "$wd" 2>/dev/null; pkill -P "$wd" 2>/dev/null
+    elif [ "$have_timeout" = "1" ]; then
+      if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo" "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG"; rc=$?
+      else timeout $TMO_K "$tmo" "$@" </dev/null >"$target" 2>>"$ERRLOG"; rc=$?; fi
+    else
+      # neither setsid nor timeout: best-effort single-pid watchdog
+      if [ "$target" = "/dev/null" ]; then "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG" &
+      else "$@" </dev/null >"$target" 2>>"$ERRLOG" & fi
+      local pid=$!
+      ( sleep "$tmo"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+      local wd=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$wd" 2>/dev/null
     fi
     local dur=$(( $(date +%s) - start ))
     if [ "$rc" = "0" ]; then
@@ -240,6 +253,10 @@ cat > "$D_META/collection_info.json" 2>/dev/null <<EOF
 { "tool":"ir-collect.sh","version":"2.0","case":"$CASE","host":"$HOSTN",
   "collector":"$(id -un 2>/dev/null)","root":$IS_ROOT,"startUtc":"$(now_utc)",
   "kernel":"$(uname -a 2>/dev/null | sed 's/"/ /g')","toolsDetected":"${DET# }" }
+EOF
+# default intake.json (overwritten by guided intake); the detection generator always finds one
+cat > "$D_META/intake.json" 2>/dev/null <<EOF
+{ "case_id":"$CASE","scenario":"U","scenario_name":"Unknown / broad triage","host_role":"unknown","scope":"single","connectivity":"connected","generated_by":"ir-collect.sh (non-guided)","known_bad_ips":[],"known_bad_domains":[],"known_bad_hashes":[],"known_bad_accounts":[],"known_bad_paths":[],"attack_tags":[] }
 EOF
 
 # ===========================================================================
@@ -371,6 +388,7 @@ job_persistence() {
 }
 job_filehashes() {
   audit "--- HEAVY: full filesystem SHA-256 inventory ---"
+  [ "${DO_NO_HARM:-0}" = "1" ] && { audit "filehashes skipped (do-no-harm/OT-ICS)"; run_sh hash-skip-ot FILEHASH_SKIPPED_OT.txt "$D_ART" 10 0 'echo "Skipped: do-no-harm (OT/ICS) mode - a full live-filesystem hash walk is too intrusive for control systems."'; DONE[filehashes]=1; return; }
   run_sh hash-all filehashes.csv "$D_ART" 7200 0 "$NICE "'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,\"$f\""; done'
   DONE[filehashes]=1
 }
@@ -396,6 +414,7 @@ job_ad() {
 }
 job_diskimage() {
   audit "--- HEAVY: disk image ---"
+  [ "${DO_NO_HARM:-0}" = "1" ] && { audit "disk image skipped (do-no-harm/OT-ICS)"; run_sh disk-skip-ot DISK_SKIPPED_OT.txt "$D_DISK" 10 0 'echo "Skipped: do-no-harm (OT/ICS) mode - live disk imaging risks control-system availability."'; DONE[diskimage]=1; return; }
   if command -v dd >/dev/null 2>&1; then
     for disk in $(lsblk -dnp -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
       n="$(basename "$disk")"
@@ -405,6 +424,16 @@ job_diskimage() {
     run_sh disk-note DISK_NOT_IMAGED.txt "$D_DISK" 30 0 'echo "dd not found - cannot image."'
   fi
   DONE[diskimage]=1
+}
+
+job_weblogs() {
+  audit "--- HEAVY: web-server logs + webroot timeline (webshell hunt) ---"
+  local W="$D_ART/webserver"; mkdir -p "$W" 2>/dev/null
+  run_sh web-logs   - "$W" 900 0 'for d in /var/log/apache2 /var/log/httpd /var/log/nginx /var/log/lighttpd; do [ -d "$d" ] && cp -a --parents "$d" "'"$W"'" 2>/dev/null; done; for f in /var/log/tomcat*/catalina.out /opt/tomcat*/logs/catalina.out; do [ -f "$f" ] && cp -a --parents "$f" "'"$W"'" 2>/dev/null; done; echo done'
+  run_sh web-config - "$W" 120 0 'for f in /etc/apache2/apache2.conf /etc/httpd/conf/httpd.conf /etc/nginx/nginx.conf; do [ -f "$f" ] && cp -a --parents "$f" "'"$W"'" 2>/dev/null; done; echo done'
+  # webroot recent-file timeline: dropped .php/.jsp/.aspx shells sort to the top by mtime
+  run_sh web-root-timeline webroot_script_files.txt "$W" 600 0 'for r in /var/www /srv/www /usr/share/nginx/html /var/lib/tomcat*/webapps /opt/*/webapps; do [ -d "$r" ] && { echo "=== $r ==="; find "$r" -type f \( -name "*.php" -o -name "*.phtml" -o -name "*.jsp" -o -name "*.jspx" -o -name "*.asp" -o -name "*.aspx" -o -name "*.war" \) -printf "%TY-%Tm-%Td %TH:%TM %10s %p\n" 2>/dev/null | sort -r | head -500; }; done'
+  DONE[weblogs]=1
 }
 
 # ---------------------------------------------------------------------------
@@ -420,6 +449,7 @@ show_menu() {
   echo "  4 $(mark ad)          Active Directory / domain enum"
   echo "  5 $(mark filehashes)  Full filesystem SHA-256 inventory    [SLOW]"
   echo "  6 $(mark diskimage)   Full disk image (dd)                 [VERY SLOW]"
+  echo "  7 $(mark weblogs)    Web-server logs + webroot timeline (webshell) [~min]"
   echo "  A  Run ALL remaining"
   echo "  Q  Finish & seal"
   echo
@@ -429,7 +459,7 @@ run_menu() {
   # fall back to running ALL jobs rather than looping forever on a failed read.
   if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
     audit "No TTY for menu - falling back to ALL heavy jobs."
-    job_memory; job_artifacts; job_persistence; job_ad; job_filehashes; job_diskimage
+    job_memory; job_artifacts; job_persistence; job_ad; job_filehashes; job_diskimage; job_weblogs
     return
   fi
   local badreads=0
@@ -448,7 +478,8 @@ run_menu() {
       4) job_ad ;;
       5) job_filehashes ;;
       6) job_diskimage ;;
-      A) [ -z "${DONE[memory]}" ] && job_memory; [ -z "${DONE[artifacts]}" ] && job_artifacts; [ -z "${DONE[persistence]}" ] && job_persistence; [ -z "${DONE[ad]}" ] && job_ad; [ -z "${DONE[filehashes]}" ] && job_filehashes; [ -z "${DONE[diskimage]}" ] && job_diskimage ;;
+      7) job_weblogs ;;
+      A) [ -z "${DONE[memory]}" ] && job_memory; [ -z "${DONE[artifacts]}" ] && job_artifacts; [ -z "${DONE[persistence]}" ] && job_persistence; [ -z "${DONE[ad]}" ] && job_ad; [ -z "${DONE[filehashes]}" ] && job_filehashes; [ -z "${DONE[diskimage]}" ] && job_diskimage; [ -z "${DONE[weblogs]}" ] && job_weblogs ;;
       Q) break ;;
       *) echo "Invalid selection." ;;
     esac
@@ -479,7 +510,9 @@ See 99_logs/audit.log for the full timestamped trail; 99_logs/errors.log for rec
 EOF
 
   # manifest LAST so it covers SUMMARY.md
-  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -name 'audit.log' -print0 | xargs -0 sha256sum 2>/dev/null"
+  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' -print0 | xargs -0 sha256sum 2>/dev/null"
+  # freeze + hash the custody trail itself (excluded above because it is still being written)
+  cp -a "$AUDIT" "$D_LOG/audit.frozen.log" 2>/dev/null && ( cd "$OUTDIR" && sha256sum 99_logs/audit.frozen.log ) > "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Custody trail frozen + hashed."
 
   # ship to network destination
   if [ -n "$NETWORK_DEST" ]; then
@@ -542,36 +575,108 @@ trap 'finish' EXIT
 # GUIDED INTAKE - a few questions about the source/compromised host that drive
 # the volatile->non-volatile collection. Includes a vantage-decision preamble.
 # ---------------------------------------------------------------------------
-GUIDED=0; VOL_ONLY=0; PLAN=""
+GUIDED=0; VOL_ONLY=0; PLAN=""; DO_NO_HARM=0
+sani() { printf '%s' "$1" | tr -d '\\"'; }
+json_arr() {  # split on comma/space -> ["a","b"]
+  local out="" x; local IFS=', '; set -f; local a=($1); set +f
+  for x in "${a[@]}"; do x="$(sani "$x")"; [ -n "$x" ] && out="$out\"$x\","; done; printf '[%s]' "${out%,}"; }
+json_arr_c() {  # split on comma only (paths may contain spaces) -> ["a b","c"]
+  local out="" x; local OLD="$IFS"; IFS=','; set -f; local a=($1); set +f; IFS="$OLD"
+  for x in "${a[@]}"; do x="$(sani "$(echo "$x" | sed 's/^ *//; s/ *$//')")"; [ -n "$x" ] && out="$out\"$x\","; done; printf '[%s]' "${out%,}"; }
 guided_intake() {
   [ -e /dev/tty ] || return
   echo; echo "================ GUIDED INTAKE ================"
-  echo "-- Vantage check: is running on this box the right move? --"
-  read -rp "Is this host a VM or cloud instance? (y/N) " a </dev/tty
-  case "$a" in [yY]*) echo "  -> Prefer a SNAPSHOT (VMware .vmem/.vmdk, or cloud disk snapshot to a clean forensic instance). Run me only if you can't snapshot.";; esac
-  read -rp "Is C2 / attacker traffic believed LIVE now? (y/N) " a </dev/tty
-  case "$a" in [yY]*) echo "  -> Capture NETWORK off-host FIRST (PCAP at a TAP/SPAN; firewall/proxy/DNS logs). Running me can tip the attacker.";; esac
-  read -rp "More than a few hosts in scope? (y/N) " a </dev/tty
-  case "$a" in [yY]*) echo "  -> Promote to a Velociraptor fleet HUNT (in tools/) instead of USB-per-box.";; esac
-  echo; echo "-- Source host --"
-  echo "  Host: $HOSTN  root: $IS_ROOT  kernel: $(uname -r)"
+  echo "-- Vantage check: is running on THIS box the right move? --"
+  read -rp "Is this host a VM or cloud instance? (y/N) " VMC </dev/tty
+  case "$VMC" in [yY]*) echo "  -> Prefer a SNAPSHOT (VMware .vmem/.vmdk, or cloud disk snapshot to a clean forensic instance). Run me only if you can't snapshot.";; esac
+  read -rp "Is C2 / attacker traffic believed LIVE now? (y/N) " C2L </dev/tty
+  case "$C2L" in [yY]*) echo "  -> Capture NETWORK off-host FIRST (PCAP at a TAP/SPAN; firewall/proxy/DNS logs). Running me can tip the attacker; keep enrichment PASSIVE.";; esac
+
+  echo; echo "-- Incident scenario (drives collection order + detection handoff) --"
+  echo "  1  Ransomware / destructive"
+  echo "  2  BEC / cloud (M365/Entra) account compromise"
+  echo "  3  Insider threat / data exfiltration"
+  echo "  4  Web-server / public-app compromise (webshell)"
+  echo "  5  Commodity malware / C2 beacon"
+  echo "  6  Active Directory / Domain-Controller compromise"
+  echo "  7  Lateral movement / credential theft"
+  echo "  8  Living-off-the-land / fileless"
+  echo "  9  Phishing initial access"
+  echo "  10 Cryptomining"
+  echo "  U  Unknown / broad triage"
+  read -rp "Select scenario [U] " SCEN </dev/tty; SCEN="$(echo "${SCEN:-U}" | tr a-z A-Z)"
+  case "$SCEN" in
+    1)  SCEN_NAME="Ransomware / destructive"; PLAN="artifacts persistence"; ATTACK="T1486,T1490,T1489,T1496"; FIRST="RAM FIRST (keys/beacon may be resident); check for deleted backups/snapshots (LVM/.snapshot/borg/restic); filesystem timeline via artifacts. DO NOT reboot.";;
+    2)  SCEN_NAME="BEC / cloud account compromise"; PLAN="artifacts"; ATTACK="T1078.004,T1114.003,T1098.002"; FIRST="Mostly OFF-HOST: pull M365 Unified Audit Log / Entra or cloud-IdP logs, forwarding rules, OAuth grants (docs/SCENARIOS.md). On-host is secondary.";;
+    3)  SCEN_NAME="Insider threat / data exfiltration"; PLAN="artifacts persistence filehashes"; ATTACK="T1567.002,T1052.001,T1560"; FIRST="Live process/handles + current network (rclone/scp/rsync in flight) + mounted media while live; then shell histories + ~/.config/rclone.";;
+    4)  SCEN_NAME="Web-server / public-app compromise (webshell)"; PLAN="weblogs artifacts persistence"; ATTACK="T1190,T1505.003,T1059"; FIRST="Live ss + process tree of the web service FIRST (memory-only shells), then web logs + webroot mtime timeline (job 7).";;
+    5)  SCEN_NAME="Commodity malware / C2 beacon"; PLAN="artifacts persistence"; ATTACK="T1071.001,T1071.004,T1573,T1055"; FIRST="RAM FIRST (beacon/injected code is memory-only), then live conn->PID->exe hash (/proc/<pid>/exe), DNS.";;
+    6)  SCEN_NAME="AD / Domain-Controller compromise"; PLAN="artifacts ad persistence"; ATTACK="T1003.006,T1558,T1207"; FIRST="Kerberos tickets (klist) + sssd/realm state + krb5.keytab; the Windows DCs are the primary target - this Linux host is a supporting angle.";;
+    7)  SCEN_NAME="Lateral movement / credential theft"; PLAN="artifacts persistence ad"; ATTACK="T1021.004,T1078,T1552.004"; FIRST="auth.log/secure (SSH lateral), ~/.ssh (authorized_keys/known_hosts/id_*), lastlog/wtmp/btmp, live sessions.";;
+    8)  SCEN_NAME="Living-off-the-land / fileless"; PLAN="artifacts persistence"; ATTACK="T1059.004,T1071,T1546"; FIRST="RAM + live process cmdlines (/proc/<pid>/cmdline), shell histories, /dev/shm + /tmp payloads, cron/systemd transient units.";;
+    9)  SCEN_NAME="Phishing initial access"; PLAN="artifacts persistence"; ATTACK="T1566,T1204,T1059"; FIRST="Downloads + /tmp payloads, mail spools, browser history; on Linux usually a server pivot - chain to C2/lateral.";;
+    10) SCEN_NAME="Cryptomining"; PLAN="persistence artifacts"; ATTACK="T1496,T1543.002,T1053.003"; FIRST="Live high-CPU process + cmdline + pool connections, cron/systemd/rc.local persistence, /tmp+/dev/shm miners; check for rootkit-hidden PIDs.";;
+    *)  SCEN="U"; SCEN_NAME="Unknown / broad triage"; PLAN="artifacts persistence ad"; ATTACK=""; FIRST="Standard RFC 3227 order-of-volatility triage.";;
+  esac
+  echo "  -> FIRST: $FIRST"
+
+  echo; echo "-- Host role / environment --"
+  echo "  [1] Workstation  [2] Server  [3] Cloud VM  [4] Container/k8s node  [5] OT/ICS  [6] Network device"
+  read -rp "Select role [2] " ROLE </dev/tty; ROLE="${ROLE:-2}"
+  case "$ROLE" in
+    1) HOST_ROLE="workstation";;
+    3) HOST_ROLE="cloud-vm"; echo "  -> Cloud VM: prefer a disk SNAPSHOT to a clean forensic instance; also pull cloud control-plane logs (CloudTrail/Activity/Audit).";;
+    4) HOST_ROLE="container"; echo "  -> Container/k8s: capture running-container state FAST (docker/crictl ps, image digests, diffs, SA tokens, kube audit) - pods are ephemeral. This captures the NODE.";;
+    5) HOST_ROLE="ot-ics"; DO_NO_HARM=1; echo "  -> OT/ICS DO-NO-HARM mode: no filesystem-hash walk / disk image / active enum. Host-only + passive. Availability > evidence.";;
+    6) HOST_ROLE="network-device"; echo "  -> Network device: collect OFF-box (config, ARP/CAM, routing, syslog, NetFlow) via console - this host tool does not apply.";;
+    *) HOST_ROLE="server";;
+  esac
+
+  read -rp "Scope: single host or fleet? (s/F) " SCOPE_IN </dev/tty
+  case "$SCOPE_IN" in [fF]*) SCOPE="fleet"; echo "  -> Fleet: promote to a Velociraptor HUNT (in tools/) - a targeted artifact set, not USB-per-box.";; *) SCOPE="single";; esac
+  read -rp "Connectivity: connected or airgapped/quarantined? (c/A) " CONN_IN </dev/tty
+  case "$CONN_IN" in [aA]*) CONNECTIVITY="airgapped";; *) CONNECTIVITY="connected";; esac
+
+  echo; echo "-- Known-bad indicators you already hold (comma-separated, Enter to skip) --"
+  read -rp "  Malicious IPs: " KB_IPS </dev/tty
+  read -rp "  Malicious domains: " KB_DOMAINS </dev/tty
+  read -rp "  Malicious hashes: " KB_HASHES </dev/tty
+  read -rp "  Suspect accounts: " KB_ACCOUNTS </dev/tty
+  read -rp "  Suspect files/paths: " KB_PATHS </dev/tty
+
+  echo; echo "-- Scope-out (Enter to skip) --"
+  read -rp "Earliest suspected activity (UTC): " FIRST_UTC </dev/tty
+  read -rp "When detected (UTC): " DETECT_UTC </dev/tty
+  read -rp "Crown jewels in scope: " CROWN </dev/tty
+  read -rp "Data at risk (PII/PHI/PCI/IP/creds/none) [unknown]: " DATARISK </dev/tty; DATARISK="${DATARISK:-unknown}"
+  read -rp "Severity 1-4 (1=critical) [3]: " SEVERITY </dev/tty; SEVERITY="${SEVERITY:-3}"
+
   read -rp "Is this host believed COMPROMISED? (Y/n) " a </dev/tty
   case "$a" in [nN]*) COMPROMISED=0;; *) COMPROMISED=1; echo "  -> Trusted-tool posture (carried tools + raw /proc). RAM + dead-box are ground truth.";; esac
   if lsblk -o TYPE,FSTYPE 2>/dev/null | grep -qiE 'crypt|luks'; then
     echo "  -> LUKS/dm-crypt DETECTED. The master key is in the RAM image - do NOT power off without it (or a recovery key)."; fi
-  echo; echo "-- Destination --"; echo "  Writing to: $OUTDIR"
-  echo; echo "-- Collection scope --"
-  echo "  [1] Volatile only        (RAM + live state, then seal)"
-  echo "  [2] Volatile + triage    (RECOMMENDED: + artifacts, persistence, AD)"
-  echo "  [3] EVERYTHING           (+ full file-hash inventory + full disk image - hours)"
-  read -rp "Select scope [2] " s </dev/tty; s="${s:-2}"
-  case "$s" in
-    1) VOL_ONLY=1; PLAN="";;
-    3) PLAN="artifacts persistence ad filehashes diskimage";;
-    *) PLAN="artifacts persistence ad";;
-  esac
+
+  # role overlays on the plan
+  [ "$HOST_ROLE" = "ot-ics" ] && PLAN="$(echo "$PLAN" | sed -E 's/(^| )filehashes( |$)/ /g; s/(^| )diskimage( |$)/ /g')"
+  [ "$SKIP_AD" = "1" ] && PLAN="$(echo "$PLAN" | sed -E 's/(^| )ad( |$)/ /g')"
+  PLAN="$(echo "$PLAN" | tr -s ' ' | sed 's/^ //; s/ $//')"
+
+  # write intake.json - seeds the detection generator with operator-supplied known-bad IOCs
+  cat > "$D_META/intake.json" 2>/dev/null <<EOF
+{ "case_id":"$(sani "$CASE")","scenario":"$SCEN","scenario_name":"$(sani "$SCEN_NAME")",
+  "attack_tags":$(json_arr "$ATTACK"),
+  "host_role":"$HOST_ROLE","scope":"$SCOPE","connectivity":"$CONNECTIVITY",
+  "known_bad_ips":$(json_arr "$KB_IPS"),"known_bad_domains":$(json_arr "$KB_DOMAINS"),
+  "known_bad_hashes":$(json_arr "$KB_HASHES"),"known_bad_accounts":$(json_arr "$KB_ACCOUNTS"),
+  "known_bad_paths":$(json_arr_c "$KB_PATHS"),
+  "first_activity_utc":"$(sani "$FIRST_UTC")","detection_utc":"$(sani "$DETECT_UTC")",
+  "crown_jewels":"$(sani "$CROWN")","data_at_risk":"$(sani "$DATARISK")","severity":"$(sani "$SEVERITY")",
+  "plan":"$PLAN","generated_by":"ir-collect.sh" }
+EOF
   GUIDED=1
   echo; echo "Plan: RAM+volatile -> GREEN gate -> ${PLAN:-seal}"
+  echo "Scenario: $SCEN_NAME  |  Role: $HOST_ROLE  |  Scope: $SCOPE  |  ATT&CK: $ATTACK"
+  audit "INTAKE scenario=$SCEN role=$HOST_ROLE scope=$SCOPE plan=$PLAN"
   read -rp "Press Enter to begin (Ctrl-C to abort) " _ </dev/tty
 }
 
@@ -589,7 +694,7 @@ if [ "$RAPID_ONLY" = "1" ] || [ "$VOL_ONLY" = "1" ]; then
   echo "volatile-only - sealing."
 elif [ "$AUTO" = "1" ]; then
   audit "Auto mode: running ALL heavy (non-volatile) jobs."
-  job_memory; job_artifacts; job_persistence; job_ad; job_filehashes; job_diskimage
+  job_memory; job_artifacts; job_persistence; job_ad; job_filehashes; job_diskimage; job_weblogs
 elif [ "$GUIDED" = "1" ]; then
   audit "Guided plan: $PLAN"
   for j in $PLAN; do "job_$j" || audit "job_$j fault - continuing"; done
