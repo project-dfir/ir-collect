@@ -64,8 +64,8 @@ BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 if [ -d "$TOOL_DIR/bin" ]; then export PATH="$TOOL_DIR/bin:$BASE_PATH"; TRUSTED_BIN=1
 else export PATH="$BASE_PATH"; TRUSTED_BIN=0; fi
 # Require bash 4+ (associative arrays). Re-exec a carried bash if the host bash is too old/absent.
-if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; then
-  if [ -x "$BIN/bash" ]; then exec "$BIN/bash" "$0" "$@"; fi
+if { [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO:-0}" -lt 4 ]; } && [ -z "${_IRC_REEXEC:-}" ]; then
+  if [ -x "$BIN/bash" ]; then export _IRC_REEXEC=1; exec "$BIN/bash" "$0" "$@"; fi
   echo "WARNING: bash 4+ recommended (associative arrays). Carry a static bash in tools/bin." >&2
 fi
 # Neutralize userland-rootkit hooks + non-deterministic locale for our own process.
@@ -459,8 +459,6 @@ run_menu() {
 # ===========================================================================
 seal() {
   audit "--- SEAL: manifest + report ---"
-  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -name 'audit.log' -print0 | xargs -0 sha256sum 2>/dev/null"
-
   local end; end="$(now_utc)"
   local donelist=""; for k in "${!DONE[@]}"; do donelist="$donelist $k"; done
   cat > "$OUTDIR/SUMMARY.md" 2>/dev/null <<EOF
@@ -478,6 +476,9 @@ seal() {
 Stage 1 (auto) secured volatile state in order of volatility. Stage 2 heavy jobs were operator-selected.
 See 99_logs/audit.log for the full timestamped trail; 99_logs/errors.log for recovered failures.
 EOF
+
+  # manifest LAST so it covers SUMMARY.md
+  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -name 'audit.log' -print0 | xargs -0 sha256sum 2>/dev/null"
 
   # ship to network destination
   if [ -n "$NETWORK_DEST" ]; then

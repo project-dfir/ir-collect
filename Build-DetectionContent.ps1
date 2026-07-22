@@ -21,7 +21,7 @@
 
 .PARAMETER CollectionDir  An IR-Collect output folder (<CASE>_<HOST>_<UTC>), or a parent of several.
 .PARAMETER OutDir         Where to write the package. Default: <CollectionDir>\_detection.
-.PARAMETER SidBase        Starting Suricata SID (local range). Default 9100000.
+.PARAMETER SidBase        Starting Suricata SID (local range). Default 1000000.
 
 .EXAMPLE  pwsh ./Build-DetectionContent.ps1 -CollectionDir E:\evidence\CASE001_HOST_20260722
 #>
@@ -29,7 +29,7 @@
 param(
     [Parameter(Mandatory)][string]$CollectionDir,
     [string]$OutDir,
-    [int]$SidBase = 9100000
+    [int]$SidBase = 1000000
 )
 $ErrorActionPreference = 'Continue'
 
@@ -46,13 +46,17 @@ if (-not $folders) { $folders = @($CollectionDir) }   # try anyway
 # ---------------------------------------------------------------------------
 # IOC accumulation
 # ---------------------------------------------------------------------------
+function Save-Text($path,$text){ [IO.File]::WriteAllText($path, ($text -replace "`r`n","`n"), (New-Object Text.UTF8Encoding($false))) }
+function New-DetUuid($seed){ $md5=[Security.Cryptography.MD5]::Create(); ([guid]::new($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($seed)))).ToString() }
+function New-DetId($prefix,$seed){ "$prefix--" + (New-DetUuid $seed) }
+$stixTs = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.000Z")
 $IOC = @{}   # key "type|value" -> object
 function Add-IOC {
     param([string]$Type,[string]$Value,[string]$Source,[string]$Hn)
     if ([string]::IsNullOrWhiteSpace($Value)) { return }
     $Value = $Value.Trim()
     $k = "$Type|$Value"
-    if (-not $IOC.ContainsKey($k)) { $IOC[$k] = [ordered]@{ type=$Type; value=$Value; source=$Source; host=$Hn } }
+    if (-not $IOC.ContainsKey($k)) { $IOC[$k] = [ordered]@{ type=$Type; value=$Value; source=$Source; host=$Hn; confidence=50; to_ids=$false } }
     elseif (($IOC[$k].host -split ';') -notcontains $Hn) { $IOC[$k].host = "$($IOC[$k].host);$Hn" }
 }
 
@@ -137,9 +141,10 @@ foreach ($i in $all) {
         'file-path'{ "[file:name = '$(( $i.value -split '[\\/]')[-1])']" }
         default    { $null }
     }
-    if ($pat) { $stixObjs += [ordered]@{ type='indicator'; spec_version='2.1'; pattern=$pat; pattern_type='stix'; description="IR-Collect $($i.type) from host $($i.host)" } }
+    if ($pat) { $stixObjs += [ordered]@{ type='indicator'; spec_version='2.1'; id=(New-DetId 'indicator' $pat); created=$stixTs; modified=$stixTs; valid_from=$stixTs; name="IR-Collect $($i.type)"; pattern=$pat; pattern_type='stix'; description="IR-Collect $($i.type) from host $($i.host)"; confidence=50; indicator_types=@('malicious-activity') } }
 }
-[ordered]@{ type='bundle'; objects=$stixObjs } | ConvertTo-Json -Depth 6 | Out-File (Join-Path $OutDir 'ioc\indicators.stix.json') -Encoding UTF8
+$bundle = [ordered]@{ type='bundle'; id=(New-DetId 'bundle' (($stixObjs | ForEach-Object { $_.pattern }) -join '|')); objects=$stixObjs }
+Save-Text (Join-Path $OutDir 'ioc\indicators.stix.json') ($bundle | ConvertTo-Json -Depth 6)
 
 # ---------------------------------------------------------------------------
 # 2. Splunk SPL hunt searches (for Splunk Enterprise Security)
@@ -163,66 +168,96 @@ if ($domains.Count) {
     $dOr   = ($domains | ForEach-Object { 'query=' + $Q + $_ + $Q + ' OR url=' + $Q + '*' + $_ + '*' + $Q }) -join ' OR '
     [void]$spl.AppendLine('### DNS resolution / web requests to captured domains')
     [void]$spl.AppendLine('| tstats count from datamodel=Network_Resolution where DNS.query IN (' + $dList + ') by DNS.src DNS.query')
-    [void]$spl.AppendLine('index=* sourcetype IN (stream:dns,*dns*,*proxy*,zeek*) (' + $dOr + ') | stats count by query src')
+    [void]$spl.AppendLine('index=* (sourcetype=stream:dns OR sourcetype=*dns* OR sourcetype=*proxy* OR sourcetype=zeek*) (' + $dOr + ') | stats count by query src')
     [void]$spl.AppendLine('')
 }
 if ($hashes.Count) {
     $hList = ($hashes | ForEach-Object { $Q + $_ + $Q }) -join ','
     [void]$spl.AppendLine('### Process/file execution of captured hashes (Sysmon/EDR)')
-    [void]$spl.AppendLine('index=* sourcetype IN (*Sysmon*,*EDR*,*CrowdStrike*) (Hashes IN (' + $hList + ') OR SHA256 IN (' + $hList + ')) | stats count values(Image) values(ComputerName) by _time')
+    [void]$spl.AppendLine('index=* (sourcetype=*Sysmon* OR sourcetype=*EDR* OR sourcetype=*CrowdStrike*) (Hashes IN (' + $hList + ') OR SHA256 IN (' + $hList + ')) | stats count values(Image) values(ComputerName) by _time')
     [void]$spl.AppendLine('')
 }
 if ($paths.Count) {
     $imgs = ($paths | ForEach-Object { 'Image=' + $Q + '*' + (($_ -split '[\\/]')[-1]) + $Q }) -join ' OR '
     [void]$spl.AppendLine('### Execution from suspicious paths (captured)')
-    [void]$spl.AppendLine('index=* sourcetype IN (*Sysmon*,WinEventLog:*) EventCode IN (1,4688) (' + $imgs + ') | stats count values(CommandLine) by Image ComputerName')
+    [void]$spl.AppendLine('index=* (sourcetype=*Sysmon* OR sourcetype=WinEventLog:*) EventCode IN (1,4688) (' + $imgs + ') | stats count values(CommandLine) by Image ComputerName')
     [void]$spl.AppendLine('')
 }
-$spl.ToString() | Out-File (Join-Path $OutDir 'splunk\hunt_searches.spl') -Encoding UTF8
+Save-Text (Join-Path $OutDir 'splunk\hunt_searches.spl') $spl.ToString()
 
 # Splunk ES correlation-search stub
 $ipListCsv = ($ips | ForEach-Object { $Q + $_ + $Q }) -join ','
 $corr = @"
-# Splunk ES correlation-search stubs (savedsearches.conf). Tune thresholds/throttle before enabling.
-[IR-Collect - C2 IP contact ($($folders.Count) host(s))]
-search = | tstats count from datamodel=Network_Traffic where All_Traffic.dest_ip IN ($ipListCsv) by All_Traffic.src_ip All_Traffic.dest_ip
-action.notable = 1
-action.notable.param.severity = high
+# Splunk ES correlation search (savedsearches.conf). Review + enable in ES. Tune throttle/thresholds.
+[IR-Collect - C2 IP contact]
+search = | tstats count min(_time) as firstTime max(_time) as lastTime from datamodel=Network_Traffic where All_Traffic.dest_ip IN ($ipListCsv) by All_Traffic.src_ip All_Traffic.dest_ip
+disabled = 1
+enableSched = 1
 cron_schedule = */10 * * * *
+dispatch.earliest_time = -24h
+dispatch.latest_time = now
+counttype = number of events
+quantity = 0
+relation = greater than
+alert.track = 1
+action.correlationsearch.enabled = 1
+action.correlationsearch.label = IR-Collect - C2 IP contact
+action.notable = 1
+action.notable.param.rule_title = IR-Collect - C2 IP contact
+action.notable.param.rule_description = Endpoint contacted an external IP captured from a compromised host during IR triage.
+action.notable.param.security_domain = network
+action.notable.param.severity = high
+action.notable.param.nes_fields = src,dest
 description = Endpoint contacted an IP captured from a compromised host during IR triage.
 "@
-if ($ips.Count) { $corr | Out-File (Join-Path $OutDir 'splunk\savedsearches.conf') -Encoding UTF8 } else { '# no external IPs captured - no correlation search generated' | Out-File (Join-Path $OutDir 'splunk\savedsearches.conf') -Encoding UTF8 }
+if ($ips.Count) { Save-Text (Join-Path $OutDir 'splunk\savedsearches.conf') $corr } else { Save-Text (Join-Path $OutDir 'splunk\savedsearches.conf') '# no external IPs captured - no correlation search generated' }
 
 # ---------------------------------------------------------------------------
 # 3. Sigma rules (vendor-neutral -> convert to Splunk or Sec Onion with pySigma)
 # ---------------------------------------------------------------------------
-if ($ips.Count -or $domains.Count) {
-    $det=@(); $cond=@()
-    if ($ips.Count) { $det += '  selection_ip:'; $det += '    DestinationIp:'; $ips | ForEach-Object { $det += "      - $_" }; $cond += 'selection_ip' }
-    if ($domains.Count) { $det += '  selection_dns:'; $det += '    query:'; $domains | ForEach-Object { $det += "      - $_" }; $cond += 'selection_dns' }
+if ($ips.Count) {
+    $det=@('  selection:','    DestinationIp:'); $ips | ForEach-Object { $det += "      - $_" }
     $y = @"
-title: IR-Collect C2 network indicators
-id: $([guid]::NewGuid())
+title: IR-Collect C2 destination IPs
+id: $(New-DetUuid ("ipnet|" + ($ips -join ',')))
 status: experimental
-description: Network indicators captured from compromised host(s) during IR triage.
+description: External destination IPs captured from compromised host(s) during IR triage.
 logsource:
   category: network_connection
 detection:
 $($det -join "`n")
-  condition: $($cond -join ' or ')
+  condition: selection
 level: high
 tags:
   - attack.command_and_control
 "@
-    [IO.File]::WriteAllText((Join-Path $OutDir 'sigma\c2_network_indicators.yml'), $y, (New-Object Text.UTF8Encoding($false)))
+    Save-Text (Join-Path $OutDir 'sigma\c2_ip_indicators.yml') $y
+}
+if ($domains.Count) {
+    $det=@('  selection:','    QueryName:'); $domains | ForEach-Object { $det += "      - $_" }
+    $y = @"
+title: IR-Collect C2 DNS queries
+id: $(New-DetUuid ("dns|" + ($domains -join ',')))
+status: experimental
+description: DNS queries to domains captured from compromised host(s) during IR triage.
+logsource:
+  category: dns_query
+detection:
+$($det -join "`n")
+  condition: selection
+level: high
+tags:
+  - attack.command_and_control
+"@
+    Save-Text (Join-Path $OutDir 'sigma\c2_dns_indicators.yml') $y
 }
 if ($hashes.Count -or $paths.Count) {
     $det=@(); $cond=@()
     if ($hashes.Count) { $det += '  selection_hash:'; $det += '    Hashes|contains:'; $hashes | ForEach-Object { $det += "      - $_" }; $cond += 'selection_hash' }
-    if ($paths.Count) { $det += '  selection_image:'; $det += '    Image|endswith:'; ($paths | ForEach-Object { ($_ -split '[\/]')[-1] } | Select-Object -Unique) | ForEach-Object { $det += "      - $_" }; $cond += 'selection_image' }
+    if ($paths.Count) { $det += '  selection_image:'; $det += '    Image|endswith:'; ($paths | ForEach-Object { ($_ -split '[\\/]')[-1] } | Select-Object -Unique) | ForEach-Object { $det += "      - $_" }; $cond += 'selection_image' }
     $y = @"
 title: IR-Collect malicious process indicators
-id: $([guid]::NewGuid())
+id: $(New-DetUuid ("proc|" + (($hashes + $paths) -join ',')))
 status: experimental
 description: Process/file indicators captured from compromised host(s) during IR triage.
 logsource:
@@ -234,7 +269,7 @@ level: high
 tags:
   - attack.execution
 "@
-    [IO.File]::WriteAllText((Join-Path $OutDir 'sigma\malicious_process_indicators.yml'), $y, (New-Object Text.UTF8Encoding($false)))
+    Save-Text (Join-Path $OutDir 'sigma\malicious_process_indicators.yml') $y
 }
 
 # ---------------------------------------------------------------------------
@@ -251,7 +286,7 @@ foreach ($d in $domains) {
     [void]$sur.AppendLine("alert dns `$HOME_NET any -> any any (msg:`"IR-Collect C2 domain $d`"; dns.query; content:`"$d`"; nocase; classtype:trojan-activity; sid:$sid; rev:1; metadata:source ir-collect;)")
     $sid++
 }
-[IO.File]::WriteAllText((Join-Path $OutDir 'suricata\local.rules'), $sur.ToString(), (New-Object Text.UTF8Encoding($false)))
+Save-Text (Join-Path $OutDir 'suricata\local.rules') $sur.ToString()
 
 # ---------------------------------------------------------------------------
 # 5. Zeek Intelligence Framework feed (Security Onion)
@@ -261,7 +296,7 @@ $zeek = New-Object System.Text.StringBuilder
 foreach ($ip in $ips)     { [void]$zeek.AppendLine("$ip`tIntel::ADDR`tIR-Collect`tC2 IP from IR triage") }
 foreach ($d in $domains)  { [void]$zeek.AppendLine("$d`tIntel::DOMAIN`tIR-Collect`tC2 domain from IR triage") }
 foreach ($h in $hashes)   { $alg = if($h.Length -eq 40){'sha1'}elseif($h.Length -eq 32){'md5'}else{'sha256'}; [void]$zeek.AppendLine("$h`tIntel::FILE_HASH`tIR-Collect`t$alg hash from IR triage (Zeek matches its computed algo)") }
-[IO.File]::WriteAllText((Join-Path $OutDir 'zeek\ircollect.intel'), $zeek.ToString(), (New-Object Text.UTF8Encoding($false)))
+Save-Text (Join-Path $OutDir 'zeek\ircollect.intel') $zeek.ToString()
 
 # ---------------------------------------------------------------------------
 # HANDOFF.md for the follow-on team
