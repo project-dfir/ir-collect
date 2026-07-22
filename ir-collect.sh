@@ -518,11 +518,15 @@ EOF
   if [ -n "$NETWORK_DEST" ]; then
     audit "Shipping evidence to $NETWORK_DEST"
     local zip="$OUTDIR.tar.gz"
+    # host-key pinning: set IR_SSH_KNOWN_HOSTS to a pre-provisioned known_hosts to defeat first-contact
+    # MITM on evidence in transit (aligns with the most-secure-route rule); else fall back to TOFU.
+    local SSHOPT="-o StrictHostKeyChecking=accept-new"
+    [ -n "$IR_SSH_KNOWN_HOSTS" ] && SSHOPT="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$IR_SSH_KNOWN_HOSTS"
     run_sh seal-tar - "$D_LOG" 3600 0 "tar czf '$zip' -C '$OUT_ROOT' '$(basename "$OUTDIR")' && sha256sum '$zip' > '$zip.sha256'"
     if command -v rsync >/dev/null 2>&1; then
-      run_step ship-rsync - "$D_LOG" 3600 0 rsync -avz -e "ssh -o StrictHostKeyChecking=accept-new" "$zip" "$zip.sha256" "$NETWORK_DEST/"
+      run_step ship-rsync - "$D_LOG" 3600 0 rsync -avz -e "ssh $SSHOPT" "$zip" "$zip.sha256" "$NETWORK_DEST/"
     elif command -v scp >/dev/null 2>&1; then
-      run_step ship-scp - "$D_LOG" 3600 0 scp -o StrictHostKeyChecking=accept-new "$zip" "$zip.sha256" "$NETWORK_DEST/"
+      run_step ship-scp - "$D_LOG" 3600 0 scp $SSHOPT "$zip" "$zip.sha256" "$NETWORK_DEST/"
     else
       audit "No rsync/scp - evidence kept locally at $zip"
     fi

@@ -49,6 +49,8 @@ if (-not $folders) { $folders = @($CollectionDir) }   # try anyway
 function Save-Text($path,$text){ [IO.File]::WriteAllText($path, ($text -replace "`r`n","`n"), (New-Object Text.UTF8Encoding($false))) }
 function New-DetUuid($seed){ $md5=[Security.Cryptography.MD5]::Create(); ([guid]::new($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($seed)))).ToString() }
 function New-DetId($prefix,$seed){ "$prefix--" + (New-DetUuid $seed) }
+function Esc-Stix($v){ "$v" -replace '\\','\\\\' -replace "'","\'" }   # STIX string: backslash + single-quote
+function Yaml-Q($v){ '"' + ("$v" -replace '\\','\\\\' -replace '"','\"') + '"' }   # safe double-quoted YAML scalar
 $stixTs = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.000Z")
 $IOC = @{}   # key "type|value" -> object
 function Add-IOC {
@@ -161,9 +163,9 @@ $stixObjs = @()
 foreach ($i in $all) {
     $pat = switch ($i.type) {
         'ipv4-c2'  { "[network-traffic:dst_ref.type = 'ipv4-addr' AND network-traffic:dst_ref.value = '$($i.value)']" }
-        'domain'   { "[domain-name:value = '$($i.value)']" }
+        'domain'   { "[domain-name:value = '$(Esc-Stix $i.value)']" }
         'hash'     { $alg = if($i.value.Length -eq 40){'SHA-1'}elseif($i.value.Length -eq 32){'MD5'}else{'SHA-256'}; "[file:hashes.'$alg' = '$($i.value)']" }
-        'file-path'{ "[file:name = '$(( $i.value -split '[\\/]')[-1])']" }
+        'file-path'{ "[file:name = '$(Esc-Stix (( $i.value -split '[\\/]')[-1]))']" }
         default    { $null }
     }
     if ($pat) { $stixObjs += [ordered]@{ type='indicator'; spec_version='2.1'; id=(New-DetId 'indicator' $pat); created=$stixTs; modified=$stixTs; valid_from=$stixTs; name="IR-Collect $($i.type)"; pattern=$pat; pattern_type='stix'; description="IR-Collect $($i.type) from host $($i.host)"; confidence=50; indicator_types=@('malicious-activity') } }
@@ -281,7 +283,7 @@ $sigTags
 if ($hashes.Count -or $paths.Count) {
     $det=@(); $cond=@()
     if ($hashes.Count) { $det += '  selection_hash:'; $det += '    Hashes|contains:'; $hashes | ForEach-Object { $det += "      - $_" }; $cond += 'selection_hash' }
-    if ($paths.Count) { $det += '  selection_image:'; $det += '    Image|endswith:'; ($paths | ForEach-Object { ($_ -split '[\\/]')[-1] } | Select-Object -Unique) | ForEach-Object { $det += "      - $_" }; $cond += 'selection_image' }
+    if ($paths.Count) { $det += '  selection_image:'; $det += '    Image|endswith:'; ($paths | ForEach-Object { ($_ -split '[\\/]')[-1] } | Select-Object -Unique) | ForEach-Object { $det += ('      - ' + (Yaml-Q $_)) }; $cond += 'selection_image' }
     $y = @"
 title: IR-Collect malicious process indicators
 id: $(New-DetUuid ("proc|" + (($hashes + $paths) -join ',')))
