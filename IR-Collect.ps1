@@ -282,6 +282,13 @@ try {
 } catch {}
 Write-Audit "PREFLIGHT: privilege=$(if($isAdmin){'full'}else{'PARTIAL - not elevated'}) langMode=$($ExecutionContext.SessionState.LanguageMode) 64bit=$([Environment]::Is64BitProcess)"
 Write-Audit "FOOTPRINT: tools run from '$PSScriptRoot' (NOT installed on target); evidence written only to destination; live-collection footprint is documented in this log. For non-volatile ground truth follow with a dead-box disk image."
+try {
+    $pt = (Get-CimInstance Win32_OperatingSystem).ProductType  # 1 = workstation
+    if ($pt -eq 1 -and $domainJoined -and ((whoami /groups 2>$null) -match 'Domain Admins|Enterprise Admins|Schema Admins')) {
+        Write-Host "!!! TIERED-ADMIN RISK: high-privilege domain token (Domain/Enterprise Admin) on a WORKSTATION-class host. Credentials are exposed to a possibly-compromised box. Use a Tier-2 IR account. !!!" -ForegroundColor Red
+        Write-Audit "WARNING: high-privilege domain token on workstation-class host (tiered-admin violation / credential-exposure risk)."
+    }
+} catch {}
 
 # ===========================================================================
 # STAGE 1 - RAPID VOLATILE GRAB (automatic, order of volatility)
@@ -605,7 +612,17 @@ Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
     if ($NetworkDest) {
         Write-Audit "Shipping evidence to network destination $NetworkDest"
         $zip = "$OutDir.zip"
-        Invoke-Step 'seal-zip' ([scriptblock]::Create("Add-Type -AssemblyName System.IO.Compression.FileSystem; if(Test-Path '$zip'){Remove-Item '$zip' -Force}; [System.IO.Compression.ZipFile]::CreateFromDirectory('$OutDir','$zip')")) $null $Dirs.logs -TimeoutSec 3600 -Retries 0 | Out-Null
+        if ("$($ExecutionContext.SessionState.LanguageMode)" -eq 'FullLanguage') {
+            $zipSb = "Add-Type -AssemblyName System.IO.Compression.FileSystem; if(Test-Path '$zip'){Remove-Item '$zip' -Force}; [System.IO.Compression.ZipFile]::CreateFromDirectory('$OutDir','$zip')"
+        } else {
+            $zipSb = "Compress-Archive -Path '$OutDir\*' -DestinationPath '$zip' -Force"   # CLM-safe (cmdlet); may fail >2GB
+        }
+        Invoke-Step 'seal-zip' ([scriptblock]::Create($zipSb)) $null $Dirs.logs -TimeoutSec 3600 -Retries 0 | Out-Null
+        # CLM/large-file fallback: ship the raw folder via robocopy if no zip was produced
+        if (-not (Test-Path $zip) -and -not $Cred) {
+            Write-Audit "seal-zip produced no archive - shipping raw folder via robocopy instead."
+            Invoke-Step 'ship-folder' ([scriptblock]::Create("robocopy '$OutDir' '$NetworkDest\$(Split-Path $OutDir -Leaf)' /E /Z /R:1 /W:1 /NFL /NDL /NP")) $null $Dirs.logs -TimeoutSec 7200 -Retries 0 | Out-Null
+        }
         try { (Get-FileHash $zip -Algorithm SHA256).Hash | Out-File "$zip.sha256" -Encoding ASCII } catch {}
         # map the share (with creds if provided), copy, unmap
         try {
@@ -732,3 +749,10 @@ try {
 }
 catch { Write-Audit "FATAL in main: $($_.Exception.Message) - proceeding to seal." }
 finally { Complete-Run }
+
+# --- exit-code contract: 0 clean | 10 completed-with-skips | 20 RAM not verified | 40 fatal ---
+$exitCode = 0
+if ($script:StepsFail -gt 0) { $exitCode = 10 }
+if (-not $script:MemOk -and -not $RapidOnly) { $exitCode = 20 }
+Write-Audit "EXIT $exitCode (0=clean 10=skips 20=no-RAM 40=fatal)"
+exit $exitCode

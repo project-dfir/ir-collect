@@ -153,6 +153,7 @@ if command -v timeout >/dev/null 2>&1; then
   timeout -k 1 1 true >/dev/null 2>&1 && TMO_K="-k 5"
 fi
 SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid"
+NICE=""; command -v nice >/dev/null 2>&1 && NICE="nice -n 19"; command -v ionice >/dev/null 2>&1 && NICE="ionice -c3 $NICE"
 
 run_step() {
   local name="$1" outfile="$2" dir="$3" tmo="$4" retries="$5"; shift 5
@@ -364,13 +365,13 @@ job_persistence() {
   run_sh pers-systemd  systemd.txt  "$D_PERS" 60 1 'systemctl list-units --type=service --all --no-pager 2>/dev/null; echo "=== unit files ==="; systemctl list-unit-files --no-pager 2>/dev/null; echo "=== timers ==="; systemctl list-timers --all --no-pager 2>/dev/null'
   run_sh pers-startup  startup.txt  "$D_PERS" 60 1 'echo "=== rc.local ==="; cat /etc/rc.local 2>/dev/null; echo "=== init.d ==="; ls -la /etc/init.d 2>/dev/null; echo "=== ld.so.preload ==="; cat /etc/ld.so.preload 2>/dev/null; echo "=== autostart ==="; ls -la /home/*/.config/autostart ~/.config/autostart 2>/dev/null'
   run_sh pers-packages packages.txt "$D_PERS" 120 1 'dpkg -l 2>/dev/null || rpm -qa 2>/dev/null'
-  run_sh pers-suid     suid_sgid.txt "$D_PERS" 300 0 'find / -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec ls -l {} \; 2>/dev/null'
+  run_sh pers-suid     suid_sgid.txt "$D_PERS" 300 0 "$NICE "'find / -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec ls -l {} \; 2>/dev/null'
   run_sh pers-caps     capabilities.txt "$D_PERS" 300 0 'getcap -r / 2>/dev/null'
   DONE[persistence]=1
 }
 job_filehashes() {
   audit "--- HEAVY: full filesystem SHA-256 inventory ---"
-  run_sh hash-all filehashes.csv "$D_ART" 7200 0 'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,\"$f\""; done'
+  run_sh hash-all filehashes.csv "$D_ART" 7200 0 "$NICE "'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,\"$f\""; done'
   DONE[filehashes]=1
 }
 job_ad() {
@@ -398,7 +399,7 @@ job_diskimage() {
   if command -v dd >/dev/null 2>&1; then
     for disk in $(lsblk -dnp -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
       n="$(basename "$disk")"
-      run_sh disk-$n - "$D_DISK" 36000 0 "set -o pipefail; dd if=$disk conv=noerror,sync bs=4M status=progress 2>>'$AUDIT' | gzip > '$D_DISK/${n}.raw.gz' && sha256sum '$D_DISK/${n}.raw.gz' > '$D_DISK/${n}.sha256'"
+      run_sh disk-$n - "$D_DISK" 36000 0 "set -o pipefail; $NICE dd if=$disk conv=noerror,sync bs=4M status=progress 2>>'$AUDIT' | gzip > '$D_DISK/${n}.raw.gz' && sha256sum '$D_DISK/${n}.raw.gz' > '$D_DISK/${n}.sha256'"
     done
   else
     run_sh disk-note DISK_NOT_IMAGED.txt "$D_DISK" 30 0 'echo "dd not found - cannot image."'

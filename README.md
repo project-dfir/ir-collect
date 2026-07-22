@@ -12,8 +12,8 @@ missing tool is logged and skipped; the run never halts.
 **Start here:** the collectors default to a **guided intake** (answer a few questions about the source/
 compromised host; it drives volatile → non-volatile). Read **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a
 real collection (pre-touch decisions, encryption, authorization), **[docs/GAPS.md](docs/GAPS.md)** for what
-a single-box tool can't see (network/identity/cloud vantage points), and **[docs/DETECTION.md](docs/DETECTION.md)**
-for turning a capture into Splunk ES / Security Onion content. Build the tool payload once with `fetch-tools.*`.
+a single-box tool can't see (network/identity/cloud vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security Onion content,
+and **[docs/ENTERPRISE.md](docs/ENTERPRISE.md)** for deployment at scale (signing/CLM, EDR deconfliction, fleet bridge). Build the tool payload once with `fetch-tools.*`.
 
 ### Repository layout
 ```
