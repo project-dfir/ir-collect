@@ -663,16 +663,16 @@ EOF
   : "${nok:=0}" "${nfail:=0}" "${ntmo:=0}" "${nskip:=0}" "${nplan:=0}"
   local incomplete=""
   [ "${MEM_OK:-0}" != 1 ] && [ "$RAPID_ONLY" != 1 ] && incomplete="memory(no-verified-RAM)"
-  local failed_names; failed_names=$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)".*//p' | sort -u | tr '
-' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+  local failed_names; failed_names=$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
   [ -n "$failed_names" ] && incomplete="$(echo "$incomplete $failed_names" | sed 's/^ //; s/ $//')"
+  incomplete="$(printf %s "$incomplete" | tr -cd '[:alnum:] ._():/-' | sed 's/  */ /g; s/^ //; s/ $//')"
   local verdict=COMPLETE; [ -n "$incomplete" ] && verdict=INCOMPLETE
   cat > "$D_LOG/run_state.json" 2>/dev/null <<RSEOF
 { "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
   "ended_utc":"$end","status":"$( [ "$verdict" = COMPLETE ] && echo complete || echo partial )","resumed":$( [ -n "${RESUME_DIR:-}" ] && echo true || echo false ),
   "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
   "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
-  "completeness":{"verdict":"$verdict","incomplete":"$(printf '%s' "$incomplete" | tr -d '\"' )"} }
+  "completeness":{"verdict":"$verdict","incomplete":"$incomplete"} }
 RSEOF
   { echo; echo "## Completeness - $verdict"; echo "- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)"; [ -n "$incomplete" ] && echo "- incomplete:$incomplete"; echo "- resume: ./kit/ir-collect.sh --resume '$OUTDIR'"; } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
   RUN_INCOMPLETE=$( [ "$verdict" = COMPLETE ] && echo 0 || echo 1 )
