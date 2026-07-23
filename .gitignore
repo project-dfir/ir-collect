@@ -32,3 +32,7 @@ Thumbs.db
 
 # fetched mobile forensics tools (adb/iLEAPP/ALEAPP/androidqf)
 tools/mobile/
+
+# python bytecode
+**/__pycache__/
+*.pyc

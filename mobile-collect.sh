@@ -23,7 +23,7 @@ set -u
 # ---------------------------------------------------------------------------
 DEST="."; CASE="MOB"; PLATFORM=""; SERIAL=""; AUTO=0; DO_MVT=0; ANALYZE=0
 BACKUP_PASS=""; FARADAY=0; ISOLATE=0; ALLOW_ROOT=0
-AUTHORIZER=""; LEGAL=""; SCOPE=""
+AUTHORIZER=""; LEGAL=""; SCOPE=""; SCENARIO="U"
 while [ $# -gt 0 ]; do case "$1" in
   -d|--dest)       DEST="$2"; shift 2;;
   -c|--case)       CASE="$2"; shift 2;;
@@ -31,6 +31,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --ios)           PLATFORM=ios; shift;;
   --serial|--udid) SERIAL="$2"; shift 2;;
   --auto)          AUTO=1; shift;;
+  --scenario)      SCENARIO="$2"; shift 2;;
   --mvt|--analyze) DO_MVT=1; ANALYZE=1; shift;;
   --backup-pass)   BACKUP_PASS="$2"; shift 2;;
   --faraday)       FARADAY=1; shift;;
@@ -109,11 +110,37 @@ run() {  # run <name> <timeout_s> <outfile|-> cmd...
 }
 
 # ---------------------------------------------------------------------------
+# incident scenario (mirrors the host collectors) -> ATT&CK-Mobile tags + emphasis + forced analysis
+# ---------------------------------------------------------------------------
+OFF_DEVICE=0; SCEN_NAME="Unknown / broad triage"; ATTACK=""; FIRST="Standard logical acquisition."
+case "$(echo "$SCENARIO" | tr A-Z a-z)" in
+  smish)   SCEN_NAME="Smishing / mobile phishing"; ATTACK="T1660,T1456,T1204,T1417"; ANALYZE=1;
+           FIRST="Grab SMS/MMS + notification history + browser URL + the install-source of any app sideloaded right after the lure (before the user deletes the message).";;
+  spyware) SCEN_NAME="Mobile spyware / stalkerware"; ATTACK="T1636,T1430,T1429,T1512,T1417,T1521,T1631"; ANALYZE=1; FARADAY=${FARADAY};
+           FIRST="DO NOT REBOOT (zero-click implants are memory-resident). Faraday-isolate. Capture live syslog/logcat + crash reports FIRST, then MVT check-backup/bugreport over shutdown.log/DataUsage/WebKit/tcc.db + accessibility/appops/device_policy.";;
+  mdm)     SCEN_NAME="Malicious MDM / configuration-profile compromise"; ATTACK="T1626.001,T1629,T1478,T1474"; ANALYZE=1;
+           FIRST="Enumerate + snapshot installed configuration/provisioning profiles, trusted CA certs, VPN/proxy payloads, MDM enrollment BEFORE anyone revokes them; DIFF against the corporate baseline (rogue CA/proxy/silent-install = red flag).";;
+  bec|token) SCEN_NAME="Mobile BEC / on-device token theft"; ATTACK="T1635,T1409,T1417.001,T1521,T1636.004"; ANALYZE=1;
+           FIRST="iOS encrypted backup = Keychain (OAuth/refresh tokens); Android dumpsys account + mail-app data. Pair with host scenario 2 cloud UAL/Entra pull - the phone is the token origin.";;
+  exfil)   SCEN_NAME="Mobile as exfil destination"; ATTACK="T1533,T1544,T1567";
+           FIRST="Pull + hash /sdcard (Android) / Files+camera-roll (iOS) to find copied corporate files; inventory cloud-sync apps + DataUsage; correlate the phone serial to the workstation USBSTOR mount.";;
+  beacon)  SCEN_NAME="Mobile C2 beacon"; ATTACK="T1437.001,T1521,T1481"; ANALYZE=1;
+           FIRST="Capture live dumpsys connectivity/netstats + full logcat (Android) / DataUsage+syslog (iOS) BEFORE isolation, then MVT IOC check for beaconing domains.";;
+  ransom)  SCEN_NAME="Mobile extortion channel"; ATTACK="T1471,T1516";
+           FIRST="Grab the extortion/leak-site contact evidence: SMS/notification, messaging-app DBs, any dropped locker APK / config profile. Do NOT wipe or reset.";;
+  lost)    SCEN_NAME="Lost / stolen device (off-device)"; ATTACK="T1461,T1626"; OFF_DEVICE=1;
+           FIRST="Device usually absent/locked -> OFF-DEVICE workflow: Find My / MDM console (last check-in, location, remote-lock/wipe issued?), iCloud/Google account activity, carrier records. If recovered + unlocked: Faraday, then normal acquisition.";;
+  *)       SCENARIO="U";;
+esac
+
+# ---------------------------------------------------------------------------
 # doctrine gate (authorization + network isolation vs remote wipe)
 # ---------------------------------------------------------------------------
 echo
 echo "================ MOBILE ACQUISITION - $PLATFORM ($SERIAL) ================"
 echo " Examiner: $EXAMINER   Case: $CASE   Out: $OUT"
+echo " Scenario: $SCEN_NAME  (ATT&CK-Mobile: ${ATTACK:-none})"
+[ -n "$ATTACK" ] && echo "  -> FIRST: $FIRST"
 echo " DOCTRINE: open-source LOGICAL acquisition only (non-root Android / encrypted iOS backup)."
 echo "           physical / full-filesystem needs jailbreak or proprietary tools - NOT attempted."
 log "START platform=$PLATFORM serial=$SERIAL examiner=$EXAMINER os=$OS authorizer=${AUTHORIZER:-none}"
@@ -330,6 +357,7 @@ seal() {
   cat > "$OUT/meta/collection_info.json" <<EOF
 { "tool":"mobile-collect.sh","platform":"$PLATFORM","serial":"$SERIAL","case":"$CASE",
   "examiner":"$EXAMINER","examiner_os":"$OS","startUtc":"$STARTUTC","endUtc":"$end",
+  "scenario":"$SCENARIO","scenario_name":"$SCEN_NAME","attack_tags":"$ATTACK",
   "acquisition_tier":"${ACQ_TIER:-logical}","faraday":$FARADAY,"analyzed":$ANALYZE,
   "backup_password":"$bkpw",
   "authorizer":"$AUTHORIZER","legal_basis":"$LEGAL","scope":"$SCOPE","toolVersions":"$tv" }
@@ -363,7 +391,24 @@ trap finish EXIT
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
-if [ "$PLATFORM" = android ]; then collect_android; analyze_android
-else collect_ios; analyze_ios; fi
-extract_iocs
+if [ "$OFF_DEVICE" = 1 ]; then
+  log "OFF-DEVICE scenario (lost/stolen) - writing an off-device investigation checklist instead of a tethered acquisition."
+  cat > "$OUT/artifacts/OFF_DEVICE_CHECKLIST.md" <<'CL'
+# Lost / Stolen Device - Off-Device Investigation Checklist
+The device is not in hand (or is locked with no passcode). Collect from the platforms it touches:
+- [ ] Find My iPhone / Google Find My Device: status, last check-in, last known location, is a remote lock/WIPE pending or issued?
+- [ ] MDM/EMM console (Intune / Workspace ONE / Jamf / MobileIron): last sync, compliance, issued lost-mode/wipe commands, installed profiles/apps.
+- [ ] iCloud (appleid.apple.com) / Google account activity: recent sign-ins, new devices, security events, data access.
+- [ ] Carrier: call/SMS records, IMEI status, SIM swap history.
+- [ ] Corporate SSO/IdP (Entra/Okta) sign-in logs for the user + this device id; revoke tokens/sessions.
+- [ ] If RECOVERED and UNLOCKED: Faraday-isolate immediately, then re-run this tool tethered.
+- [ ] If passcode-locked with no passcode: open-source acquisition ends here -> escalate to Cellebrite/GrayKey/XRY.
+CL
+  hashf "$OUT/artifacts/OFF_DEVICE_CHECKLIST.md"
+  ACQ_TIER="off-device (lost/stolen checklist)"
+else
+  if [ "$PLATFORM" = android ]; then collect_android; analyze_android
+  else collect_ios; analyze_ios; fi
+  extract_iocs
+fi
 finish

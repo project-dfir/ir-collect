@@ -43,7 +43,7 @@ hash-walk and disk image entirely).
 Each entry: the **grab-first** perishable item, the auto **plan**, ATT&CK, and what generic triage would
 otherwise miss. Event IDs are Windows Security unless a channel is named.
 
-### 1 · Ransomware / destructive — `T1486, T1490, T1489`
+### 1 · Ransomware / destructive — `T1486, T1490, T1489, T1562.001`
 - **First:** RAM (keys/beacon may be resident) → **preserve Volume Shadow Copies (job 9)** before malware
   or an admin deletes them → `$MFT`/`$UsnJrnl` timeline via triage. **Do not reboot.**
 - **Misses otherwise:** USN journal (time-boxes the whole encryption run), live VSS state, `vssadmin/wbadmin/bcdedit`
@@ -161,3 +161,51 @@ before it reschedules.
 Put the operator's already-known indicators into the intake (Malicious IPs/domains/hashes/accounts/paths)
 — the generator seeds them at **confidence 75 / to_ids** so the fleet sweep starts from known-bad, then adds
 the mined candidates around them.
+
+---
+
+## Mobile scenarios (Android / iPhone)
+
+A phone is a **device column** in the incident, not a separate tool. The host guided intake asks *"was a
+mobile device involved?"* and, based on the host scenario, prints the matching `mobile-collect.sh
+--scenario <id>` command. `mobile-collect.sh` carries the same scenario doctrine (grab-first order,
+ATT&CK-**Mobile** tags, forced analysis) and its findings fold into the **same** detection handoff +
+ATT&CK Navigator layer as the host (via `detection/mobile_iocs.csv` → `Build-DetectionContent.ps1`).
+Grounded in **NIST SP 800-101r1** (mobile), MVT methodology, and ATT&CK Mobile (T14xx/T15xx/T16xx).
+
+| id | Scenario | ATT&CK-Mobile | Grab-first / emphasis |
+|---|---|---|---|
+| `smish` | Smishing / mobile phishing | T1660,T1456,T1204,T1417 | SMS/MMS + notifications + browser URL + install-source of an app sideloaded right after the lure |
+| `spyware` | Mobile spyware / stalkerware (Pegasus-class) | T1636,T1430,T1429,T1512,T1417,T1521 | **Do not reboot**; Faraday; live syslog/logcat + crash reports FIRST → MVT over shutdown.log/DataUsage/WebKit/tcc.db + accessibility/appops/device_policy |
+| `mdm` | Malicious MDM / config-profile compromise | T1626.001,T1629,T1478,T1474 | Snapshot installed profiles / trusted CAs / VPN payloads / MDM enrollment → **diff vs corporate baseline** |
+| `bec`/`token` | Mobile BEC / on-device token theft | T1635,T1409,T1417.001,T1636.004 | iOS encrypted backup = Keychain (OAuth/refresh tokens); Android `dumpsys account` + mail-app data; pair with host BEC cloud pull |
+| `exfil` | Mobile as exfil destination | T1533,T1544,T1567 | Hash `/sdcard` (Android) / Files+camera-roll (iOS); cloud-sync app inventory; correlate phone serial ↔ workstation USBSTOR |
+| `beacon` | Mobile C2 beacon | T1437.001,T1521,T1481 | Live connectivity/netstats + full logcat before isolation → MVT IOC check |
+| `ransom` | Mobile extortion channel | T1471,T1516 | Extortion/leak-site contact evidence (SMS/notifications, messaging DBs, dropped locker APK/profile). Do **not** wipe |
+| `lost` | Lost / stolen device | T1461,T1626 | **Off-device**: Find My / MDM console / iCloud-Google activity / carrier; only tether if recovered + unlocked (writes an off-device checklist) |
+
+**How host scenarios map to a mobile profile** (what the intake suggests): BEC→`bec`, insider-exfil→`exfil`,
+phishing→`smish`, C2→`beacon`, cryptomining→`spyware`, AD/lateral→`token`, ransomware→`ransom`.
+
+### Scenario × device coverage (summary)
+
+`P`=primary · `✓`=in scope · `S`=secondary · `R`=off-box/control-plane · `—`=n/a. Phones are covered by
+`mobile-collect.sh`; Windows/Linux/DC/cloud-VM/container/OT/netdev by the host collectors' role overlay.
+
+| Scenario | Win/Linux host | Cloud VM | Container | OT/ICS | Net dev | Android | iPhone |
+|---|---|---|---|---|---|---|---|
+| Ransomware | P | ✓(snap) | S | S(do-no-harm) | R | S(`ransom`) | S(`ransom`) |
+| BEC / cloud acct | S | S | — | — | R | **P(`bec`)** | **P(`bec`)** |
+| Insider / exfil | P | ✓ | S | — | R | **P(`exfil`)** | **P(`exfil`)** |
+| Webshell | P | P | P | — | R | — | — |
+| C2 beacon | P | ✓ | P | S | R | S(`beacon`) | S(`beacon`) |
+| AD / DC | P | S | — | — | R | S(`token`) | S(`token`) |
+| Lateral / cred | P | ✓ | S | S | R | S(`token`) | S(`token`) |
+| LOLBin / fileless | P | ✓ | ✓ | S | R | — | — |
+| Phishing | P | S | — | — | R | **P(`smish`)** | **P(`smish`)** |
+| Cryptomining | P | P | P | S | R | S(`spyware`) | S(`spyware`) |
+| Mobile spyware | — | — | — | — | R | **P(`spyware`)** | **P(`spyware`)** |
+| Malicious MDM | S | S | — | — | R | **P(`mdm`)** | **P(`mdm`)** |
+| Lost / stolen | S | — | — | — | — | **P(`lost`)** | **P(`lost`)** |
+
+See **[MOBILE.md](MOBILE.md)** for acquisition doctrine, the open-source tool stack, and per-platform steps.

@@ -8,6 +8,12 @@ tooling — mirroring how `Build-DetectionContent.ps1` runs on the analyst box, 
 - **Windows launcher:** `Mobile-Collect.ps1` (runs the engine under Git-Bash for native USB, else WSL).
 - **Set up the box once:** `bash ./fetch-mobile-tools.sh`.
 
+Standards: **NIST SP 800-101r1** (mobile acquisition tiers + isolation), **SWGDE** mobile best practices,
+MVT methodology (acquire-then-analyze-offline), ATT&CK Mobile. Scenario-aware: pass `--scenario
+<smish|spyware|mdm|bec|token|exfil|beacon|ransom|lost>` to reprioritise + auto-run the MVT analysis and
+tag `collection_info.json` with ATT&CK-Mobile IDs (see [SCENARIOS.md](SCENARIOS.md) for the catalog +
+scenario×device matrix). The host guided intake prompts for a mobile device and prints the matching command.
+
 ## Doctrine (enforced by the tool)
 
 1. **Authorization first.** Mobile data (messages, Health, Keychain, location) is highly sensitive — the

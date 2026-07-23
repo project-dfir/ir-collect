@@ -129,8 +129,7 @@ bash ./fetch-mobile-tools.sh                              # one-time: adb + libi
 ./mobile-collect.sh -c CASE1 -d /evidence --ios --analyze --backup-pass CaseIR
 # Windows examiner: .\Mobile-Collect.ps1 -c CASE1 -d E:\evidence --android --analyze   (runs under Git-Bash/WSL)
 ```
-Run **as root**. Flags: `--auto`, `--rapid-only`, `--skip-ad`, `--defer-memory`, `-t <sec>`.
-For BloodHound.py collection set `BH_USER/BH_PASS/BH_DOMAIN/BH_DC` in the environment.
+Mobile flags: `--android`/`--ios`, `--scenario <smish|spyware|mdm|bec|token|exfil|beacon|ransom|lost>`, `--analyze`, `--faraday`/`--isolate`, `--backup-pass`, `--allow-root`, `--authorizer/--legal/--scope`. Runs on the examiner box (not the phone) - see [docs/MOBILE.md](docs/MOBILE.md).
 
 The **destination** may be a local path, a UNC share (`\\IP\share`), or a bare IP/`user@host:path`.
 Network destinations stage locally first, then zip + hash + ship (SMB on Windows; rsync/scp on Linux).
@@ -234,5 +233,3 @@ Built in from the DFIR failure-mode catalog:
 - EDR/AV may quarantine responder tools — allow-list the kit's hashes with the SOC beforehand.
 - Record the **host-clock offset** vs a trusted source (the script captures host local+UTC time; you
   supply the trusted delta) so the timeline is defensible.
-```
-```

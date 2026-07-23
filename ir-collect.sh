@@ -35,6 +35,7 @@ AUTO=0
 RAPID_ONLY=0
 SKIP_AD=0
 DEFER_MEM=0
+AUTHORIZER=""; LEGAL_BASIS=""; SCOPE_NOTE=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOOL_DIR="$SCRIPT_DIR/tools"
 BIN="$TOOL_DIR/bin"
@@ -49,6 +50,9 @@ while [ $# -gt 0 ]; do
     --skip-ad)        SKIP_AD=1; shift ;;
     --defer-memory)   DEFER_MEM=1; shift ;;
     --lab|--training) LAB=1; shift ;;
+    --authorizer)     AUTHORIZER="$2"; shift 2 ;;
+    --legal)          LEGAL_BASIS="$2"; shift 2 ;;
+    --scope)          SCOPE_NOTE="$2"; shift 2 ;;
     -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
@@ -281,8 +285,10 @@ audit "FOOTPRINT: tools run from '$SCRIPT_DIR' (NOT installed on target); eviden
 cat > "$D_META/collection_info.json" 2>/dev/null <<EOF
 { "tool":"ir-collect.sh","version":"2.0","case":"$CASE","host":"$HOSTN",
   "collector":"$(id -un 2>/dev/null)","root":$IS_ROOT,"startUtc":"$(now_utc)",
-  "kernel":"$(uname -a 2>/dev/null | sed 's/"/ /g')","toolsDetected":"${DET# }" }
+  "kernel":"$(uname -a 2>/dev/null | sed 's/"/ /g')","toolsDetected":"${DET# }",
+  "exercise":${LAB:-0},"authorizer":"$AUTHORIZER","legalBasis":"$LEGAL_BASIS","scope":"$SCOPE_NOTE" }
 EOF
+[ -z "$AUTHORIZER" ] && audit "CUSTODY WARNING: no --authorizer recorded (pass --authorizer/--legal/--scope for a defensible chain of custody)."
 # --- guest / hypervisor detection: which host-side pull channel is available (training-lab) ---
 HYPERVISOR="unknown"; GUEST_AGENT=""
 if command -v systemd-detect-virt >/dev/null 2>&1; then HYPERVISOR="$(systemd-detect-virt 2>/dev/null || echo unknown)"; fi
@@ -680,12 +686,12 @@ guided_intake() {
   echo "  U  Unknown / broad triage"
   read -rp "Select scenario [U] " SCEN </dev/tty; SCEN="$(echo "${SCEN:-U}" | tr a-z A-Z)"
   case "$SCEN" in
-    1)  SCEN_NAME="Ransomware / destructive"; PLAN="artifacts persistence"; ATTACK="T1486,T1490,T1489,T1496"; FIRST="RAM FIRST (keys/beacon may be resident); check for deleted backups/snapshots (LVM/.snapshot/borg/restic); filesystem timeline via artifacts. DO NOT reboot.";;
+    1)  SCEN_NAME="Ransomware / destructive"; PLAN="artifacts persistence"; ATTACK="T1486,T1490,T1489,T1562.001"; FIRST="RAM FIRST (keys/beacon may be resident); check for deleted backups/snapshots (LVM/.snapshot/borg/restic); filesystem timeline via artifacts. DO NOT reboot.";;
     2)  SCEN_NAME="BEC / cloud account compromise"; PLAN="artifacts"; ATTACK="T1078.004,T1114.003,T1098.002"; FIRST="Mostly OFF-HOST: pull M365 Unified Audit Log / Entra or cloud-IdP logs, forwarding rules, OAuth grants (docs/SCENARIOS.md). On-host is secondary.";;
     3)  SCEN_NAME="Insider threat / data exfiltration"; PLAN="artifacts persistence filehashes"; ATTACK="T1567.002,T1052.001,T1560"; FIRST="Live process/handles + current network (rclone/scp/rsync in flight) + mounted media while live; then shell histories + ~/.config/rclone.";;
     4)  SCEN_NAME="Web-server / public-app compromise (webshell)"; PLAN="weblogs artifacts persistence"; ATTACK="T1190,T1505.003,T1059"; FIRST="Live ss + process tree of the web service FIRST (memory-only shells), then web logs + webroot mtime timeline (job 7).";;
     5)  SCEN_NAME="Commodity malware / C2 beacon"; PLAN="artifacts persistence"; ATTACK="T1071.001,T1071.004,T1573,T1055"; FIRST="RAM FIRST (beacon/injected code is memory-only), then live conn->PID->exe hash (/proc/<pid>/exe), DNS.";;
-    6)  SCEN_NAME="AD / Domain-Controller compromise"; PLAN="artifacts ad persistence"; ATTACK="T1003.006,T1558,T1207"; FIRST="Kerberos tickets (klist) + sssd/realm state + krb5.keytab; the Windows DCs are the primary target - this Linux host is a supporting angle.";;
+    6)  SCEN_NAME="AD / Domain-Controller compromise"; PLAN="artifacts ad persistence"; ATTACK="T1003.006,T1558.001,T1207,T1003.003"; FIRST="Kerberos tickets (klist) + sssd/realm state + krb5.keytab; the Windows DCs are the primary target - this Linux host is a supporting angle.";;
     7)  SCEN_NAME="Lateral movement / credential theft"; PLAN="artifacts persistence ad"; ATTACK="T1021.004,T1078,T1552.004"; FIRST="auth.log/secure (SSH lateral), ~/.ssh (authorized_keys/known_hosts/id_*), lastlog/wtmp/btmp, live sessions.";;
     8)  SCEN_NAME="Living-off-the-land / fileless"; PLAN="artifacts persistence"; ATTACK="T1059.004,T1071,T1546"; FIRST="RAM + live process cmdlines (/proc/<pid>/cmdline), shell histories, /dev/shm + /tmp payloads, cron/systemd transient units.";;
     9)  SCEN_NAME="Phishing initial access"; PLAN="artifacts persistence"; ATTACK="T1566,T1204,T1059"; FIRST="Downloads + /tmp payloads, mail spools, browser history; on Linux usually a server pivot - chain to C2/lateral.";;
@@ -693,6 +699,12 @@ guided_intake() {
     *)  SCEN="U"; SCEN_NAME="Unknown / broad triage"; PLAN="artifacts persistence ad"; ATTACK=""; FIRST="Standard RFC 3227 order-of-volatility triage.";;
   esac
   echo "  -> FIRST: $FIRST"
+
+  # mobile device trigger: a phone is often the real endpoint (BEC token / smishing / exfil target)
+  case "$SCEN" in 2) MOBPROF=bec;; 3) MOBPROF=exfil;; 9) MOBPROF=smish;; 5) MOBPROF=beacon;; 10) MOBPROF=spyware;; 6|7) MOBPROF=token;; 1) MOBPROF=ransom;; *) MOBPROF=U;; esac
+  read -rp "Was a MOBILE device involved (victim / exfil target / MFA-auth / lateral)? (y/N) " mi </dev/tty
+  case "$mi" in [yY]*) MOBILE_INVOLVED=1; echo "  -> Acquire the phone from an EXAMINER box (docs/MOBILE.md). Suggested:";
+    echo "     ./mobile-collect.sh -c $CASE -d <dest> --android|--ios --scenario $MOBPROF --analyze --faraday --authorizer '$AUTHORIZER'";; *) MOBILE_INVOLVED=0;; esac
 
   echo; echo "-- Host role / environment --"
   echo "  [1] Workstation  [2] Server  [3] Cloud VM  [4] Container/k8s node  [5] OT/ICS  [6] Network device"
@@ -737,7 +749,7 @@ guided_intake() {
 
   # write intake.json - seeds the detection generator with operator-supplied known-bad IOCs
   cat > "$D_META/intake.json" 2>/dev/null <<EOF
-{ "case_id":"$(sani "$CASE")","exercise":${LAB:-0},"scenario":"$SCEN","scenario_name":"$(sani "$SCEN_NAME")",
+{ "case_id":"$(sani "$CASE")","exercise":${LAB:-0},"mobile_involved":${MOBILE_INVOLVED:-0},"mobile_profile":"${MOBPROF:-U}","scenario":"$SCEN","scenario_name":"$(sani "$SCEN_NAME")",
   "attack_tags":$(json_arr "$ATTACK"),
   "host_role":"$HOST_ROLE","scope":"$SCOPE","connectivity":"$CONNECTIVITY",
   "known_bad_ips":$(json_arr "$KB_IPS"),"known_bad_domains":$(json_arr "$KB_DOMAINS"),
@@ -777,3 +789,10 @@ else
   run_menu
 fi
 finish   # seal (trap also guards this)
+
+# --- exit-code contract (parity with IR-Collect.ps1): 0 clean | 10 skips | 20 no-RAM | 40 fatal ---
+EXIT_CODE=0
+[ "${STEPS_FAIL:-0}" -gt 0 ] && EXIT_CODE=10
+[ "${MEM_OK:-0}" != "1" ] && [ "$RAPID_ONLY" != "1" ] && EXIT_CODE=20
+audit "EXIT $EXIT_CODE (0=clean 10=skips 20=no-RAM 40=fatal)"
+exit $EXIT_CODE

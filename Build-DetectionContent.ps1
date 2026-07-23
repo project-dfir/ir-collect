@@ -38,9 +38,10 @@ if (-not $OutDir) { $OutDir = Join-Path $CollectionDir '_detection' }
 foreach ($d in 'ioc','splunk','sigma','suricata','zeek') { New-Item -ItemType Directory -Force (Join-Path $OutDir $d) | Out-Null }
 
 # Collect the set of collection folders (support a parent dir with several hosts)
+function Test-IsCapture($d) { (Test-Path (Join-Path $d '00_metadata')) -or (Test-Path (Join-Path $d 'meta\collection_info.json')) }
 $folders = @()
-if (Test-Path (Join-Path $CollectionDir '00_metadata')) { $folders = @($CollectionDir) }
-else { $folders = Get-ChildItem $CollectionDir -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path (Join-Path $_.FullName '00_metadata') } | Select-Object -ExpandProperty FullName }
+if (Test-IsCapture $CollectionDir) { $folders = @($CollectionDir) }
+else { $folders = Get-ChildItem $CollectionDir -Directory -ErrorAction SilentlyContinue | Where-Object { Test-IsCapture $_.FullName } | Select-Object -ExpandProperty FullName }
 if (-not $folders) { $folders = @($CollectionDir) }   # try anyway
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,30 @@ $suspDirRe = '(?i)(\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Wind
 foreach ($f in $folders) {
     $hostn = 'unknown'
     try { $ci = Get-Content (Join-Path $f '00_metadata\collection_info.json') -Raw -ErrorAction Stop | ConvertFrom-Json; if ($ci.host) { $hostn = $ci.host } } catch {}
+
+    # --- MOBILE capture (mobile-collect.sh): meta/ tree + pre-extracted detection/mobile_iocs.csv ---
+    if (Test-Path (Join-Path $f 'meta\collection_info.json')) {
+        try { $mci = Get-Content (Join-Path $f 'meta\collection_info.json') -Raw | ConvertFrom-Json
+              $hostn = "$($mci.platform)-$($mci.serial)"
+              if ($mci.case) { $IntakeCase = $mci.case }
+              if ($mci.scenario_name) { $IntakeScenarios += $mci.scenario_name }
+              if ($mci.attack_tags) { $AttackTags += @(("$($mci.attack_tags)") -split '[, ]+' | Where-Object { $_ }) } } catch {}
+        $micsv = Join-Path $f 'detection\mobile_iocs.csv'
+        if (Test-Path $micsv) {
+            Write-Host "Mining MOBILE capture $f (host=$hostn)" -ForegroundColor Cyan
+            foreach ($row in (Import-Csv $micsv -ErrorAction SilentlyContinue)) {
+                switch ($row.type) {
+                    'domain'          { Add-IOC 'domain'    ("$($row.value)").ToLower() 'mobile-mvt' $hostn 75 $true }
+                    'ipv4'            { Add-IOC 'ipv4-c2'   "$($row.value)" 'mobile-mvt' $hostn 75 $true }
+                    'sha256'          { Add-IOC 'hash'      "$($row.value)" 'mobile-mvt' $hostn 75 $true }
+                    'apk-hash'        { Add-IOC 'hash'      "$($row.value)" 'mobile-apk'  $hostn 60 $false }
+                    'process'         { Add-IOC 'file-path' "$($row.value)" 'mobile-mvt' $hostn 75 $true }
+                    'android-package' { Add-IOC 'file-path' "$($row.value)" 'mobile-pkg' $hostn 60 $false }
+                }
+            }
+        }
+        continue   # mobile folder has no host 01_volatile/02_network tree to mine
+    }
     Write-Host "Mining $f (host=$hostn)" -ForegroundColor Cyan
     # intake.json: scenario context + operator's already-known indicators (seeded confidence=75, to_ids)
     $intake = $null

@@ -9,6 +9,7 @@
 # $IR_OUT -> /var/tmp/ir_evidence. (Never writes onto the read-only delivery media.)
 here="$(cd "$(dirname "$0")" && pwd)"
 col="$(find "$here" -name ir-collect.sh -type f 2>/dev/null | head -1)"
+[ -z "$col" ] && col="$(find "$here/.." -name ir-collect.sh -type f 2>/dev/null | head -1)"
 [ -z "$col" ] && { echo "ir-collect.sh not found under $here" >&2; exit 1; }
 
 out=""

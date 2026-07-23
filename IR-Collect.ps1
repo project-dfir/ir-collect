@@ -851,6 +851,15 @@ function Invoke-GuidedIntake {
     if ($scen.note) { Write-Host ("     NOTE:  {0}" -f $scen.note) -ForegroundColor DarkYellow }
     $script:Intake.scenario = $sc; $script:Intake.scenario_name = $scen.name; $script:Intake.attack_tags = @($scen.attack)
 
+    # -- mobile device trigger: a phone is often the real endpoint (BEC token / smishing / exfil target) --
+    $mobMap = @{ '2'='bec'; '3'='exfil'; '9'='smish'; '5'='beacon'; '10'='spyware'; '6'='token'; '7'='token'; '1'='ransom' }
+    $mobProf = if ($mobMap.ContainsKey($sc)) { $mobMap[$sc] } else { 'U' }
+    if ((Read-Def "Was a MOBILE device involved (victim / exfil target / MFA-auth / lateral)? (y/N)" 'N') -match '^[yY]') {
+        $script:Intake.mobile_involved = $true; $script:Intake.mobile_profile = $mobProf
+        Write-Host "  -> Acquire the phone from an EXAMINER box (see docs/MOBILE.md). Suggested command:" -ForegroundColor Yellow
+        Write-Host ("     ./mobile-collect.sh -c {0} -d <dest> --android|--ios --scenario {1} --analyze --faraday --authorizer '{2}'" -f $CaseId,$mobProf,$Authorizer) -ForegroundColor Gray
+    } else { $script:Intake.mobile_involved = $false }
+
     Write-Host ""; Write-Host "-- Host role / environment --" -ForegroundColor Gray
     Write-Host "  [1] Workstation  [2] Server  [3] Domain Controller  [4] Cloud VM  [5] Container/k8s node  [6] OT/ICS  [7] Network device"
     $roleDef = if ($info.os -match 'Server') { '2' } else { '1' }
