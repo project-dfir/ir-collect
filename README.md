@@ -14,7 +14,8 @@ BEC/cloud, insider-exfil, webshell, C2 beacon, AD/DC, lateral, LOLBin, phishing,
 **host role** (workstation/server/DC/cloud-VM/container/OT), plus any indicators you already hold. That
 reprioritises the menu, adds scenario-specific collection, and tags the detection handoff with ATT&CK. Read
 **[docs/RANGE.md](docs/RANGE.md)** for TRAINING / cyber-range use (loading the kit into guest VMs and
-extracting evidence across VMware/Hyper-V/VirtualBox/KVM), **[docs/SCENARIOS.md](docs/SCENARIOS.md)** for the scenario catalog + environment matrix + cloud/off-host
+extracting evidence across VMware/Hyper-V/VirtualBox/KVM), **[docs/MOBILE.md](docs/MOBILE.md)** for
+ANDROID + iPHONE acquisition (open-source logical acquisition + MVT spyware triage from an examiner box), **[docs/SCENARIOS.md](docs/SCENARIOS.md)** for the scenario catalog + environment matrix + cloud/off-host
 collection, **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a real collection (pre-touch decisions, encryption,
 authorization), **[docs/GAPS.md](docs/GAPS.md)** for what a single-box tool can't see (network/identity/cloud
 vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security
@@ -26,9 +27,12 @@ deconfliction, fleet bridge). Build the tool payload once with `fetch-tools.*`.
 IR-Collect.ps1 / ir-collect.sh      collectors (Windows / Linux)      -- run on the compromised host
 fetch-tools.ps1 / fetch-tools.sh    one-time kit builder              -- run on a trusted box
 Build-DetectionContent.ps1          capture -> Splunk/Sigma/Suricata/Zeek content  -- run on the analyst box
+mobile-collect.sh / Mobile-Collect.ps1  Android + iOS logical acquisition + MVT triage  -- run on the examiner box
+fetch-mobile-tools.sh               one-time mobile examiner-box setup (adb/libimobiledevice/MVT/iLEAPP/ALEAPP)
 tools/                              open-source payload (fetched, not committed)
 docs/SCENARIOS.md                   incident-scenario catalog + host-role matrix + cloud/off-host steps
 docs/RANGE.md                       training-lab use: load into / extract out of guest VMs (any hypervisor)
+docs/MOBILE.md                      Android + iPhone forensics: doctrine, usage, open-source tool stack
 range/                              lab helpers: per-hypervisor deploy scripts, in-guest detect, loader, collector server
 docs/RUNBOOK.md                     pre-touch field procedure + checklist
 docs/GAPS.md                        off-host vantage points (network/identity/cloud) + artifact gaps
@@ -114,6 +118,16 @@ sudo ./ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
 sudo ./ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
 sudo ./ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
 sudo ./ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
+```
+
+### Mobile (Android / iPhone) - runs on the EXAMINER box with the device on USB
+```bash
+bash ./fetch-mobile-tools.sh                              # one-time: adb + libimobiledevice + MVT + iLEAPP/ALEAPP
+# Android (USB debugging on, RSA trusted): acquire + MVT/ALEAPP triage
+./mobile-collect.sh -c CASE1 -d /evidence --android --analyze --faraday --authorizer "J. Doe"
+# iPhone (unlocked, 'Trust'): encrypted backup + mvt-ios spyware check
+./mobile-collect.sh -c CASE1 -d /evidence --ios --analyze --backup-pass CaseIR
+# Windows examiner: .\Mobile-Collect.ps1 -c CASE1 -d E:\evidence --android --analyze   (runs under Git-Bash/WSL)
 ```
 Run **as root**. Flags: `--auto`, `--rapid-only`, `--skip-ad`, `--defer-memory`, `-t <sec>`.
 For BloodHound.py collection set `BH_USER/BH_PASS/BH_DOMAIN/BH_DC` in the environment.

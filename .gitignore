@@ -29,3 +29,6 @@ Thumbs.db
 
 # local Claude settings (not committed)
 .claude/
+
+# fetched mobile forensics tools (adb/iLEAPP/ALEAPP/androidqf)
+tools/mobile/
