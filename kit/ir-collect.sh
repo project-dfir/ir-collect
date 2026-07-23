@@ -47,6 +47,7 @@ while [ $# -gt 0 ]; do
     -t|--timeout)     STEP_TIMEOUT="$2"; shift 2 ;;
     --auto)           AUTO=1; shift ;;
     --rapid-only)     RAPID_ONLY=1; shift ;;
+    --resume)         RESUME_DIR="$2"; shift 2 ;;
     --skip-ad)        SKIP_AD=1; shift ;;
     --defer-memory)   DEFER_MEM=1; shift ;;
     --lab|--training) LAB=1; shift ;;
@@ -59,6 +60,12 @@ while [ $# -gt 0 ]; do
 done
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
+# --- portability preamble: OS family + coreutils flavor (drives stat/find branching) ---
+OS_FAMILY=linux; case "$(uname -s 2>/dev/null)" in Darwin) OS_FAMILY=macos;; *BSD|DragonFly) OS_FAMILY=bsd;; SunOS) OS_FAMILY=solaris;; AIX) OS_FAMILY=aix;; esac
+STAT_FLAVOR=gnu; stat -c %s /dev/null >/dev/null 2>&1 || { stat -f %z /dev/null >/dev/null 2>&1 && STAT_FLAVOR=bsd; }
+FIND_FLAVOR=gnu; find --version >/dev/null 2>&1 || FIND_FLAVOR=bsd
+ARCH="$(uname -m 2>/dev/null)"
+fsize()  { case "$STAT_FLAVOR" in bsd) stat -f %z "$1" 2>/dev/null;; *) stat -c %s "$1" 2>/dev/null;; esac; }
 HOSTN="$(hostname 2>/dev/null || echo unknown)"
 STAMP="$(date -u +%Y%m%d_%H%M%SZ)"
 
@@ -125,6 +132,7 @@ else
   else rm -f "$OUT_ROOT/.w_$STAMP" 2>/dev/null; fi
 fi
 OUTDIR="$OUT_ROOT/${CASE}_${HOSTN}_${STAMP}"
+[ -n "${RESUME_DIR:-}" ] && OUTDIR="$RESUME_DIR"   # --resume: finish an existing capture
 
 # Output subfolders (per phase)
 D_META="$OUTDIR/00_metadata"
@@ -142,6 +150,14 @@ AUDIT="$D_LOG/audit.log"
 ERRLOG="$D_LOG/errors.log"
 
 audit() { echo "$(now_utc) | $(id -un 2>/dev/null) | $*" | tee -a "$AUDIT"; }
+STATE_JSONL="$D_LOG/run_state.jsonl"; touch "$STATE_JSONL" 2>/dev/null
+INIT=unknown; [ -d /run/systemd/system ] && INIT=systemd || { command -v rc-service >/dev/null 2>&1 && INIT=openrc; }; command -v launchctl >/dev/null 2>&1 && INIT=launchd
+cat > "$D_META/platform_profile.json" 2>/dev/null <<PPEOF
+{ "os_family":"$OS_FAMILY","arch":"$ARCH","stat_flavor":"$STAT_FLAVOR","find_flavor":"$FIND_FLAVOR","init":"$INIT",
+  "shell":"${BASH_VERSION:-sh}","has_proc":$( [ -r /proc/self/status ] && echo true || echo false ),
+  "is_root":$( [ "$(id -u 2>/dev/null)" = 0 ] && echo 1 || echo 0 ),"resume":$( [ -n "${RESUME_DIR:-}" ] && echo true || echo false ) }
+PPEOF
+[ -n "${RESUME_DIR:-}" ] && audit "RESUME: continuing capture at $OUTDIR"
 
 # ---------------------------------------------------------------------------
 # Tool discovery
@@ -193,49 +209,121 @@ fi
 SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid"
 NICE=""; command -v nice >/dev/null 2>&1 && NICE="nice -n 19"; command -v ionice >/dev/null 2>&1 && NICE="ionice -c3 $NICE"
 
+# ===== completion ledger + self-troubleshoot + resume =====
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t'; }
+ledger() { # ledger id name phase ev [k=v ...]
+  [ -n "${STATE_JSONL:-}" ] || return 0
+  local id="$1" name="$2" phase="$3" ev="$4"; shift 4
+  local extra=""; for kv in "$@"; do extra="$extra,\"${kv%%=*}\":\"$(jesc "${kv#*=}")\""; done
+  printf '{"t":"%s","id":"%s","name":"%s","phase":"%s","ev":"%s"%s}\n' "$(now_utc)" "$id" "$(jesc "$name")" "$phase" "$ev" "$extra" >> "$STATE_JSONL" 2>/dev/null
+}
+phase_of() { case "$1" in *00_metadata) echo metadata;; *01_volatile) echo volatile;; *02_network) echo network;; *03_memory) echo memory;; *04_persistence) echo persistence;; *05_artifacts) echo artifacts;; *06_activedirectory) echo ad;; *07_diskimage) echo diskimage;; *) echo other;; esac; }
+classify_error() { # name rc errfile -> class
+  local name="$1" rc="$2" e="$3"; local S=""; [ -f "$e" ] && S="$(tr -d '\0' <"$e" 2>/dev/null)"
+  case "$rc" in 124|137|143) echo timeout; return;; 127) echo tool_missing; return;; 126) echo not_elevated; return;; 255) echo net_unreachable; return;; esac
+  case "$S" in
+    *"Permission denied"*|*"Operation not permitted"*|*"must be root"*) echo not_elevated;;
+    *"command not found"*|*"No such file or directory"*) echo tool_missing;;
+    *"No space left on device"*) echo no_space;;
+    *"Text file busy"*|*"resource busy"*|*"Device or resource busy"*) echo file_locked;;
+    *"insmod"*|*"Key was rejected"*|*"Lockdown"*|*"Required key not available"*) echo driver_blocked;;
+    *"No route to host"*|*"Connection refused"*|*"Connection timed out"*|*"Network is unreachable"*) echo net_unreachable;;
+    *"could not resolve"*|*"Name or service not known"*|*"Temporary failure in name resolution"*) echo dns_blocked;;
+    *"Sizelimit"*|*"Administrative Limit"*) echo rate_limit;;
+    *) echo unknown;;
+  esac
+}
+declare -A REM_TRIED 2>/dev/null || true
+redirect_dest() { for c in ${LAB_VOL:+"$LAB_VOL/ir_evidence"} /var/tmp/ir_evidence; do if mkdir -p "$c" 2>/dev/null && ( : > "$c/.w" ) 2>/dev/null; then rm -f "$c/.w"; echo "redirect:$c"; return; fi; done; echo none; }
+backoff() { case "$1" in timeout|net_unreachable|rate_limit) echo $(( $2 * $2 ));; file_locked) echo 2;; *) echo 0;; esac; }
+# remediate: 0 => retry now ; 1 => give up. Each (id,class) once; hard cap 3 attempts.
+remediate() {
+  local cls="$1" name="$2" id="$3" attempt="$4"
+  [ "$attempt" -ge 3 ] && return 1
+  local k="$id|$cls"; [ -n "${REM_TRIED[$k]:-}" ] && return 1; REM_TRIED[$k]=1
+  local action=none retry=1
+  case "$cls" in
+    timeout|net_unreachable|dns_blocked|rate_limit) action="backoff-retry"; [ "$attempt" -lt 2 ] && retry=0;;
+    file_locked) action="retry-after-settle"; retry=0;;
+    no_space)    action="$(redirect_dest)"; [ "$action" != none ] && retry=0;;
+    not_elevated) action="degraded-nonroot"; retry=1;;
+    tool_missing) action="fallback-or-skip"; retry=1;;
+    driver_blocked) action="pivot-flag"; retry=1;;
+    *) action=none; retry=1;;
+  esac
+  ledger "$id" "$name" other remediation "class=$cls" "action=$action" "result=$( [ $retry = 0 ] && echo retry || echo stop )"
+  audit "STEP $id REMEDIATE | $name | class=$cls action=$action -> $( [ $retry = 0 ] && echo retry || echo stop )"
+  return $retry
+}
+declare -A SATISFIED 2>/dev/null || true
+load_prior_state() { # dir
+  local d="$1"; [ -f "$d/99_logs/run_state.jsonl" ] || return 1
+  while IFS= read -r line; do case "$line" in *'"ev":"ok"'*) local nm; nm="$(printf '%s' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')"; [ -n "$nm" ] && SATISFIED[$nm]=1;; esac; done < "$d/99_logs/run_state.jsonl"
+  audit "RESUME: ${#SATISFIED[@]} steps already satisfied - will skip them."
+}
+step_satisfied() { # name target
+  [ -n "${RESUME_DIR:-}" ] || return 1
+  [ -n "${SATISFIED[$1]:-}" ] || return 1
+  [ "$2" = "/dev/null" ] && return 0
+  [ -f "$2" ] || return 1
+  local b; b="$(fsize "$2")"; [ "${b:-0}" -gt 0 ] 2>/dev/null || return 1
+  return 0
+}
+
 run_step() {
   local name="$1" outfile="$2" dir="$3" tmo="$4" retries="$5"; shift 5
   STEP_NUM=$((STEP_NUM+1)); local id; id="$(printf '%03d' "$STEP_NUM")"
+  local phase; phase="$(phase_of "$dir")"
   local target="/dev/null"; [ "$outfile" != "-" ] && target="$dir/$outfile"
-  local attempt=0 rc=0 start; start="$(date +%s)"
+  if step_satisfied "$name" "$target"; then ledger "$id" "$name" "$phase" skipped reason=already-ok; audit "STEP $id SKIP | $name | already satisfied (resume)"; STEPS_OK=$((STEPS_OK+1)); return 0; fi
+  ledger "$id" "$name" "$phase" planned "timeout_s=$tmo"
+  local attempt=0 rc=0 start cls=""; start="$(date +%s)"
+  local etmp="$D_LOG/.err.$id"; : > "$etmp" 2>/dev/null
   while [ "$attempt" -le "$retries" ]; do
     attempt=$((attempt+1))
+    ledger "$id" "$name" "$phase" running "attempt=$attempt"
     # stdin closed (</dev/null) so no tool can block on an interactive prompt
     if [ -n "$SETSID" ]; then
       # PREFERRED: run in a NEW process group so the watchdog kills the WHOLE pipeline
       # (dd|gzip), not just the parent shell. GNU `timeout` only signals its direct child,
       # so pipeline grandchildren would be orphaned and keep writing - hence setsid first.
-      if [ "$target" = "/dev/null" ]; then $SETSID "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG" &
-      else $SETSID "$@" </dev/null >"$target" 2>>"$ERRLOG" & fi
+      if [ "$target" = "/dev/null" ]; then $SETSID "$@" </dev/null >>"$AUDIT" 2>"$etmp" &
+      else $SETSID "$@" </dev/null >"$target" 2>"$etmp" & fi
       local pid=$!; local kt="-$pid"
       ( sleep "$tmo"; kill -TERM "$kt" 2>/dev/null; sleep 5; kill -KILL "$kt" 2>/dev/null ) >/dev/null 2>&1 &
       local wd=$!
       wait "$pid" 2>/dev/null; rc=$?
       kill "$wd" 2>/dev/null; pkill -P "$wd" 2>/dev/null
     elif [ "$have_timeout" = "1" ]; then
-      if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo" "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG"; rc=$?
-      else timeout $TMO_K "$tmo" "$@" </dev/null >"$target" 2>>"$ERRLOG"; rc=$?; fi
+      if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo" "$@" </dev/null >>"$AUDIT" 2>"$etmp"; rc=$?
+      else timeout $TMO_K "$tmo" "$@" </dev/null >"$target" 2>"$etmp"; rc=$?; fi
     else
       # neither setsid nor timeout: best-effort single-pid watchdog
-      if [ "$target" = "/dev/null" ]; then "$@" </dev/null >>"$AUDIT" 2>>"$ERRLOG" &
-      else "$@" </dev/null >"$target" 2>>"$ERRLOG" & fi
+      if [ "$target" = "/dev/null" ]; then "$@" </dev/null >>"$AUDIT" 2>"$etmp" &
+      else "$@" </dev/null >"$target" 2>"$etmp" & fi
       local pid=$!
       ( sleep "$tmo"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
       local wd=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$wd" 2>/dev/null
     fi
+    cat "$etmp" >> "$ERRLOG" 2>/dev/null
     local dur=$(( $(date +%s) - start ))
     if [ "$rc" = "0" ]; then
+      local bytes=0; [ "$target" != "/dev/null" ] && [ -f "$target" ] && bytes="$(fsize "$target")"
+      ledger "$id" "$name" "$phase" ok "attempt=$attempt" "duration_s=$dur" "out_file=$outfile" "out_bytes=${bytes:-0}"
       audit "STEP $id OK   | $name | ${dur}s | try $attempt${outfile:+ -> $outfile}"
-      STEPS_OK=$((STEPS_OK+1)); return 0
-    elif [ "$rc" = "124" ] || [ "$rc" = "137" ] || [ "$rc" = "143" ]; then
-      audit "STEP $id WARN | $name | TIMEOUT ${tmo}s | try $attempt"
-    else
-      audit "STEP $id ERR  | $name | rc=$rc | try $attempt"
+      STEPS_OK=$((STEPS_OK+1)); rm -f "$etmp"; return 0
     fi
+    # classify + bounded self-troubleshoot (each fix logged as a custody action)
+    cls="$(classify_error "$name" "$rc" "$etmp")"
+    if remediate "$cls" "$name" "$id" "$attempt"; then retries=$attempt; sleep "$(backoff "$cls" "$attempt")"; continue; fi
+    if [ "$rc" = "124" ] || [ "$rc" = "137" ] || [ "$rc" = "143" ]; then audit "STEP $id WARN | $name | TIMEOUT ${tmo}s cls=$cls | try $attempt"
+    else audit "STEP $id ERR  | $name | rc=$rc cls=$cls | try $attempt"; fi
     [ "$attempt" -le "$retries" ] && sleep 0.4
   done
-  echo "$(now_utc) [$id] $name : failed rc=$rc" >> "$ERRLOG"
-  STEPS_FAIL=$((STEPS_FAIL+1)); return 0     # swallow: never abort
+  case "$rc" in 124|137|143) term=timeout;; *) term=failed;; esac
+  ledger "$id" "$name" "$phase" "${term:-failed}" "attempt=$attempt" "exit_code=$rc" "error_class=${cls:-unknown}" "error_msg=$(head -c 200 "$etmp" 2>/dev/null | tr -d '\n\r')"
+  echo "$(now_utc) [$id] $name : ${term:-failed} rc=$rc cls=${cls:-?}" >> "$ERRLOG"
+  STEPS_FAIL=$((STEPS_FAIL+1)); rm -f "$etmp"; return 0     # swallow: never abort
 }
 # shell-snippet variant (for pipes/redirs): run_sh <name> <outfile> <dir> <tmo> <retries> '<shell>'
 run_sh() {
@@ -566,6 +654,29 @@ Stage 1 (auto) secured volatile state in order of volatility. Stage 2 heavy jobs
 See 99_logs/audit.log for the full timestamped trail; 99_logs/errors.log for recovered failures.
 EOF
 
+  # --- completion rollup + completeness verdict (reduce run_state.jsonl; no jq dependency) ---
+  local nok nfail ntmo nskip nplan
+  # grep -c prints "0" and exits 1 on no-match; capture then default (never use || echo which doubles)
+  nok=$(grep -c '"ev":"ok"' "$STATE_JSONL" 2>/dev/null); nfail=$(grep -c '"ev":"failed"' "$STATE_JSONL" 2>/dev/null)
+  ntmo=$(grep -c '"ev":"timeout"' "$STATE_JSONL" 2>/dev/null); nskip=$(grep -c '"ev":"skipped"' "$STATE_JSONL" 2>/dev/null)
+  nplan=$(grep -c '"ev":"planned"' "$STATE_JSONL" 2>/dev/null)
+  : "${nok:=0}" "${nfail:=0}" "${ntmo:=0}" "${nskip:=0}" "${nplan:=0}"
+  local incomplete=""
+  [ "${MEM_OK:-0}" != 1 ] && [ "$RAPID_ONLY" != 1 ] && incomplete="memory(no-verified-RAM)"
+  local failed_names; failed_names=$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)".*//p' | sort -u | tr '
+' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+  [ -n "$failed_names" ] && incomplete="$(echo "$incomplete $failed_names" | sed 's/^ //; s/ $//')"
+  local verdict=COMPLETE; [ -n "$incomplete" ] && verdict=INCOMPLETE
+  cat > "$D_LOG/run_state.json" 2>/dev/null <<RSEOF
+{ "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
+  "ended_utc":"$end","status":"$( [ "$verdict" = COMPLETE ] && echo complete || echo partial )","resumed":$( [ -n "${RESUME_DIR:-}" ] && echo true || echo false ),
+  "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
+  "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
+  "completeness":{"verdict":"$verdict","incomplete":"$(printf '%s' "$incomplete" | tr -d '\"' )"} }
+RSEOF
+  { echo; echo "## Completeness - $verdict"; echo "- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)"; [ -n "$incomplete" ] && echo "- incomplete:$incomplete"; echo "- resume: ./kit/ir-collect.sh --resume '$OUTDIR'"; } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
+  RUN_INCOMPLETE=$( [ "$verdict" = COMPLETE ] && echo 0 || echo 1 )
+
   # manifest LAST so it covers SUMMARY.md
   run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' -print0 | xargs -0 sha256sum 2>/dev/null"
   # freeze + hash the custody trail itself (excluded above because it is still being written)
@@ -770,7 +881,8 @@ EOF
 # MAIN
 # ===========================================================================
 # guided intake is the default when interactive and no mode flag was given
-if [ "$AUTO" != "1" ] && [ "$RAPID_ONLY" != "1" ] && [ -e /dev/tty ]; then guided_intake; fi
+if [ -n "${RESUME_DIR:-}" ]; then load_prior_state "$OUTDIR"
+elif [ "$AUTO" != "1" ] && [ "$RAPID_ONLY" != "1" ] && [ -e /dev/tty ]; then guided_intake; fi
 
 integrity_baseline
 rapid_volatile
@@ -793,6 +905,7 @@ finish   # seal (trap also guards this)
 # --- exit-code contract (parity with IR-Collect.ps1): 0 clean | 10 skips | 20 no-RAM | 40 fatal ---
 EXIT_CODE=0
 [ "${STEPS_FAIL:-0}" -gt 0 ] && EXIT_CODE=10
+[ "${RUN_INCOMPLETE:-0}" = "1" ] && EXIT_CODE=15
 [ "${MEM_OK:-0}" != "1" ] && [ "$RAPID_ONLY" != "1" ] && EXIT_CODE=20
 audit "EXIT $EXIT_CODE (0=clean 10=skips 20=no-RAM 40=fatal)"
 exit $EXIT_CODE
