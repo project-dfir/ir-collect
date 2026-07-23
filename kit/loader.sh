@@ -3,7 +3,7 @@
 # want to launch it: finds ir-collect.sh next to itself, resolves a WRITABLE output, runs --lab.
 # Extra args pass through (e.g. --auto -c EXERCISE1).
 #
-#   /mnt/cdrom/range/loader.sh --auto -c EXERCISE1
+#   /mnt/cdrom/kit/loader.sh --auto -c EXERCISE1
 #
 # Output precedence: a volume LABELED EVIDENCE/IR-EVIDENCE (attached evidence disk) ->
 # $IR_OUT -> /var/tmp/ir_evidence. (Never writes onto the read-only delivery media.)

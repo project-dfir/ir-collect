@@ -20,16 +20,20 @@ collection, **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a real collection (pre
 authorization), **[docs/GAPS.md](docs/GAPS.md)** for what a single-box tool can't see (network/identity/cloud
 vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security
 Onion content, and **[docs/ENTERPRISE.md](docs/ENTERPRISE.md)** for deployment at scale (signing/CLM, EDR
-deconfliction, fleet bridge). Build the tool payload once with `fetch-tools.*`.
+deconfliction, fleet bridge). Build the tool payload once with `kit/fetch-tools.*`.
 
 ### Repository layout
 ```
-IR-Collect.ps1 / ir-collect.sh      collectors (Windows / Linux)      -- run on the compromised host
-fetch-tools.ps1 / fetch-tools.sh    one-time kit builder              -- run on a trusted box
-Build-DetectionContent.ps1          capture -> Splunk/Sigma/Suricata/Zeek content  -- run on the analyst box
-mobile-collect.sh / Mobile-Collect.ps1  Android + iOS logical acquisition + MVT triage  -- run on the examiner box
-fetch-mobile-tools.sh               one-time mobile examiner-box setup (adb/libimobiledevice/MVT/iLEAPP/ALEAPP)
-tools/                              open-source payload (fetched, not committed)
+kit/                                the shippable, path-coupled collector kit (archive its CONTENTS)
+  IR-Collect.ps1 / ir-collect.sh      collectors (Windows / Linux)    -- run on the compromised host
+  fetch-tools.ps1 / fetch-tools.sh    one-time kit builder            -- run on a trusted box
+  loader.ps1 / loader.sh              in-guest bootstrap (read-only ISO / share launch)
+  tools/                              open-source payload (fetched, not committed)
+detection/Build-DetectionContent.ps1  capture -> Splunk/Sigma/Suricata/Zeek + Navigator  -- analyst box
+mobile/                             mobile forensics                  -- run on the examiner box
+  mobile-collect.sh / Mobile-Collect.ps1   Android + iOS logical acquisition + MVT triage
+  fetch-mobile-tools.sh               one-time mobile examiner-box setup (adb/libimobiledevice/MVT/iLEAPP)
+range/                              training-lab deploy helpers (per-hypervisor), collector server, detect
 docs/SCENARIOS.md                   incident-scenario catalog + host-role matrix + cloud/off-host steps
 docs/RANGE.md                       training-lab use: load into / extract out of guest VMs (any hypervisor)
 docs/MOBILE.md                      Android + iPhone forensics: doctrine, usage, open-source tool stack
@@ -95,39 +99,39 @@ the **RAM image + a dead-box disk image are ground truth**; live enumeration cor
 ### Windows
 ```powershell
 # to an external drive, interactive menu for the slow jobs
-powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
+powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
 
 # fully unattended - rapid volatile + ALL heavy jobs, no prompts
-powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest E:\evidence -Auto
+powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -Auto
 
 # volatile only (fastest), then seal
-powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest E:\evidence -RapidOnly
+powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -RapidOnly
 
 # ship to a network collector at an IP (stages locally, zips+hashes, SMB copy)
-powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
+powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
 
 # TRAINING / range mode: mark EXERCISE, VM-aware, POST the bundle to a lab collector (see docs/RANGE.md)
-powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
+powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
 ```
 Run **as Administrator**. Key switches: `-Auto`, `-RapidOnly`, `-SkipAD`, `-DeferMemory`, `-Lab`, `-StepTimeoutSec N`, `-Share <name>`, `-Cred`. `-Dest` accepts a drive path, `\\host\share`, a bare IP, or `http(s)://collector/`.
 
 ### Linux
 ```bash
-sudo ./ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + menu
-sudo ./ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
-sudo ./ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
-sudo ./ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
-sudo ./ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
+sudo ./kit/ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + menu
+sudo ./kit/ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
+sudo ./kit/ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
+sudo ./kit/ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
+sudo ./kit/ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
 ```
 
 ### Mobile (Android / iPhone) - runs on the EXAMINER box with the device on USB
 ```bash
-bash ./fetch-mobile-tools.sh                              # one-time: adb + libimobiledevice + MVT + iLEAPP/ALEAPP
+bash ./mobile/fetch-mobile-tools.sh                              # one-time: adb + libimobiledevice + MVT + iLEAPP/ALEAPP
 # Android (USB debugging on, RSA trusted): acquire + MVT/ALEAPP triage
-./mobile-collect.sh -c CASE1 -d /evidence --android --analyze --faraday --authorizer "J. Doe"
+./mobile/mobile-collect.sh -c CASE1 -d /evidence --android --analyze --faraday --authorizer "J. Doe"
 # iPhone (unlocked, 'Trust'): encrypted backup + mvt-ios spyware check
-./mobile-collect.sh -c CASE1 -d /evidence --ios --analyze --backup-pass CaseIR
-# Windows examiner: .\Mobile-Collect.ps1 -c CASE1 -d E:\evidence --android --analyze   (runs under Git-Bash/WSL)
+./mobile/mobile-collect.sh -c CASE1 -d /evidence --ios --analyze --backup-pass CaseIR
+# Windows examiner: .\mobile\Mobile-Collect.ps1 -c CASE1 -d E:\evidence --android --analyze   (runs under Git-Bash/WSL)
 ```
 Mobile flags: `--android`/`--ios`, `--scenario <smish|spyware|mdm|bec|token|exfil|beacon|ransom|lost>`, `--analyze`, `--faraday`/`--isolate`, `--backup-pass`, `--allow-root`, `--authorizer/--legal/--scope`. Runs on the examiner box (not the phone) - see [docs/MOBILE.md](docs/MOBILE.md).
 
@@ -143,8 +147,8 @@ only detects what's already in `tools/`. Build the kit **once on a trusted works
 included one-time builder, then carry the drive:
 
 ```
-powershell -ExecutionPolicy Bypass -File .\fetch-tools.ps1     # Windows payload -> tools\
-bash ./fetch-tools.sh                                          # Linux payload  -> tools/bin\
+powershell -ExecutionPolicy Bypass -File .\kit\fetch-tools.ps1     # Windows payload -> tools\
+bash ./kit/fetch-tools.sh                                          # Linux payload  -> tools/bin\
 ```
 
 These pull **open-source, license-free, professionally-proven** tools from their **official GitHub

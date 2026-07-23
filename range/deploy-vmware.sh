@@ -4,7 +4,7 @@
 #
 # Prereqs: govc installed; VMware Tools running in the guest; valid GUEST-OS credentials;
 #          GOVC_URL / GOVC_USERNAME / GOVC_PASSWORD exported (GOVC_INSECURE=1 for self-signed).
-# Build the kit first (a zip/tgz of this repo incl. tools/), then:
+# Build the kit first (archive the kit/ folder CONTENTS: cd kit && zip -r ../kit.zip .), then:
 #   export GOVC_URL=https://vcenter/sdk GOVC_USERNAME=... GOVC_PASSWORD=...
 #   ./deploy-vmware.sh -vm TRIAGE-WIN01 -u 'LAB\Administrator' -p 'P@ss' -k kit.zip -o ./loot
 #   ./deploy-vmware.sh -vm TRIAGE-LNX01 -u root -p 'P@ss' -k kit.tgz --linux

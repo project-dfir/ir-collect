@@ -4,9 +4,9 @@ Mobile support works differently from the host collectors: **you do not run a sc
 Acquisition runs from an **examiner workstation** with the device tethered over USB, using open-source
 tooling — mirroring how `Build-DetectionContent.ps1` runs on the analyst box, not the victim.
 
-- **Engine:** `mobile-collect.sh` (Linux / macOS / WSL / Git-Bash examiner box).
-- **Windows launcher:** `Mobile-Collect.ps1` (runs the engine under Git-Bash for native USB, else WSL).
-- **Set up the box once:** `bash ./fetch-mobile-tools.sh`.
+- **Engine:** `mobile/mobile-collect.sh` (Linux / macOS / WSL / Git-Bash examiner box).
+- **Windows launcher:** `mobile/Mobile-Collect.ps1` (runs the engine under Git-Bash for native USB, else WSL).
+- **Set up the box once:** `bash ./mobile/fetch-mobile-tools.sh`.
 
 Standards: **NIST SP 800-101r1** (mobile acquisition tiers + isolation), **SWGDE** mobile best practices,
 MVT methodology (acquire-then-analyze-offline), ATT&CK Mobile. Scenario-aware: pass `--scenario
@@ -40,9 +40,9 @@ on-device **RSA authorization** accepted (the tool self-heals `unauthorized`/`of
 
 ```bash
 # acquire only (interactive doctrine gate)
-./mobile-collect.sh -c CASE1 -d /evidence --android
+./mobile/mobile-collect.sh -c CASE1 -d /evidence --android
 # acquire + analyze (MVT IOC check + ALEAPP), assert Faraday isolation, record custody
-./mobile-collect.sh -c CASE1 -d /evidence --android --analyze --faraday \
+./mobile/mobile-collect.sh -c CASE1 -d /evidence --android --analyze --faraday \
     --authorizer "J. Doe" --legal "IR engagement 2026-07" --scope "phishing triage"
 ```
 Key artifacts (order-of-volatility): `ps`, `dumpsys connectivity/netstats/notification`, full `logcat`,
@@ -53,7 +53,7 @@ don't rely on it. Root-only escalation (`--allow-root`) tars `/data/data` and re
 the device is already rooted**.
 
 > Linux prereqs: `android-udev-rules` + your user in `plugdev` (else `no permissions`). Windows: the Google
-> USB driver bound to the ADB interface. See `fetch-mobile-tools.sh`.
+> USB driver bound to the ADB interface. See `mobile/fetch-mobile-tools.sh`.
 
 ## iOS / iPhone
 
@@ -61,7 +61,7 @@ Uses **libimobiledevice** (`idevice*`) for a logical **encrypted backup**; **MVT
 for analysis. Requires the device **unlocked with passcode** and **"Trust This Computer"** accepted.
 
 ```bash
-./mobile-collect.sh -c CASE1 -d /evidence --ios --analyze --backup-pass CaseIR2026 \
+./mobile/mobile-collect.sh -c CASE1 -d /evidence --ios --analyze --backup-pass CaseIR2026 \
     --authorizer "J. Doe" --legal "consent" --scope "spyware check"
 ```
 Flow: `idevicepair pair` (preserve the pairing record) → `ideviceinfo` → volatile (`idevicesyslog`,

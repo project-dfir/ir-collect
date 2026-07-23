@@ -1,8 +1,8 @@
 # --- Downloaded tool payload (fetched by fetch-tools.*, NOT committed) ---
 # Third-party binaries are not redistributed here; build the kit with fetch-tools.
-tools/**
-!tools/README.md
-!tools/.gitkeep
+kit/tools/**
+!kit/tools/README.md
+!kit/tools/.gitkeep
 
 # --- Collection output / evidence (never commit real evidence) ---
 _staging/
@@ -31,7 +31,7 @@ Thumbs.db
 .claude/
 
 # fetched mobile forensics tools (adb/iLEAPP/ALEAPP/androidqf)
-tools/mobile/
+mobile/tools/
 
 # python bytecode
 **/__pycache__/

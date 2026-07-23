@@ -2,7 +2,7 @@
 # just want to launch it: it finds IR-Collect.ps1 next to itself, resolves a WRITABLE output
 # target, and runs the collector in Lab mode. Extra args pass through (e.g. -Auto -CaseId EX1).
 #
-#   D:\range\loader.ps1 -Auto -CaseId EXERCISE1
+#   D:\kit\loader.ps1 -Auto -CaseId EXERCISE1
 #
 # Output precedence: a volume LABELED 'EVIDENCE'/'IR-EVIDENCE' (an attached evidence disk) ->
 # $env:IR_OUT -> C:\ir_evidence. (Never writes onto the read-only delivery media.)

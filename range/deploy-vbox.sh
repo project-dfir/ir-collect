@@ -3,7 +3,7 @@
 # run it, pull results. NO guest network required.
 #
 # Prereqs: VBoxManage on the host; Guest Additions running in the guest; GUEST-OS credentials.
-# Build the kit first (zip/tgz of this repo incl. tools/), then:
+# Build the kit first (archive the kit/ folder CONTENTS: cd kit && zip -r ../kit.zip .), then:
 #   ./deploy-vbox.sh -vm TRIAGE-WIN01 -u Administrator -p 'P@ss' -k kit.zip -o ./loot
 #   ./deploy-vbox.sh -vm TRIAGE-LNX01 -u root -p 'P@ss' -k kit.tgz --linux
 set -eu

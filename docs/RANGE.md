@@ -33,13 +33,13 @@ Lab mode changes four things vs a real engagement:
 | **VirtualBox** | `range/deploy-vbox.sh` (VBoxManage guestcontrol) | Guest Additions + guest creds |
 | **QEMU/KVM / Proxmox** | `range/deploy-kvm.sh` (`qm guest exec` / `virsh` QGA) | qemu-guest-agent |
 | **Any (network)** | `-Dest <IP|user@host:path|http://collector>` from inside the guest | guest network |
-| **Read-only ISO** | attach the kit ISO; run `range/loader.*`; write to an `EVIDENCE`-labeled disk | — |
+| **Read-only ISO** | attach the kit ISO; run `kit/loader.*`; write to an `EVIDENCE`-labeled disk | — |
 | **Snapshot / offline** | leave output on disk; instructor `snapshot` + `guestmount --ro` | — |
 
 All four `deploy-*` helpers do the same four steps: **detect/target → upload kit → run collector in Lab mode
 → pull results to `./loot/<vm>/`**. They travel over the hypervisor channel, so **no guest network is
 required** (except the generic network option). Build a `kit` archive of this repo (including `tools/`) first,
-e.g. `zip -r kit.zip .` (Windows guest) or `tar czf kit.tgz .` (Linux guest), and pass it with `-k`.
+e.g. `cd kit && zip -r ../kit.zip .` (Windows guest) or `cd kit && tar czf ../kit.tgz .` (Linux guest) - build from the `kit/` **contents** so `IR-Collect.ps1`/`ir-collect.sh` land at the archive root where the deploy scripts expect them; pass it with `-k`.
 
 ### Examples
 ```bash
@@ -80,8 +80,8 @@ orchestrator can choose the matching `deploy-*` helper. The collector records th
 
 When the kit is on a read-only ISO or a share and you just want to launch it from inside the guest:
 ```
-D:\range\loader.ps1 -Auto -CaseId EXERCISE1        # Windows
-/mnt/cdrom/range/loader.sh --auto -c EXERCISE1     # Linux
+D:\kit\loader.ps1 -Auto -CaseId EXERCISE1          # Windows
+/mnt/cdrom/kit/loader.sh --auto -c EXERCISE1       # Linux
 ```
 It finds the collector next to itself, resolves a writable output (evidence disk → `$IR_OUT` → default),
 and runs Lab mode. Extra args pass straight through.

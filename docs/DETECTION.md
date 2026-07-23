@@ -18,7 +18,7 @@ handoff as a **living, versioned feed**, not a one-shot list.
 Run it on the **analyst box** (not the victim) against a collection folder:
 
 ```
-pwsh ./Build-DetectionContent.ps1 -CollectionDir E:\evidence\CASE001_HOST_20260722_141530Z
+pwsh detection/Build-DetectionContent.ps1 -CollectionDir E:\evidence\CASE001_HOST_20260722_141530Z
 #   (also accepts a mobile-collect.sh capture folder - folds its MVT IOCs into the same handoff)
 ```
 

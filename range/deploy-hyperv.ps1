@@ -4,7 +4,7 @@ run it, and pull results back. Falls back to Copy-VMFile (Guest Service Interfac
 if you only have GSI and not guest creds (but running still needs a session or a scheduled task).
 
 Prereqs: run on the Hyper-V HOST as admin; guest is Windows 10 / Server 2016+; GUEST-OS credentials.
-Build the kit first (zip of this repo incl. tools\), then:
+Build the kit first (archive the kit\ folder CONTENTS: cd kit; zip -r ../kit.zip .), then:
   .\deploy-hyperv.ps1 -VMName TRIAGE-WIN01 -KitZip .\kit.zip -Out .\loot
 #>
 param(
