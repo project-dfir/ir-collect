@@ -48,6 +48,7 @@ while [ $# -gt 0 ]; do
     --rapid-only)     RAPID_ONLY=1; shift ;;
     --skip-ad)        SKIP_AD=1; shift ;;
     --defer-memory)   DEFER_MEM=1; shift ;;
+    --lab|--training) LAB=1; shift ;;
     -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
@@ -77,19 +78,47 @@ umask 077                       # evidence files not world-readable
 # Resolve destination: local path vs network (IP or user@host:path)
 # Network dest -> stage locally, then rsync/scp at seal.
 # ---------------------------------------------------------------------------
-NETWORK_DEST=""
-if echo "$DEST" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(:.*)?$' || echo "$DEST" | grep -q '@'; then
-  NETWORK_DEST="$DEST"
-  # bare IP -> default remote path
-  echo "$DEST" | grep -q ':' || NETWORK_DEST="${DEST}:/tmp/evidence"
-  OUT_ROOT="$SCRIPT_DIR/_staging"
-  if ! mkdir -p "$OUT_ROOT" 2>/dev/null; then
-    OUT_ROOT="/tmp/_ir_staging"; mkdir -p "$OUT_ROOT" 2>/dev/null
-    echo "!!! CONTAMINATION WARNING: cannot stage on the collection media - falling back to the TARGET disk ($OUT_ROOT)."
-    echo "    This writes evidence onto the subject host. Attach writable removable media and re-run if at all possible. !!!"
+# an instructor-attached, purpose-labeled writable volume (lab evidence disk), if present + mountable
+LAB_VOL=""
+if command -v blkid >/dev/null 2>&1; then
+  _ev="$(blkid -L EVIDENCE 2>/dev/null || blkid -L IR-EVIDENCE 2>/dev/null)"
+  if [ -n "$_ev" ]; then
+    _mp="$(lsblk -no MOUNTPOINT "$_ev" 2>/dev/null | head -1)"
+    [ -z "$_mp" ] && { mkdir -p /mnt/ir_evidence 2>/dev/null && mount "$_ev" /mnt/ir_evidence 2>/dev/null && _mp=/mnt/ir_evidence; }
+    [ -n "$_mp" ] && LAB_VOL="$_mp"
   fi
+fi
+# is the tool running from read-only media (ISO/CD/squashfs)?  (can't write next to itself)
+RO_MEDIA=0
+_srcfs="$(df -P "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2{print $1}')"
+mount 2>/dev/null | grep -q "^$_srcfs .*[(,]ro[,)]" && RO_MEDIA=1
+case "$_srcfs" in /dev/sr*|/dev/loop*) RO_MEDIA=1;; esac
+
+NETWORK_DEST=""; HTTP_DEST=""
+if echo "$DEST" | grep -qE '^https?://'; then
+  HTTP_DEST="$DEST"                                  # lab: POST the sealed bundle to a collector endpoint
+elif echo "$DEST" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}(:.*)?$' || echo "$DEST" | grep -q '@'; then
+  NETWORK_DEST="$DEST"
+  echo "$DEST" | grep -q ':' || NETWORK_DEST="${DEST}:/tmp/evidence"
+fi
+
+# choose a WRITABLE output/staging root: script dir -> lab evidence disk -> /tmp
+pick_writable() { for c in "$@"; do if mkdir -p "$c" 2>/dev/null && ( : > "$c/.w_$STAMP" ) 2>/dev/null; then rm -f "$c/.w_$STAMP" 2>/dev/null; echo "$c"; return; fi; done; }
+if [ -n "$NETWORK_DEST" ] || [ -n "$HTTP_DEST" ]; then
+  OUT_ROOT="$(pick_writable "$SCRIPT_DIR/_staging" ${LAB_VOL:+"$LAB_VOL/_ir_staging"} "/tmp/_ir_staging")"
+  [ -z "$OUT_ROOT" ] && OUT_ROOT="/tmp/_ir_staging" && mkdir -p "$OUT_ROOT" 2>/dev/null
+  if echo "$OUT_ROOT" | grep -q '^/tmp' && [ "${LAB:-0}" != "1" ]; then
+    echo "!!! CONTAMINATION WARNING: cannot stage on the collection media - staging on the TARGET disk ($OUT_ROOT)."
+    echo "    Attach writable removable media and re-run if at all possible. !!!"
+  elif [ "${LAB:-0}" = "1" ]; then echo "Lab mode: staging at $OUT_ROOT; ships/POSTs at seal."; fi
 else
   OUT_ROOT="$DEST"
+  # read-only-media / non-writable target: redirect to a writable evidence location so we can run at all
+  if ! ( mkdir -p "$OUT_ROOT" 2>/dev/null && ( : > "$OUT_ROOT/.w_$STAMP" ) 2>/dev/null ); then
+    REDIR="${LAB_VOL:+$LAB_VOL/ir_evidence}"; [ -z "$REDIR" ] && REDIR="/var/tmp/ir_evidence"
+    echo "Output '$OUT_ROOT' not writable (read-only media?). Redirecting evidence to $REDIR."
+    OUT_ROOT="$REDIR"; mkdir -p "$OUT_ROOT" 2>/dev/null
+  else rm -f "$OUT_ROOT/.w_$STAMP" 2>/dev/null; fi
 fi
 OUTDIR="$OUT_ROOT/${CASE}_${HOSTN}_${STAMP}"
 
@@ -254,9 +283,31 @@ cat > "$D_META/collection_info.json" 2>/dev/null <<EOF
   "collector":"$(id -un 2>/dev/null)","root":$IS_ROOT,"startUtc":"$(now_utc)",
   "kernel":"$(uname -a 2>/dev/null | sed 's/"/ /g')","toolsDetected":"${DET# }" }
 EOF
+# --- guest / hypervisor detection: which host-side pull channel is available (training-lab) ---
+HYPERVISOR="unknown"; GUEST_AGENT=""
+if command -v systemd-detect-virt >/dev/null 2>&1; then HYPERVISOR="$(systemd-detect-virt 2>/dev/null || echo unknown)"; fi
+if [ "$HYPERVISOR" = "unknown" ] || [ "$HYPERVISOR" = "none" ]; then
+  _pn="$(cat /sys/class/dmi/id/product_name 2>/dev/null) $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)"
+  case "$_pn" in
+    *VMware*)                 HYPERVISOR="vmware";;
+    *VirtualBox*|*innotek*)   HYPERVISOR="virtualbox";;
+    *Microsoft*|*Hyper-V*)    HYPERVISOR="hyper-v";;
+    *QEMU*|*KVM*|*"Red Hat"*) HYPERVISOR="qemu-kvm";;
+  esac
+fi
+case "$HYPERVISOR" in oracle) HYPERVISOR="virtualbox";; microsoft) HYPERVISOR="hyper-v";; qemu) HYPERVISOR="qemu-kvm";; esac
+pgrep -x vmtoolsd    >/dev/null 2>&1 && GUEST_AGENT="$GUEST_AGENT vmtoolsd"
+pgrep -x qemu-ga     >/dev/null 2>&1 && GUEST_AGENT="$GUEST_AGENT qemu-ga"
+pgrep -x VBoxService >/dev/null 2>&1 && GUEST_AGENT="$GUEST_AGENT VBoxService"
+[ -e /dev/virtio-ports/org.qemu.guest_agent.0 ] && GUEST_AGENT="$GUEST_AGENT qga-channel"
+lsmod 2>/dev/null | grep -q hv_utils && GUEST_AGENT="$GUEST_AGENT hyperv-lis"
+{ echo "Hypervisor: $HYPERVISOR"; echo "GuestAgent:$GUEST_AGENT"; echo "BootMediaReadOnly: $RO_MEDIA"; echo "LabMode: ${LAB:-0}"; echo "OutputRoot: $OUT_ROOT"; } > "$D_META/environment_detect.txt" 2>/dev/null
+audit "GUEST ENV: hypervisor=$HYPERVISOR agent=$GUEST_AGENT roMedia=$RO_MEDIA lab=${LAB:-0}"
+[ "${LAB:-0}" = "1" ] && echo "=== LAB / TRAINING MODE (hypervisor=$HYPERVISOR) - evidence marked EXERCISE ==="
+
 # default intake.json (overwritten by guided intake); the detection generator always finds one
 cat > "$D_META/intake.json" 2>/dev/null <<EOF
-{ "case_id":"$CASE","scenario":"U","scenario_name":"Unknown / broad triage","host_role":"unknown","scope":"single","connectivity":"connected","generated_by":"ir-collect.sh (non-guided)","known_bad_ips":[],"known_bad_domains":[],"known_bad_hashes":[],"known_bad_accounts":[],"known_bad_paths":[],"attack_tags":[] }
+{ "case_id":"$CASE","scenario":"U","scenario_name":"Unknown / broad triage","host_role":"unknown","scope":"single","connectivity":"connected","exercise":${LAB:-0},"generated_by":"ir-collect.sh (non-guided)","known_bad_ips":[],"known_bad_domains":[],"known_bad_hashes":[],"known_bad_accounts":[],"known_bad_paths":[],"attack_tags":[] }
 EOF
 
 # ===========================================================================
@@ -514,24 +565,43 @@ EOF
   # freeze + hash the custody trail itself (excluded above because it is still being written)
   cp -a "$AUDIT" "$D_LOG/audit.frozen.log" 2>/dev/null && ( cd "$OUTDIR" && sha256sum 99_logs/audit.frozen.log ) > "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Custody trail frozen + hashed."
 
-  # ship to network destination
-  if [ -n "$NETWORK_DEST" ]; then
-    audit "Shipping evidence to $NETWORK_DEST"
+  # ship the sealed bundle: scp/rsync to a collection server, and/or HTTP(S) POST to a lab collector
+  if [ -n "$NETWORK_DEST" ] || [ -n "$HTTP_DEST" ]; then
+    audit "Sealing + shipping evidence (${HTTP_DEST:-$NETWORK_DEST})"
     local zip="$OUTDIR.tar.gz"
-    # host-key pinning: set IR_SSH_KNOWN_HOSTS to a pre-provisioned known_hosts to defeat first-contact
-    # MITM on evidence in transit (aligns with the most-secure-route rule); else fall back to TOFU.
-    local SSHOPT="-o StrictHostKeyChecking=accept-new"
-    [ -n "$IR_SSH_KNOWN_HOSTS" ] && SSHOPT="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$IR_SSH_KNOWN_HOSTS"
     run_sh seal-tar - "$D_LOG" 3600 0 "tar czf '$zip' -C '$OUT_ROOT' '$(basename "$OUTDIR")' && sha256sum '$zip' > '$zip.sha256'"
-    if command -v rsync >/dev/null 2>&1; then
-      run_step ship-rsync - "$D_LOG" 3600 0 rsync -avz -e "ssh $SSHOPT" "$zip" "$zip.sha256" "$NETWORK_DEST/"
-    elif command -v scp >/dev/null 2>&1; then
-      run_step ship-scp - "$D_LOG" 3600 0 scp $SSHOPT "$zip" "$zip.sha256" "$NETWORK_DEST/"
-    else
-      audit "No rsync/scp - evidence kept locally at $zip"
+    if [ -n "$NETWORK_DEST" ]; then
+      local SSHOPT="-o StrictHostKeyChecking=accept-new"
+      [ -n "$IR_SSH_KNOWN_HOSTS" ] && SSHOPT="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$IR_SSH_KNOWN_HOSTS"
+      if command -v rsync >/dev/null 2>&1; then
+        run_step ship-rsync - "$D_LOG" 3600 0 rsync -avz -e "ssh $SSHOPT" "$zip" "$zip.sha256" "$NETWORK_DEST/"
+      elif command -v scp >/dev/null 2>&1; then
+        run_step ship-scp - "$D_LOG" 3600 0 scp $SSHOPT "$zip" "$zip.sha256" "$NETWORK_DEST/"
+      else audit "No rsync/scp - evidence kept locally at $zip"; fi
+    fi
+    if [ -n "$HTTP_DEST" ] && [ -f "$zip" ]; then
+      local url="$HTTP_DEST"; case "$HTTP_DEST" in */) url="$HTTP_DEST$(basename "$zip")";; esac
+      if command -v curl >/dev/null 2>&1; then
+        run_step ship-http - "$D_LOG" 3600 0 curl -fsS --max-time 3600 -T "$zip" "$url"
+      elif command -v wget >/dev/null 2>&1; then
+        run_step ship-http - "$D_LOG" 3600 0 wget -q --method=PUT --body-file="$zip" -O /dev/null "$url"
+      else audit "No curl/wget - HTTP upload skipped; evidence kept locally at $zip"; fi
     fi
   fi
 
+  if [ "${LAB:-0}" = "1" ] && [ -z "$NETWORK_DEST" ] && [ -z "$HTTP_DEST" ]; then
+    local leaf; leaf="$(basename "$OUTDIR")"
+    case "$HYPERVISOR" in
+      vmware)     hint="govc guest.download -vm <VM> -l <u>:<p> '$OUTDIR' ./$leaf  (VMware Tools guest ops)";;
+      virtualbox) hint="VBoxManage guestcontrol <VM> copyfrom --username <u> --password <p> --recursive '$OUTDIR' './$leaf'";;
+      hyper-v)    hint="Hyper-V LIS: copy '$OUTDIR' out via a mounted share, or snapshot+offline-mount the guest disk";;
+      qemu-kvm)   hint="Proxmox/QEMU: qm guest exec <vmid> -- tar czf - '$OUTDIR' > $leaf.tgz , or 'guestmount -a disk.qcow2 --ro'";;
+      *)          hint="Pull '$OUTDIR' via your hypervisor guest file-copy / shared folder, or re-run with -d <IP|user@host:path|http://collector>";;
+    esac
+    echo "LAB: evidence left in-guest at $OUTDIR. Host-side pull:"
+    echo "  $hint"
+    audit "LAB host-pull hint ($HYPERVISOR): $hint"
+  fi
   audit "===== ir-collect DONE | OK=$STEPS_OK FAIL=$STEPS_FAIL TOTAL=$STEP_NUM ====="
   echo; echo "Collection complete. Output: $OUTDIR"
   echo "Summary: $OUTDIR/SUMMARY.md  |  Audit: $AUDIT"
@@ -667,7 +737,7 @@ guided_intake() {
 
   # write intake.json - seeds the detection generator with operator-supplied known-bad IOCs
   cat > "$D_META/intake.json" 2>/dev/null <<EOF
-{ "case_id":"$(sani "$CASE")","scenario":"$SCEN","scenario_name":"$(sani "$SCEN_NAME")",
+{ "case_id":"$(sani "$CASE")","exercise":${LAB:-0},"scenario":"$SCEN","scenario_name":"$(sani "$SCEN_NAME")",
   "attack_tags":$(json_arr "$ATTACK"),
   "host_role":"$HOST_ROLE","scope":"$SCOPE","connectivity":"$CONNECTIVITY",
   "known_bad_ips":$(json_arr "$KB_IPS"),"known_bad_domains":$(json_arr "$KB_DOMAINS"),

@@ -13,7 +13,8 @@ missing tool is logged and skipped; the run never halts.
 BEC/cloud, insider-exfil, webshell, C2 beacon, AD/DC, lateral, LOLBin, phishing, cryptomining…) and the
 **host role** (workstation/server/DC/cloud-VM/container/OT), plus any indicators you already hold. That
 reprioritises the menu, adds scenario-specific collection, and tags the detection handoff with ATT&CK. Read
-**[docs/SCENARIOS.md](docs/SCENARIOS.md)** for the scenario catalog + environment matrix + cloud/off-host
+**[docs/RANGE.md](docs/RANGE.md)** for TRAINING / cyber-range use (loading the kit into guest VMs and
+extracting evidence across VMware/Hyper-V/VirtualBox/KVM), **[docs/SCENARIOS.md](docs/SCENARIOS.md)** for the scenario catalog + environment matrix + cloud/off-host
 collection, **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a real collection (pre-touch decisions, encryption,
 authorization), **[docs/GAPS.md](docs/GAPS.md)** for what a single-box tool can't see (network/identity/cloud
 vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security
@@ -27,6 +28,8 @@ fetch-tools.ps1 / fetch-tools.sh    one-time kit builder              -- run on 
 Build-DetectionContent.ps1          capture -> Splunk/Sigma/Suricata/Zeek content  -- run on the analyst box
 tools/                              open-source payload (fetched, not committed)
 docs/SCENARIOS.md                   incident-scenario catalog + host-role matrix + cloud/off-host steps
+docs/RANGE.md                       training-lab use: load into / extract out of guest VMs (any hypervisor)
+range/                              lab helpers: per-hypervisor deploy scripts, in-guest detect, loader, collector server
 docs/RUNBOOK.md                     pre-touch field procedure + checklist
 docs/GAPS.md                        off-host vantage points (network/identity/cloud) + artifact gaps
 docs/DETECTION.md                   forward-triage -> detection-handoff doctrine + roadmap
@@ -98,8 +101,11 @@ powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest E:\evidence -Rap
 
 # ship to a network collector at an IP (stages locally, zips+hashes, SMB copy)
 powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
+
+# TRAINING / range mode: mark EXERCISE, VM-aware, POST the bundle to a lab collector (see docs/RANGE.md)
+powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
 ```
-Run **as Administrator**. Key switches: `-Auto`, `-RapidOnly`, `-SkipAD`, `-DeferMemory`, `-StepTimeoutSec N`, `-Share <name>`, `-Cred`.
+Run **as Administrator**. Key switches: `-Auto`, `-RapidOnly`, `-SkipAD`, `-DeferMemory`, `-Lab`, `-StepTimeoutSec N`, `-Share <name>`, `-Cred`. `-Dest` accepts a drive path, `\\host\share`, a bare IP, or `http(s)://collector/`.
 
 ### Linux
 ```bash
@@ -107,6 +113,7 @@ sudo ./ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + men
 sudo ./ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
 sudo ./ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
 sudo ./ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
+sudo ./ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
 ```
 Run **as root**. Flags: `--auto`, `--rapid-only`, `--skip-ad`, `--defer-memory`, `-t <sec>`.
 For BloodHound.py collection set `BH_USER/BH_PASS/BH_DOMAIN/BH_DC` in the environment.

@@ -43,6 +43,7 @@ param(
     [switch]$RapidOnly,
     [switch]$SkipAD,
     [switch]$DeferMemory,  # capture RAM AFTER the volatile-command battery instead of before it
+    [switch]$Lab,          # training/exercise mode: read-only-media launch, VM detection, HTTP egress, relaxed contamination
     [string]$Authorizer = '',   # who authorized this collection (chain of custody)
     [string]$LegalBasis = '',   # authority/legal basis (IR engagement, warrant, consent...)
     [string]$ScopeNote  = ''    # authorized scope of collection
@@ -80,21 +81,48 @@ $ToolDir  = Join-Path $PSScriptRoot 'tools'
 # Network destinations are slow+fragile to write to live, so we STAGE locally
 # (next to the script / thumb drive) then ZIP + ship at seal time.
 function Test-IsIP { param([string]$s) $s -match '^(\d{1,3}\.){3}\d{1,3}$' }
-$NetworkDest = $null
-if (Test-IsIP $Dest)            { $NetworkDest = "\\$Dest\$Share" }
-elseif ($Dest -like '\\*')      { $NetworkDest = $Dest }
-
-if ($NetworkDest) {
-    $OutputRoot = Join-Path $PSScriptRoot '_staging'   # collect locally first (on the collection media, NOT the target)
-    try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {
-        # last resort only: staging on the TARGET's own disk contaminates the subject - never do it silently
-        $OutputRoot = Join-Path $env:TEMP '_ir_staging'
-        try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {}
-        Write-Host "!!! CONTAMINATION WARNING: cannot stage on the collection media - falling back to the TARGET disk ($OutputRoot)." -ForegroundColor Red
-        Write-Host "    This writes evidence onto the subject host. Attach writable removable media and re-run if at all possible. !!!" -ForegroundColor Red
+function Get-WritableRoot {
+    # first candidate that we can create + write a probe file into
+    param([string[]]$Candidates)
+    foreach ($c in $Candidates) {
+        try { New-Item -ItemType Directory -Force $c -EA Stop | Out-Null
+              $tf = Join-Path $c ('.w_' + $stamp); [IO.File]::WriteAllText($tf,'x'); Remove-Item $tf -Force -EA SilentlyContinue
+              return $c } catch {}
     }
+    return $null
+}
+# an instructor-attached, purpose-labeled writable volume (lab evidence disk), if present
+$LabVol = $null
+try { $lv = Get-Volume 2>$null | Where-Object { $_.FileSystemLabel -match 'IR.?EVID|EVIDENCE' -and $_.DriveLetter } | Select-Object -First 1; if ($lv) { $LabVol = "$($lv.DriveLetter):\" } } catch {}
+# is the tool running from read-only media (CD/ISO)?  (can't write next to itself)
+$RoMedia = $false
+try { $sd = $PSScriptRoot.Substring(0,2); $RoMedia = ((Get-CimInstance Win32_CDROMDrive 2>$null | ForEach-Object { $_.Drive }) -contains $sd) } catch {}
+
+$NetworkDest = $null; $HttpDest = $null
+if     ($Dest -match '^https?://') { $HttpDest = $Dest }          # lab: POST the sealed bundle to a collector endpoint
+elseif (Test-IsIP $Dest)           { $NetworkDest = "\\$Dest\$Share" }
+elseif ($Dest -like '\\*')         { $NetworkDest = $Dest }
+
+if ($NetworkDest -or $HttpDest) {
+    # stage locally first, ship/POST at seal. Find a WRITABLE staging root (media -> lab disk -> temp).
+    $cands = @((Join-Path $PSScriptRoot '_staging'))
+    if ($LabVol) { $cands += (Join-Path $LabVol '_ir_staging') }
+    $cands += (Join-Path $env:TEMP '_ir_staging')
+    $OutputRoot = Get-WritableRoot $cands
+    if (-not $OutputRoot) { $OutputRoot = Join-Path $env:TEMP '_ir_staging'; try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {} }
+    if ($OutputRoot -like "$env:TEMP*" -and -not $Lab) {
+        Write-Host "!!! CONTAMINATION WARNING: cannot stage on the collection media - staging on the TARGET disk ($OutputRoot)." -ForegroundColor Red
+        Write-Host "    This writes evidence onto the subject host. Attach writable removable media and re-run if possible. !!!" -ForegroundColor Red
+    } elseif ($Lab) { Write-Host "Lab mode: staging at $OutputRoot; ships/POSTs at seal." -ForegroundColor Cyan }
 } else {
     $OutputRoot = $Dest
+    # read-only-media / non-writable target: redirect to a writable evidence location so we can run at all.
+    $probe = $false; try { $tf = Join-Path $OutputRoot ('.w_' + $stamp); [IO.File]::WriteAllText($tf,'x'); Remove-Item $tf -Force -EA SilentlyContinue; $probe = $true } catch {}
+    if (-not $probe) {
+        $redir = if ($LabVol) { Join-Path $LabVol 'ir_evidence' } else { Join-Path $env:SystemDrive 'ir_evidence' }
+        Write-Host "Output '$OutputRoot' not writable (read-only media?). Redirecting evidence to $redir." -ForegroundColor Yellow
+        $OutputRoot = $redir; try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {}
+    }
 }
 $OutDir = Join-Path $OutputRoot ("{0}_{1}_{2}" -f $CaseId, $hostName, $stamp)
 
@@ -274,11 +302,32 @@ $info = [ordered]@{
     fqdn=$fqdn; domain=$env:USERDNSDOMAIN; domainJoined=$domainJoined; collector=$env:USERNAME; elevated=$isAdmin
     startUtc=$startUtc; os=$osCaption; psVersion="$($PSVersionTable.PSVersion)"
     languageMode="$($ExecutionContext.SessionState.LanguageMode)"; is64="$([Environment]::Is64BitProcess)"; toolsDetected=$detected
-    authorizer=$Authorizer; legalBasis=$LegalBasis; scope=$ScopeNote
+    authorizer=$Authorizer; legalBasis=$LegalBasis; scope=$ScopeNote; exercise=[bool]$Lab; roMedia=$RoMedia
 }
 if (-not $Authorizer) { Write-Audit "CUSTODY WARNING: no -Authorizer recorded. Pass -Authorizer/-LegalBasis/-ScopeNote for a defensible chain of custody." }
 try { [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
-try { if (-not (Test-Path (Join-Path $Dirs.metadata 'intake.json'))) { $di=[ordered]@{ case_id=$CaseId; scenario='U'; scenario_name='Unknown / broad triage'; host_role='unknown'; scope='single'; connectivity='connected'; generated_by='IR-Collect.ps1 (non-guided)'; known_bad_ips=@(); known_bad_domains=@(); known_bad_hashes=@(); known_bad_accounts=@(); known_bad_paths=@(); attack_tags=@() }; [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($di | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } } catch {}
+try { if (-not (Test-Path (Join-Path $Dirs.metadata 'intake.json'))) { $di=[ordered]@{ case_id=$CaseId; scenario='U'; scenario_name='Unknown / broad triage'; host_role='unknown'; scope='single'; connectivity='connected'; exercise=[bool]$Lab; generated_by='IR-Collect.ps1 (non-guided)'; known_bad_ips=@(); known_bad_domains=@(); known_bad_hashes=@(); known_bad_accounts=@(); known_bad_paths=@(); attack_tags=@() }; [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($di | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } } catch {}
+
+# --- guest / hypervisor detection: which host-side pull channel is available (training-lab) ---
+$script:Hypervisor='unknown'; $script:GuestTools=@()
+try {
+    $cs = Get-CimInstance Win32_ComputerSystem 2>$null; $bios = Get-CimInstance Win32_BIOS 2>$null
+    $sig = "$($cs.Manufacturer) $($cs.Model) $($bios.Manufacturer) $($bios.SMBIOSBIOSVersion) $($bios.SerialNumber)"
+    switch -Regex ($sig) {
+        'VMware'                       { $script:Hypervisor='vmware'; break }
+        'VirtualBox|innotek'           { $script:Hypervisor='virtualbox'; break }
+        'QEMU|KVM|BOCHS|SeaBIOS|Red Hat' { $script:Hypervisor='qemu-kvm'; break }
+        'Xen'                          { $script:Hypervisor='xen'; break }
+        'Amazon|EC2'                   { $script:Hypervisor='aws'; break }
+        'Google'                       { $script:Hypervisor='gcp'; break }
+        'Microsoft Corporation.*Virtual|Virtual Machine' { $script:Hypervisor='hyper-v'; break }
+    }
+    foreach($svc in 'vmtools','VBoxService','vmicvss','vmicheartbeat','qemu-ga','GCEAgent','AmazonSSMAgent'){ if (Get-Service $svc -EA SilentlyContinue){ $script:GuestTools += $svc } }
+    $envtxt = "Hypervisor: $script:Hypervisor`nGuestTools: $($script:GuestTools -join ', ')`nSMBIOS: $sig`nBootMediaReadOnly: $RoMedia`nLabMode: $([bool]$Lab)`nOutputRoot: $OutputRoot"
+    [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'environment_detect.txt'), $envtxt, (New-Object Text.UTF8Encoding($false)))
+    Write-Audit "GUEST ENV: hypervisor=$script:Hypervisor tools=$($script:GuestTools -join '+') roMedia=$RoMedia lab=$([bool]$Lab)"
+} catch {}
+if ($Lab) { Write-Host "=== LAB / TRAINING MODE (hypervisor=$script:Hypervisor) - evidence marked EXERCISE ===" -ForegroundColor Magenta }
 
 # --- destination preflight: write-test + FAT32 4GB cap -----------------------
 try {
@@ -667,9 +716,9 @@ Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
         Write-Audit "Custody trail frozen + hashed: $ah"
     } catch { Write-Audit "Could not freeze/hash audit.log: $($_.Exception.Message)" }
 
-    # --- ship to network destination if requested ---
-    if ($NetworkDest) {
-        Write-Audit "Shipping evidence to network destination $NetworkDest"
+    # --- ship the sealed bundle: SMB/UNC share and/or HTTP(S) POST to a lab collector ---
+    if ($NetworkDest -or $HttpDest) {
+        Write-Audit "Sealing + shipping evidence ($(if($HttpDest){"HTTP $HttpDest"}else{$NetworkDest}))"
         $zip = "$OutDir.zip"
         if ("$($ExecutionContext.SessionState.LanguageMode)" -eq 'FullLanguage') {
             $zipSb = "Add-Type -AssemblyName System.IO.Compression.FileSystem; if(Test-Path '$zip'){Remove-Item '$zip' -Force}; [System.IO.Compression.ZipFile]::CreateFromDirectory('$OutDir','$zip')"
@@ -677,25 +726,49 @@ Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
             $zipSb = "Compress-Archive -Path '$OutDir\*' -DestinationPath '$zip' -Force"   # CLM-safe (cmdlet); may fail >2GB
         }
         Invoke-Step 'seal-zip' ([scriptblock]::Create($zipSb)) $null $Dirs.logs -TimeoutSec 3600 -Retries 0 | Out-Null
-        # CLM/large-file fallback: ship the raw folder via robocopy if no zip was produced
-        if (-not (Test-Path $zip) -and -not $Cred) {
+        if (-not (Test-Path $zip) -and $NetworkDest -and -not $Cred) {
             Write-Audit "seal-zip produced no archive - shipping raw folder via robocopy instead."
             Invoke-Step 'ship-folder' ([scriptblock]::Create("robocopy '$OutDir' '$NetworkDest\$(Split-Path $OutDir -Leaf)' /E /Z /R:1 /W:1 /NFL /NDL /NP")) $null $Dirs.logs -TimeoutSec 7200 -Retries 0 | Out-Null
         }
         try { (Get-FileHash $zip -Algorithm SHA256).Hash | Out-File "$zip.sha256" -Encoding ASCII } catch {}
-        # map the share (with creds if provided), copy, unmap
-        try {
-            if ($Cred) { New-PSDrive -Name IRDEST -PSProvider FileSystem -Root $NetworkDest -Credential $Cred -ErrorAction Stop | Out-Null; $tgt='IRDEST:\' }
-            else       { $tgt = $NetworkDest }
-            Copy-Item "$zip","$zip.sha256" $tgt -Force -ErrorAction Stop
-            Write-Audit "Ship OK -> $NetworkDest"
-            Write-Host "Shipped $(Split-Path $zip -Leaf) to $NetworkDest" -ForegroundColor Green
-        } catch {
-            Write-Audit "Ship FAILED: $($_.Exception.Message). Evidence retained locally at $zip"
-            Write-Host "Network ship failed - evidence kept locally: $zip" -ForegroundColor Yellow
-        } finally { try { Remove-PSDrive IRDEST -ErrorAction SilentlyContinue } catch {} }
+        if ($NetworkDest) {
+            try {
+                if ($Cred) { New-PSDrive -Name IRDEST -PSProvider FileSystem -Root $NetworkDest -Credential $Cred -ErrorAction Stop | Out-Null; $tgt='IRDEST:\' }
+                else       { $tgt = $NetworkDest }
+                Copy-Item "$zip","$zip.sha256" $tgt -Force -ErrorAction Stop
+                Write-Audit "Ship OK -> $NetworkDest"; Write-Host "Shipped $(Split-Path $zip -Leaf) to $NetworkDest" -ForegroundColor Green
+            } catch {
+                Write-Audit "Ship FAILED: $($_.Exception.Message). Evidence retained locally at $zip"
+                Write-Host "Network ship failed - evidence kept locally: $zip" -ForegroundColor Yellow
+            } finally { try { Remove-PSDrive IRDEST -ErrorAction SilentlyContinue } catch {} }
+        }
+        if ($HttpDest -and (Test-Path $zip)) {
+            # POST/PUT the bundle to a lab collector (e.g. an uploadserver / range results endpoint)
+            try {
+                $u = if ($HttpDest.EndsWith('/')) { $HttpDest + (Split-Path $zip -Leaf) } else { $HttpDest }
+                try   { Invoke-RestMethod -Uri $u -Method Put -InFile $zip -TimeoutSec 3600 -ErrorAction Stop | Out-Null }
+                catch { Invoke-WebRequest -Uri $HttpDest -Method Post -InFile $zip -ContentType 'application/zip' -TimeoutSec 3600 -UseBasicParsing -ErrorAction Stop | Out-Null }
+                Write-Audit "HTTP upload OK -> $HttpDest"; Write-Host "Uploaded $(Split-Path $zip -Leaf) to $HttpDest" -ForegroundColor Green
+            } catch {
+                Write-Audit "HTTP upload FAILED: $($_.Exception.Message). Evidence retained locally at $zip"
+                Write-Host "HTTP upload failed - evidence kept locally: $zip" -ForegroundColor Yellow
+            }
+        }
     }
 
+    if ($Lab -and -not $NetworkDest -and -not $HttpDest) {
+        $leaf = Split-Path $OutDir -Leaf
+        $hint = switch ($script:Hypervisor) {
+            'vmware'     { "govc guest.download -vm <VM> -l <user>:<pass> '$OutDir' ./$leaf  (VMware Tools guest ops)" }
+            'virtualbox' { "VBoxManage guestcontrol <VM> copyfrom --username <u> --password <p> --recursive '$OutDir' './$leaf'" }
+            'hyper-v'    { "PowerShell Direct: Copy-Item -FromSession (New-PSSession -VMName <VM> -Credential (Get-Credential)) '$OutDir' -Destination ./$leaf -Recurse" }
+            'qemu-kvm'   { "Proxmox/QEMU: qm guest exec <vmid> -- tar czf - '$OutDir' > $leaf.tgz , or mount the guest disk / shared folder" }
+            default      { "Pull '$OutDir' via your hypervisor's guest file-copy or a shared folder, or re-run with -Dest <IP|\\share|http://collector>." }
+        }
+        Write-Host "LAB: evidence left in-guest at $OutDir. Host-side pull:" -ForegroundColor Cyan
+        Write-Host "  $hint" -ForegroundColor Gray
+        Write-Audit "LAB host-pull hint ($script:Hypervisor): $hint"
+    }
     Write-Audit "===== IR-Collect DONE | OK=$script:StepsOk FAIL=$script:StepsFail TOTAL=$script:StepNum ====="
     Write-Host ""; Write-Host "Collection complete. Output: $OutDir" -ForegroundColor Green
     Write-Host "Summary: $(Join-Path $OutDir 'SUMMARY.md')  |  Audit: $AuditLog"
@@ -761,7 +834,7 @@ $Scenarios = [ordered]@{
 }
 
 function Invoke-GuidedIntake {
-    $script:Intake = [ordered]@{ case_id=$CaseId; generated_by='IR-Collect.ps1' }
+    $script:Intake = [ordered]@{ case_id=$CaseId; exercise=[bool]$Lab; generated_by='IR-Collect.ps1' }
     Write-Host ""; Write-Host "================ GUIDED INTAKE ================" -ForegroundColor Cyan
 
     Write-Host "-- Vantage check: is running on THIS box the right move? --" -ForegroundColor Gray
