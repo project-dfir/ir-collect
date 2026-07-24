@@ -47,7 +47,12 @@ param(
     [string]$Authorizer = '',   # who authorized this collection (chain of custody)
     [string]$LegalBasis = '',   # authority/legal basis (IR engagement, warrant, consent...)
     [string]$ScopeNote  = '',   # authorized scope of collection
-    [string]$Resume     = ''    # resume a prior run: point at its output dir; re-runs only unsatisfied steps
+    [string]$Resume     = '',   # resume a prior run: point at its output dir; re-runs only unsatisfied steps
+    [string]$Scenario   = '',   # non-interactive scenario id (1-10 or U): injects intake+plan, no prompts (automation/lab/E2E)
+    [string]$HostRole   = '',   # non-interactive host role: workstation|server|domain-controller|cloud-vm|container|ot-ics|network-device
+    [string]$KnownBadIps     = '',  # comma/space-separated seed IOCs (fold into intake.json)
+    [string]$KnownBadDomains = '',
+    [string]$KnownBadHashes  = ''
 )
 
 $ErrorActionPreference = 'Continue'   # self-heal: never let a single error stop the pipeline
@@ -1060,6 +1065,36 @@ function Invoke-GuidedIntake {
     [void](Read-Def "Press Enter to begin (Ctrl-C to abort)" '')
 }
 
+function Set-IntakeAuto {
+    # non-interactive twin of Invoke-GuidedIntake: same catalog, same plan logic, zero prompts.
+    $sc = if ($Scenarios.Contains($Scenario)) { $Scenario } else { 'U' }
+    $scen = $Scenarios[$sc]
+    $roleName = if ($HostRole) { $HostRole.ToLower() } elseif ($info.os -match 'Server') { 'server' } else { 'workstation' }
+    if ($roleName -notin 'workstation','server','domain-controller','cloud-vm','container','ot-ics','network-device') { $roleName='workstation' }
+    $script:Intake = [ordered]@{ case_id=$CaseId; exercise=[bool]$Lab; generated_by='IR-Collect.ps1'; noninteractive=$true }
+    $script:Intake.scenario = $sc; $script:Intake.scenario_name = $scen.name; $script:Intake.attack_tags = @($scen.attack)
+    $mobMap = @{ '2'='bec'; '3'='exfil'; '9'='smish'; '5'='beacon'; '10'='spyware'; '6'='token'; '7'='token'; '1'='ransom' }
+    $script:Intake.mobile_involved = $false
+    if ($mobMap.ContainsKey($sc)) { $script:Intake.mobile_profile = $mobMap[$sc] }
+    $script:Intake.host_role = $roleName
+    if ($roleName -eq 'ot-ics') { $script:DoNoHarm = $true }
+    $script:Intake.scope = 'single'; $script:Intake.connectivity = 'connected'
+    $script:Intake.known_bad_ips     = @(($KnownBadIps)     -split '[, ]+' | Where-Object { $_ })
+    $script:Intake.known_bad_domains = @(($KnownBadDomains) -split '[, ]+' | Where-Object { $_ })
+    $script:Intake.known_bad_hashes  = @(($KnownBadHashes)  -split '[, ]+' | Where-Object { $_ })
+    # collection plan: identical rules to the guided path
+    $plan = @($scen.plan)
+    if (-not $plan.Count) { $plan = @('2','3','4','6'); if ($domainJoined) { $plan += '5' } }
+    if ($roleName -in 'server','domain-controller') { $plan = @($plan | Where-Object { $_ -ne '6' }) }
+    if ($roleName -eq 'domain-controller' -and $domainJoined -and $plan -notcontains '5') { $plan += '5' }
+    if ($script:DoNoHarm) { $plan = @($plan | Where-Object { $_ -notin '7','8' }) }
+    if ($SkipAD) { $plan = @($plan | Where-Object { $_ -ne '5' }) }
+    $script:Plan = @($plan | Select-Object -Unique)
+    $script:Intake.plan = $script:Plan
+    try { [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($script:Intake | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } catch {}
+    Write-Audit "INTAKE(auto) scenario=$sc ($($scen.name)) role=$roleName plan=$($script:Plan -join ',') attack=$($scen.attack -join ',') seedIOCs=$(($script:Intake.known_bad_ips.Count + $script:Intake.known_bad_domains.Count + $script:Intake.known_bad_hashes.Count))"
+}
+
 # ===========================================================================
 # MAIN  (self-heal: Seal ALWAYS runs, even if a phase throws)
 # ===========================================================================
@@ -1071,7 +1106,9 @@ try { Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEn
 
 # guided intake is the default when interactive and no mode flag was given
 if ($Resume) { Import-PriorState $OutDir }
-if (-not $Auto -and -not $RapidOnly -and -not [Console]::IsInputRedirected) {
+if ($Scenario) {
+    try { Set-IntakeAuto } catch { Write-Audit "Auto-intake failed: $($_.Exception.Message)" }
+} elseif (-not $Auto -and -not $RapidOnly -and -not [Console]::IsInputRedirected) {
     try { Invoke-GuidedIntake } catch { Write-Audit "Guided intake skipped: $($_.Exception.Message)" }
 }
 
