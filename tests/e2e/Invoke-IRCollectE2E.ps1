@@ -235,7 +235,7 @@ function Assert-Scenario {
     $intakeF = Join-Path $base '00_metadata\intake.json'
     $rsF     = Join-Path $base '99_logs\run_state.json'
     $sumF    = Join-Path $base 'SUMMARY.md'
-    $manF    = Join-Path $base 'MANIFEST-SHA256.csv'
+    $manF    = Join-Path $base '99_logs\MANIFEST-SHA256.csv'
     $checks['intake_exists']    = Test-Path $intakeF
     $checks['runstate_exists']  = Test-Path $rsF
     $checks['summary_exists']   = Test-Path $sumF
