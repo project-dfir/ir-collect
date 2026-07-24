@@ -136,7 +136,9 @@ if ($NetworkDest -or $HttpDest) {
 } else {
     $OutputRoot = $Dest
     # read-only-media / non-writable target: redirect to a writable evidence location so we can run at all.
-    $probe = $false; try { $tf = Join-Path $OutputRoot ('.w_' + $stamp); [IO.File]::WriteAllText($tf,'x'); Remove-Item $tf -Force -EA SilentlyContinue; $probe = $true } catch {}
+    # NOTE: create the destination first - a valid local -Dest that does not exist yet must be CREATED,
+    # not misjudged as read-only and redirected.
+    $probe = $false; try { New-Item -ItemType Directory -Force $OutputRoot -EA Stop | Out-Null; $tf = Join-Path $OutputRoot ('.w_' + $stamp); [IO.File]::WriteAllText($tf,'x'); Remove-Item $tf -Force -EA SilentlyContinue; $probe = $true } catch {}
     if (-not $probe) {
         $redir = if ($LabVol) { Join-Path $LabVol 'ir_evidence' } else { Join-Path $env:SystemDrive 'ir_evidence' }
         Write-Host "Output '$OutputRoot' not writable (read-only media?). Redirecting evidence to $redir." -ForegroundColor Yellow

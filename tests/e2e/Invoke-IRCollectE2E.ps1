@@ -36,7 +36,7 @@ param(
     [int]   $BootTimeoutSec  = 900,   # bound for heartbeat OK
     [int]   $PSDirectTimeoutSec = 600, # bound for PowerShell Direct to accept the credential
     [string[]]$Scenarios  = @('1','2','3','4','5','6','7','8','9','10','U'),  # full matrix
-    [string[]]$FullRunScenarios = @('5'),  # these get a FULL -Auto run (all heavy jobs); rest are -RapidOnly
+    [string[]]$FullRunScenarios = @(),     # opt-in: scenarios to run FULL -Auto (all heavy jobs); default all -RapidOnly
     [switch]$Fresh,        # remove any existing VM/vhdx first
     [switch]$KeepVM        # skip teardown (debug)
 )
@@ -212,11 +212,15 @@ function Invoke-Scenario {
             if ($ip)   { $a += @('-KnownBadIps',$ip) }
             if ($dom)  { $a += @('-KnownBadDomains',$dom) }
             if ($hash) { $a += @('-KnownBadHashes',$hash) }
+            New-Item -ItemType Directory -Force 'C:\evidence' | Out-Null
             $p = Start-Process powershell -ArgumentList $a -Wait -PassThru -WindowStyle Hidden
-            $out = Get-ChildItem 'C:\evidence' -Directory | Where-Object { $_.Name -like "${case}_*" } | Sort-Object LastWriteTime -Desc | Select-Object -First 1
-            [pscustomobject]@{ exit=$p.ExitCode; outdir=$out.FullName }
+            # the collector may honour -Dest (C:\evidence) or, on a non-writable target, redirect to C:\ir_evidence
+            $out = Get-ChildItem 'C:\evidence','C:\ir_evidence' -Directory -EA SilentlyContinue |
+                   Where-Object { $_.Name -like "${case}_*" } | Sort-Object LastWriteTime -Desc | Select-Object -First 1
+            [pscustomobject]@{ exit=$p.ExitCode; outdir=$(if($out){$out.FullName}else{$null}) }
         } -ArgumentList $Sid,$m.role,$m.ip,$m.dom,$m.hash,$mode,$case
         Log "  guest exit=$($guestOut.exit) outdir=$($guestOut.outdir)"
+        if (-not $guestOut.outdir) { throw "collector produced no output dir in guest (exit=$($guestOut.exit))" }
         $localOut = Join-Path $ResultsDir "S$Sid"
         Copy-Item -FromSession $sess -Path $guestOut.outdir -Destination $localOut -Recurse -Force
         return (Assert-Scenario -Sid $Sid -LocalOut $localOut -GuestExit $guestOut.exit)
