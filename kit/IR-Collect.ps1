@@ -46,7 +46,8 @@ param(
     [switch]$Lab,          # training/exercise mode: read-only-media launch, VM detection, HTTP egress, relaxed contamination
     [string]$Authorizer = '',   # who authorized this collection (chain of custody)
     [string]$LegalBasis = '',   # authority/legal basis (IR engagement, warrant, consent...)
-    [string]$ScopeNote  = ''    # authorized scope of collection
+    [string]$ScopeNote  = '',   # authorized scope of collection
+    [string]$Resume     = ''    # resume a prior run: point at its output dir; re-runs only unsatisfied steps
 )
 
 $ErrorActionPreference = 'Continue'   # self-heal: never let a single error stop the pipeline
@@ -72,6 +73,19 @@ if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSyste
 # ---------------------------------------------------------------------------
 function Now-Utc { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ') }
 
+# Get-Inv: OS-compat inventory shim. Prefer CIM (PSv3+ / PSv7), fall back to legacy WMI on
+# older/older-broken hosts (Win7/2008R2, WinRM-off). Never throws; returns $null on total failure.
+# NOTE: only usable in PARENT scope - Start-Job children do not inherit script functions.
+function Get-Inv { param([string]$Class,[string]$Filter='',[string]$NS='root\cimv2')
+    try { if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+            if ($Filter) { return Get-CimInstance -ClassName $Class -Namespace $NS -Filter $Filter -ErrorAction Stop }
+            else         { return Get-CimInstance -ClassName $Class -Namespace $NS -ErrorAction Stop } } } catch {}
+    try { if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+            if ($Filter) { return Get-WmiObject -Class $Class -Namespace $NS -Filter $Filter -ErrorAction Stop }
+            else         { return Get-WmiObject -Class $Class -Namespace $NS -ErrorAction Stop } } } catch {}
+    return $null
+}
+
 if ([string]::IsNullOrWhiteSpace($Dest)) { $Dest = (Get-Location).Path }
 $hostName = $env:COMPUTERNAME
 $stamp    = (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmssZ')
@@ -96,7 +110,7 @@ $LabVol = $null
 try { $lv = Get-Volume 2>$null | Where-Object { $_.FileSystemLabel -match 'IR.?EVID|EVIDENCE' -and $_.DriveLetter } | Select-Object -First 1; if ($lv) { $LabVol = "$($lv.DriveLetter):\" } } catch {}
 # is the tool running from read-only media (CD/ISO)?  (can't write next to itself)
 $RoMedia = $false
-try { $sd = $PSScriptRoot.Substring(0,2); $RoMedia = ((Get-CimInstance Win32_CDROMDrive 2>$null | ForEach-Object { $_.Drive }) -contains $sd) } catch {}
+try { $sd = $PSScriptRoot.Substring(0,2); $RoMedia = ((Get-Inv Win32_CDROMDrive | ForEach-Object { $_.Drive }) -contains $sd) } catch {}
 
 $NetworkDest = $null; $HttpDest = $null
 if     ($Dest -match '^https?://') { $HttpDest = $Dest }          # lab: POST the sealed bundle to a collector endpoint
@@ -125,6 +139,7 @@ if ($NetworkDest -or $HttpDest) {
     }
 }
 $OutDir = Join-Path $OutputRoot ("{0}_{1}_{2}" -f $CaseId, $hostName, $stamp)
+if ($Resume) { $OutDir = $Resume }
 
 $Dirs = [ordered]@{
     root        = $OutDir
@@ -142,12 +157,80 @@ foreach ($d in $Dirs.Values) { try { New-Item -ItemType Directory -Force -Path $
 
 $AuditLog = Join-Path $Dirs.logs 'audit.log'
 $ErrLog   = Join-Path $Dirs.logs 'errors.log'
+$script:StateJsonl = Join-Path $Dirs.logs 'run_state.jsonl'
+try { if (-not (Test-Path $script:StateJsonl)) { New-Item -ItemType File -Path $script:StateJsonl -Force | Out-Null } } catch {}
 
 function Write-Audit {
     param([string]$Message)
     $line = "{0} | {1} | {2}" -f (Now-Utc), $env:USERNAME, $Message
     try { Add-Content -Path $AuditLog -Value $line -Encoding UTF8 } catch {}
     Write-Host $line
+}
+
+# ===== completion ledger + self-troubleshoot + resume =====
+function Get-Phase { param([string]$Dir)
+    foreach ($e in $Dirs.GetEnumerator()) { if ($e.Value -eq $Dir) { return $e.Key } }
+    return 'other'
+}
+function Write-Ledger { param([string]$Id,[string]$Name,[string]$Phase,[string]$Ev,[hashtable]$Extra)
+    if (-not $script:StateJsonl) { return }
+    $o = [ordered]@{ t=(Now-Utc); id=$Id; name=$Name; phase=$Phase; ev=$Ev }
+    if ($Extra) { foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] } }
+    try { Add-Content -Path $script:StateJsonl -Value ($o | ConvertTo-Json -Compress -Depth 4) -Encoding UTF8 } catch {}
+}
+function Get-ErrorClass { param([string]$Kind,[string]$Text)
+    if ($Kind -eq 'timeout') { return 'timeout' }
+    switch -Regex ($Text) {
+        'Access is denied|UnauthorizedAccess|requires elevation|not elevated|Administrator privilege|SeSecurityPrivilege' { return 'not_elevated' }
+        'is not recognized|CommandNotFoundException|cannot find the path|Could not find|No such file' { return 'tool_missing' }
+        'not enough space|There is not enough space|disk is full' { return 'no_space' }
+        'being used by another process|because it is being used|cannot access the file|volume .* in use' { return 'file_locked' }
+        'RPC server is unavailable|network path was not found|is unreachable|actively refused|A connection attempt failed' { return 'net_unreachable' }
+        'ConstrainedLanguage|not allowed in ConstrainedLanguage|LanguageMode|blocked by .* policy|AppLocker' { return 'clm_blocked' }
+        'Invalid namespace|provider load failure|WMI|CIM|WinRM cannot' { return 'wmi_failure' }
+        default { return 'unknown' }
+    }
+}
+function Get-Backoff { param([string]$Cls,[int]$Attempt)
+    switch ($Cls) { 'timeout' { return ($Attempt*$Attempt*1000) } 'net_unreachable' { return ($Attempt*$Attempt*1000) } 'file_locked' { return 2000 } default { return 400 } }
+}
+$script:RemTried = @{}
+# Invoke-Remediation: $true => retry now ; $false => give up. Each (id,class) fires once; hard cap 3 attempts.
+function Invoke-Remediation { param([string]$Cls,[string]$Name,[string]$Id,[string]$Phase,[int]$Attempt)
+    if ($Attempt -ge 3) { return $false }
+    $k = "$Id|$Cls"; if ($script:RemTried.ContainsKey($k)) { return $false }; $script:RemTried[$k] = $true
+    $action = 'none'; $retry = $false
+    switch ($Cls) {
+        'timeout'         { $action='backoff-retry';       $retry = ($Attempt -lt 2) }
+        'net_unreachable' { $action='backoff-retry';       $retry = ($Attempt -lt 2) }
+        'file_locked'     { $action='retry-after-settle';  $retry = $true }
+        'no_space'        { $action='insufficient-space';  $retry = $false }
+        'not_elevated'    { $action='degrade-nonadmin';    $retry = $false }
+        'tool_missing'    { $action='fallback-or-skip';    $retry = $false }
+        'clm_blocked'     { $action='clm-degrade';         $retry = $false }
+        'wmi_failure'     { $action='cim-to-wmi-fallback'; $retry = $false }
+        default           { $action='none';                $retry = $false }
+    }
+    Write-Ledger $Id $Name $Phase 'remediation' @{ class=$Cls; action=$action; result=$(if($retry){'retry'}else{'stop'}) }
+    Write-Audit "STEP $Id REMEDIATE | $Name | class=$Cls action=$action -> $(if($retry){'retry'}else{'stop'})"
+    return $retry
+}
+$script:Satisfied = @{}
+function Import-PriorState { param([string]$Dir)
+    $f = Join-Path $Dir '99_logs\run_state.jsonl'
+    if (-not (Test-Path $f)) { return }
+    foreach ($line in [IO.File]::ReadAllLines($f)) {
+        if ($line -notmatch '"ev":"ok"') { continue }
+        try { $o = $line | ConvertFrom-Json; if ($o.name) { $script:Satisfied[$o.name] = $true } } catch {}
+    }
+    Write-Audit "RESUME: $($script:Satisfied.Count) steps already satisfied - will skip them."
+}
+function Test-StepSatisfied { param([string]$Name,[string]$Target)
+    if (-not $Resume) { return $false }
+    if (-not $script:Satisfied.ContainsKey($Name)) { return $false }
+    if (-not $Target) { return $true }
+    if (-not (Test-Path $Target)) { return $false }
+    return ((Get-Item $Target).Length -gt 0)
 }
 
 # ---------------------------------------------------------------------------
@@ -217,36 +300,64 @@ function Invoke-Step {
     )
     $script:StepNum++
     $id = '{0:000}' -f $script:StepNum
+    $phase = Get-Phase $Dir
     $target = if ($OutFile) { Join-Path $Dir $OutFile } else { $null }
-    $attempt = 0; $start = Get-Date
-    while ($attempt -le $Retries) {
+    # resume gate: skip a step already satisfied by a prior run (name known-ok + output present + non-empty)
+    if (Test-StepSatisfied $Name $target) {
+        Write-Ledger $id $Name $phase 'skipped' @{ reason='already-ok' }
+        Write-Audit "STEP $id SKIP | $Name | already satisfied (resume)"; $script:StepsOk++; return $null
+    }
+    Write-Ledger $id $Name $phase 'planned' @{ timeout_s=$TimeoutSec }
+    $attempt = 0; $start = Get-Date; $maxAttempt = 3; $cls = ''
+    while ($attempt -lt $maxAttempt) {
         $attempt++; $job = $null
+        Write-Ledger $id $Name $phase 'running' @{ attempt=$attempt }
         try {
             $job = Start-Job -ScriptBlock $Script
             if (Wait-Job $job -Timeout $TimeoutSec) {
                 $out = Receive-Job $job -ErrorAction SilentlyContinue 2>&1
                 Remove-Job $job -Force -ErrorAction SilentlyContinue
-                if ($target -and $null -ne $out) { try { [IO.File]::WriteAllText($target, (($out | Out-String -Width 4096)), (New-Object Text.UTF8Encoding($false))) } catch { try { $out | Out-File -FilePath $target -Encoding UTF8 -Width 4096 } catch {} } }
+                # separate real data from non-terminating error records (Start-Job merges stderr via 2>&1)
+                $errRecs  = @($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+                $hasData  = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }).Count -gt 0
+                if ($target -and $hasData) { try { [IO.File]::WriteAllText($target, (($out | Out-String -Width 4096)), (New-Object Text.UTF8Encoding($false))) } catch { try { $out | Out-File -FilePath $target -Encoding UTF8 -Width 4096 } catch {} } }
                 $dur = [int]((Get-Date) - $start).TotalSeconds
+                # soft failure: the job ran but produced ONLY errors and no usable data
+                if (-not $hasData -and $errRecs.Count -gt 0) {
+                    $errText = ($errRecs | ForEach-Object { $_.ToString() }) -join '; '
+                    $cls = Get-ErrorClass 'errorrecord' $errText
+                    Write-Audit "STEP $id WARN | $Name | error-only (class=$cls) | try $attempt"
+                    if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
+                    Write-Ledger $id $Name $phase 'failed' @{ rc='error'; error_class=$cls; error_msg=$errText.Substring(0,[Math]::Min(200,$errText.Length)) }
+                    Add-Content $ErrLog "$(Now-Utc) [$id] $Name : $errText"; $script:StepsFail++; return $out
+                }
+                $bytes = if ($target -and (Test-Path $target)) { (Get-Item $target).Length } else { 0 }
                 $lines = if ($out) { @($out).Count } else { 0 }
                 Write-Audit ("STEP $id OK   | $Name | ${dur}s | try $attempt | lines=$lines" + $(if($target){" -> $(Split-Path $target -Leaf)"}))
+                Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines }
                 $script:StepsOk++; return $out
             } else {
                 Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue
                 # Start-Job cannot kill the NATIVE grandchild (e.g. winpmem) it launched; do it by name
                 # so a hung imager stops appending to its file before the size/stability verify runs.
                 foreach($pn in $KillOnTimeout){ try { Get-Process -Name $pn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {} }
+                $cls = 'timeout'
                 Write-Audit "STEP $id WARN | $Name | TIMEOUT ${TimeoutSec}s | try $attempt"
-                if ($attempt -gt $Retries) { Add-Content $ErrLog "$(Now-Utc) [$id] $Name : timeout ${TimeoutSec}s"; $script:StepsFail++; return $null }
+                if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
+                Write-Ledger $id $Name $phase 'timeout' @{ rc='timeout'; error_class=$cls; attempts=$attempt }
+                Add-Content $ErrLog "$(Now-Utc) [$id] $Name : timeout ${TimeoutSec}s"; $script:StepsFail++; return $null
             }
         } catch {
             if ($job) { try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {} }
-            Write-Audit "STEP $id ERR  | $Name | $($_.Exception.Message) | try $attempt"
-            if ($attempt -gt $Retries) { Add-Content $ErrLog "$(Now-Utc) [$id] $Name : $($_.Exception|Out-String)"; $script:StepsFail++; return $null }
-            Start-Sleep -Milliseconds 400
+            $emsg = $_.Exception.Message; $cls = Get-ErrorClass 'exception' $emsg
+            Write-Audit "STEP $id ERR  | $Name | $emsg | try $attempt (class=$cls)"
+            if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
+            Write-Ledger $id $Name $phase 'failed' @{ rc='exception'; error_class=$cls; error_msg=$emsg.Substring(0,[Math]::Min(200,$emsg.Length)) }
+            Add-Content $ErrLog "$(Now-Utc) [$id] $Name : $($_.Exception|Out-String)"; $script:StepsFail++; return $null
         }
     }
-    return $null
+    Write-Ledger $id $Name $phase 'failed' @{ rc='exhausted'; error_class=$cls; attempts=$attempt }
+    $script:StepsFail++; return $null
 }
 function Collect { param([string]$Name,[scriptblock]$Script,[string]$File,[string]$Dir=$Dirs.volatile,[int]$Timeout=$StepTimeoutSec,[int]$Retries=1)
     Invoke-Step -Name $Name -Script $Script -OutFile $File -Dir $Dir -TimeoutSec $Timeout -Retries $Retries | Out-Null
@@ -270,7 +381,7 @@ function Test-Space { param([string]$Path,[double]$NeedBytes,[string]$What)
 $isAdmin = $false
 try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch {}
 $domainJoined = $false
-try { $domainJoined = (Get-CimInstance Win32_ComputerSystem).PartOfDomain } catch {}
+try { $domainJoined = (Get-Inv Win32_ComputerSystem).PartOfDomain } catch {}
 
 Write-Audit "===== IR-Collect START ====="
 Write-Audit "Case=$CaseId Host=$hostName Output=$OutDir Elevated=$isAdmin DomainJoined=$domainJoined PS=$($PSVersionTable.PSVersion)"
@@ -295,7 +406,7 @@ if (Test-Path $ToolDir) {
 # precompute custody fields (try/catch is a statement, not valid inside a hashtable literal)
 $fqdn = try { [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName } catch { $hostName }
 $startUtc = Now-Utc
-$osCaption = try { (Get-CimInstance Win32_OperatingSystem).Caption } catch { '' }
+$osCaption = try { (Get-Inv Win32_OperatingSystem).Caption } catch { '' }
 $acqId = try { [guid]::NewGuid().ToString() } catch { "$hostName-$stamp" }
 $info = [ordered]@{
     tool='IR-Collect.ps1'; version='2.0'; case=$CaseId; acquisitionId=$acqId; host=$hostName
@@ -343,7 +454,7 @@ try {
 Write-Audit "PREFLIGHT: privilege=$(if($isAdmin){'full'}else{'PARTIAL - not elevated'}) langMode=$($ExecutionContext.SessionState.LanguageMode) 64bit=$([Environment]::Is64BitProcess)"
 Write-Audit "FOOTPRINT: tools run from '$PSScriptRoot' (NOT installed on target); evidence written only to destination; live-collection footprint is documented in this log. For non-volatile ground truth follow with a dead-box disk image."
 try {
-    $pt = (Get-CimInstance Win32_OperatingSystem).ProductType  # 1 = workstation
+    $pt = (Get-Inv Win32_OperatingSystem).ProductType  # 1 = workstation
     if ($pt -eq 1 -and $domainJoined -and ((whoami /groups 2>$null) -match 'Domain Admins|Enterprise Admins|Schema Admins')) {
         Write-Host "!!! TIERED-ADMIN RISK: high-privilege domain token (Domain/Enterprise Admin) on a WORKSTATION-class host. Credentials are exposed to a possibly-compromised box. Use a Tier-2 IR account. !!!" -ForegroundColor Red
         Write-Audit "WARNING: high-privilege domain token on workstation-class host (tiered-admin violation / credential-exposure risk)."
@@ -428,7 +539,7 @@ function Job-Memory {
     if ($script:Done['memory']) { Write-Audit "RAM already captured - skipping."; return }
     Write-Audit "--- RAM image (volatile #1) ---"; $D=$Dirs.memory
     # free-space preflight: need ~ physical RAM * 1.1
-    $ram = try { (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
+    $ram = try { (Get-Inv Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
     if (-not (Test-Space $D ($ram*1.1) 'RAM-image')) { Collect 'mem-skip-space' { 'RAM image skipped: insufficient destination free space.' } 'RAM_SKIPPED_NO_SPACE.txt' $D; $script:Done['memory']=$true; return }
     $img = Join-Path $D 'memory.raw'
     if     ($TOOL.winpmem) { $wp=$TOOL.winpmem; Invoke-Step 'mem-winpmem' ([scriptblock]::Create("& '$wp' acquire '$img' 2>&1; if(-not (Test-Path '$img')){ & '$wp' '$img' 2>&1 }")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($wp)) | Out-Null }
@@ -440,7 +551,7 @@ function Job-Memory {
     # writes a tiny error file, mem-hash dutifully hashes it, and the collection seals GREEN with no RAM.
     $imgFile = try { Get-ChildItem $D -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.raw','.dmp','.aff4','.lime','.mem','.zip' } | Sort-Object Length -Descending | Select-Object -First 1 } catch { $null }
     $script:MemBytes = if ($imgFile) { [int64]$imgFile.Length } else { 0 }
-    $totalRam = try { [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
+    $totalRam = try { [int64](Get-Inv Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
     # stability + lock check: a hung imager (orphaned past the job timeout) leaves a growing/locked partial.
     $stable = $false; $locked = $false
     if ($imgFile) {
@@ -698,6 +809,36 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
     try { $summary | Out-File (Join-Path $OutDir 'SUMMARY.md') -Encoding UTF8 } catch {}
     try { $info.endUtc=$endUtc; $info.stepsOk=$script:StepsOk; $info.stepsFail=$script:StepsFail; $info.stepsTotal=$script:StepNum; $info.heavyJobs=$doneList
           [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
+    # --- completion rollup + completeness verdict (reduce run_state.jsonl) ---
+    $rsj = $script:StateJsonl; $nok=0; $nfail=0; $ntmo=0; $nskip=0; $nplan=0; $failedNames=@()
+    if (Test-Path $rsj) {
+        foreach ($ln in [IO.File]::ReadAllLines($rsj)) {
+            if     ($ln -match '"ev":"ok"')      { $nok++ }
+            elseif ($ln -match '"ev":"failed"')  { $nfail++ }
+            elseif ($ln -match '"ev":"timeout"') { $ntmo++ }
+            elseif ($ln -match '"ev":"skipped"') { $nskip++ }
+            elseif ($ln -match '"ev":"planned"') { $nplan++ }
+            if ($ln -match '"ev":"(failed|timeout)"') { try { $o=$ln|ConvertFrom-Json; if($o.name){$failedNames+=$o.name} } catch {} }
+        }
+    }
+    $incomplete = @($failedNames | Sort-Object -Unique)
+    if (-not $script:MemOk -and -not $RapidOnly) { $incomplete += 'memory(no-verified-RAM)' }
+    $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
+    $rs = [ordered]@{
+        schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$CaseId; host=$hostName; output_dir=$OutDir
+        ended_utc=$endUtc; status=$(if($verdict -eq 'COMPLETE'){'complete'}else{'partial'}); resumed=[bool]$Resume
+        langMode="$($ExecutionContext.SessionState.LanguageMode)"; ps_version="$($PSVersionTable.PSVersion)"; elevated=[bool]$isAdmin
+        counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
+        memory_verified=[bool]$script:MemOk
+        completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
+    }
+    try { [IO.File]::WriteAllText((Join-Path $Dirs.logs 'run_state.json'), ($rs | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } catch {}
+    $comp = "`n## Completeness - $verdict`n- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)`n"
+    if ($incomplete.Count -gt 0) { $comp += "- incomplete: $($incomplete -join ', ')`n" }
+    $comp += "- resume: .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'`n"
+    try { Add-Content -Path (Join-Path $OutDir 'SUMMARY.md') -Value $comp -Encoding UTF8 } catch {}
+    $script:RunIncomplete = ($verdict -eq 'INCOMPLETE')
+    Write-Audit "COMPLETENESS $verdict | ok=$nok fail=$nfail timeout=$ntmo skip=$nskip planned=$nplan"
     # manifest LAST so it covers SUMMARY.md + final collection_info.json (fixed literal path strip)
     Invoke-Step 'manifest-sha256' ([scriptblock]::Create(@"
 Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
@@ -922,13 +1063,14 @@ function Invoke-GuidedIntake {
 # ===========================================================================
 # MAIN  (self-heal: Seal ALWAYS runs, even if a phase throws)
 # ===========================================================================
-$script:Sealed = $false; $script:Plan = $null; $script:VolatileOnly = $false; $script:DoNoHarm = $false
+$script:Sealed = $false; $script:Plan = $null; $script:VolatileOnly = $false; $script:DoNoHarm = $false; $script:RunIncomplete = $false
 function Complete-Run { if (-not $script:Sealed) { $script:Sealed = $true; try { Invoke-Seal } catch { Write-Audit "Seal error: $($_.Exception.Message)" } } }
 # interrupt-safety: a hard Ctrl-C / console-close during the long Stage-2 phase must still seal.
 try { [Console]::add_CancelKeyPress({ param($s,$e) $e.Cancel=$true; Write-Host "`nInterrupt - sealing evidence before exit..." -ForegroundColor Yellow; try { Complete-Run } catch {} }) } catch {}
 try { Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action { try { Complete-Run } catch {} } | Out-Null } catch {}
 
 # guided intake is the default when interactive and no mode flag was given
+if ($Resume) { Import-PriorState $OutDir }
 if (-not $Auto -and -not $RapidOnly -and -not [Console]::IsInputRedirected) {
     try { Invoke-GuidedIntake } catch { Write-Audit "Guided intake skipped: $($_.Exception.Message)" }
 }
@@ -957,5 +1099,6 @@ finally { Complete-Run }
 $exitCode = 0
 if ($script:StepsFail -gt 0) { $exitCode = 10 }
 if (-not $script:MemOk -and -not $RapidOnly) { $exitCode = 20 }
-Write-Audit "EXIT $exitCode (0=clean 10=skips 20=no-RAM 40=fatal)"
+if ($script:RunIncomplete) { $exitCode = 15 }
+Write-Audit "EXIT $exitCode (0=clean 10=skips 15=incomplete-critical 20=no-RAM 40=fatal)"
 exit $exitCode
