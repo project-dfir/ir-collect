@@ -91,7 +91,10 @@ function Expand-Guest {
     if (-not (Test-Path $VhdxZip)) { throw "VHDX zip not found: $VhdxZip" }
     Log "Extracting VHDX from $VhdxZip ..."
     $ex = Join-Path $RunDir 'vhdx_extract'; $null = New-Item -ItemType Directory -Force $ex
-    Expand-Archive -Path $VhdxZip -DestinationPath $ex -Force
+    # tar.exe (bsdtar) is far faster + lower-memory than Expand-Archive on a ~22GB zip
+    $tar = (Get-Command tar.exe -EA SilentlyContinue).Source
+    if ($tar) { & $tar -xf $VhdxZip -C $ex; if ($LASTEXITCODE -ne 0) { Log "tar extract rc=$LASTEXITCODE, falling back to Expand-Archive" 'WARN'; Expand-Archive -Path $VhdxZip -DestinationPath $ex -Force } }
+    else { Expand-Archive -Path $VhdxZip -DestinationPath $ex -Force }
     $src = Get-ChildItem $ex -Recurse -Include *.vhdx,*.vhd | Sort-Object Length -Descending | Select-Object -First 1
     if (-not $src) { throw "no VHDX inside $VhdxZip" }
     Log "Guest disk: $($src.FullName) ($([math]::Round($src.Length/1GB,1)) GB) -> $VhdWork"
