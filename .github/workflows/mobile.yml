@@ -45,32 +45,7 @@ jobs:
           force-avd-creation: true
           emulator-options: -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect
           disable-animations: true
-          script: |
-            set -x
-            adb root && adb wait-for-device || true
-            # seed a little SMS/contacts data so content-provider queries return rows (best-effort)
-            adb shell content insert --uri content://sms --bind address:s:+15550000001 \
-              --bind body:s:'e2e test message' --bind type:i:1 2>/dev/null || true
-            chmod +x mobile/mobile-collect.sh
-            # --auto skips the interactive doctrine gate; --scenario injects intake
-            ./mobile/mobile-collect.sh --android --auto --scenario beacon \
-              -c CIMOB -d ./mobout || echo "collector exit=$? (asserting artifacts next)"
-            echo "=== assert sealed mobile bundle ==="
-            base=$(find ./mobout -maxdepth 1 -type d -name 'CIMOB_*' | head -1)
-            echo "bundle: $base"
-            test -n "$base"
-            test -f "$base/meta/collection_info.json"
-            test -f "$base/logs/run_state.json"
-            test -f "$base/SUMMARY.md"
-            echo "--- scenario + acquisition tier ---"
-            grep -o '"scenario":"[^"]*"'         "$base/meta/collection_info.json"
-            grep -o '"acquisition_tier":"[^"]*"' "$base/meta/collection_info.json"
-            echo "--- run_state verdict ---"
-            grep -o '"verdict":"[^"]*"' "$base/logs/run_state.json"
-            grep -q '"scenario":"beacon"' "$base/meta/collection_info.json"
-            # ledger produced valid JSONL events
-            test -s "$base/logs/run_state.jsonl"
-            echo "captured artifacts:"; ls "$base/dumpsys" "$base/artifacts" 2>/dev/null | head
+          script: bash tests/ci/android-smoke.sh
 
       - name: Upload bundle
         if: always()
