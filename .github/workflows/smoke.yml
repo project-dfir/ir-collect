@@ -29,6 +29,8 @@ jobs:
           sudo ./kit/ir-collect.sh --rapid-only --scenario A --host-role workstation \
                --known-bad-ips 203.0.113.5 --known-bad-domains evil.example \
                -c CISMOKE -d ./out || echo "collector exit=$? (non-fatal; asserting artifacts next)"
+          # collector ran as root -> hand ownership back so assert/upload (runner user) can read it
+          sudo chown -R "$(id -u):$(id -g)" ./out 2>/dev/null || true
       - name: Assert sealed evidence contract
         shell: bash
         run: |
