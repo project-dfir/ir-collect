@@ -54,8 +54,13 @@ sudo virt-install --connect "$URI" --name "$DOM" \
   --disk "path=$RUN/seed.iso,device=cdrom" \
   --network network=default,model=virtio \
   --graphics vnc --noautoconsole --boot uefi \
+  --events on_poweroff=destroy,on_reboot=restart,on_crash=destroy \
   --wait 0 2>"$RUN/virtinstall.err" || true
 sudo virsh -c "$URI" list --all --name | grep -q "$DOM" || { log "FAIL: domain not created:"; cat "$RUN/virtinstall.err"; exit 1; }
+# Windows UEFI install ISO prints "Press any key to boot from CD or DVD" and waits for a keypress;
+# headless nobody presses it, so it falls through to "No bootable device". Send ENTER repeatedly
+# for the first ~30s to boot the installer.
+( for _k in $(seq 1 30); do sudo virsh -c "$URI" send-key "$DOM" KEY_ENTER >/dev/null 2>&1; sleep 1; done ) &
 log "install running (Server install ~20-30m + DC promo ~5-8m; reboots several times) ..."
 [ "$BUILD_ONLY" = 1 ] && { log "--build-only: leaving install running"; KEEP=1; exit 0; }
 

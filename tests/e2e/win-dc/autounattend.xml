@@ -37,13 +37,12 @@
       <ImageInstall>
         <OSImage>
           <InstallFrom>
-            <MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>Windows Server 2022 Standard Evaluation (Desktop Experience)</Value></MetaData>
+            <MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>2</Value></MetaData>
           </InstallFrom>
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
         </OSImage>
       </ImageInstall>
       <UserData>
-        <ProductKey><Key>VDYBN-27WPP-V4HQT-9VMD4-VMK7H</Key><WillShowUI>OnError</WillShowUI></ProductKey>
         <AcceptEula>true</AcceptEula><FullName>Lab</FullName><Organization>Lab</Organization>
       </UserData>
     </component>
