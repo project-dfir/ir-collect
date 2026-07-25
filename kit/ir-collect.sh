@@ -49,6 +49,11 @@ while [ $# -gt 0 ]; do
     --rapid-only)     RAPID_ONLY=1; shift ;;
     --resume)         RESUME_DIR="$2"; shift 2 ;;
     --skip-ad)        SKIP_AD=1; shift ;;
+    --scenario)       SCENARIO_ARG="$2"; shift 2 ;;
+    --host-role)      HOST_ROLE_ARG="$2"; shift 2 ;;
+    --known-bad-ips)  KB_IPS_ARG="$2"; shift 2 ;;
+    --known-bad-domains) KB_DOMAINS_ARG="$2"; shift 2 ;;
+    --known-bad-hashes)  KB_HASHES_ARG="$2"; shift 2 ;;
     --defer-memory)   DEFER_MEM=1; shift ;;
     --lab|--training) LAB=1; shift ;;
     --authorizer)     AUTHORIZER="$2"; shift 2 ;;
@@ -774,6 +779,25 @@ json_arr() {  # split on comma/space -> ["a","b"]
 json_arr_c() {  # split on comma only (paths may contain spaces) -> ["a b","c"]
   local out="" x; local OLD="$IFS"; IFS=','; set -f; local a=($1); set +f; IFS="$OLD"
   for x in "${a[@]}"; do x="$(sani "$(echo "$x" | sed 's/^ *//; s/ *$//')")"; [ -n "$x" ] && out="$out\"$x\","; done; printf '[%s]' "${out%,}"; }
+# resolve_scenario: SCEN -> SCEN_NAME/PLAN/ATTACK/FIRST/MOBPROF (shared: guided + non-interactive)
+resolve_scenario() {
+  case "$SCEN" in
+    1)  SCEN_NAME="Ransomware / destructive"; PLAN="artifacts persistence"; ATTACK="T1486,T1490,T1489,T1562.001"; FIRST="RAM FIRST (keys/beacon may be resident); check for deleted backups/snapshots (LVM/.snapshot/borg/restic); filesystem timeline via artifacts. DO NOT reboot.";;
+    2)  SCEN_NAME="BEC / cloud account compromise"; PLAN="artifacts"; ATTACK="T1078.004,T1114.003,T1098.002"; FIRST="Mostly OFF-HOST: pull M365 Unified Audit Log / Entra or cloud-IdP logs, forwarding rules, OAuth grants (docs/SCENARIOS.md). On-host is secondary.";;
+    3)  SCEN_NAME="Insider threat / data exfiltration"; PLAN="artifacts persistence filehashes"; ATTACK="T1567.002,T1052.001,T1560"; FIRST="Live process/handles + current network (rclone/scp/rsync in flight) + mounted media while live; then shell histories + ~/.config/rclone.";;
+    4)  SCEN_NAME="Web-server / public-app compromise (webshell)"; PLAN="weblogs artifacts persistence"; ATTACK="T1190,T1505.003,T1059"; FIRST="Live ss + process tree of the web service FIRST (memory-only shells), then web logs + webroot mtime timeline (job 7).";;
+    5)  SCEN_NAME="Commodity malware / C2 beacon"; PLAN="artifacts persistence"; ATTACK="T1071.001,T1071.004,T1573,T1055"; FIRST="RAM FIRST (beacon/injected code is memory-only), then live conn->PID->exe hash (/proc/<pid>/exe), DNS.";;
+    6)  SCEN_NAME="AD / Domain-Controller compromise"; PLAN="artifacts ad persistence"; ATTACK="T1003.006,T1558.001,T1207,T1003.003"; FIRST="Kerberos tickets (klist) + sssd/realm state + krb5.keytab; the Windows DCs are the primary target - this Linux host is a supporting angle.";;
+    7)  SCEN_NAME="Lateral movement / credential theft"; PLAN="artifacts persistence ad"; ATTACK="T1021.004,T1078,T1552.004"; FIRST="auth.log/secure (SSH lateral), ~/.ssh (authorized_keys/known_hosts/id_*), lastlog/wtmp/btmp, live sessions.";;
+    8)  SCEN_NAME="Living-off-the-land / fileless"; PLAN="artifacts persistence"; ATTACK="T1059.004,T1071,T1546"; FIRST="RAM + live process cmdlines (/proc/<pid>/cmdline), shell histories, /dev/shm + /tmp payloads, cron/systemd transient units.";;
+    9)  SCEN_NAME="Phishing initial access"; PLAN="artifacts persistence"; ATTACK="T1566,T1204,T1059"; FIRST="Downloads + /tmp payloads, mail spools, browser history; on Linux usually a server pivot - chain to C2/lateral.";;
+    10) SCEN_NAME="Cryptomining"; PLAN="persistence artifacts"; ATTACK="T1496,T1543.002,T1053.003"; FIRST="Live high-CPU process + cmdline + pool connections, cron/systemd/rc.local persistence, /tmp+/dev/shm miners; check for rootkit-hidden PIDs.";;
+    A)  SCEN_NAME="FULL forensic sweep (no scenario yet) - order-of-volatility + all analysis artifacts"; PLAN="memory artifacts weblogs persistence ad"; ATTACK=""; FIRST="No specific lead: capture EVERYTHING our tools analyse in RFC 3227 order - RAM -> artifact triage (logs/journals/histories/configs) -> web logs -> persistence -> AD. Full-FS hash + disk image stay opt-in via the menu.";;
+    *)  SCEN="U"; SCEN_NAME="Unknown / broad triage"; PLAN="artifacts persistence ad"; ATTACK=""; FIRST="Standard RFC 3227 order-of-volatility triage.";;
+  esac
+  case "$SCEN" in 2) MOBPROF=bec;; 3) MOBPROF=exfil;; 9) MOBPROF=smish;; 5) MOBPROF=beacon;; 10) MOBPROF=spyware;; 6|7) MOBPROF=token;; 1) MOBPROF=ransom;; *) MOBPROF=U;; esac
+}
+
 guided_intake() {
   [ -e /dev/tty ] || return
   echo; echo "================ GUIDED INTAKE ================"
@@ -794,21 +818,10 @@ guided_intake() {
   echo "  8  Living-off-the-land / fileless"
   echo "  9  Phishing initial access"
   echo "  10 Cryptomining"
+  echo "  A  FULL sweep (no scenario yet) - order-of-volatility + everything our tools analyse"
   echo "  U  Unknown / broad triage"
-  read -rp "Select scenario [U] " SCEN </dev/tty; SCEN="$(echo "${SCEN:-U}" | tr a-z A-Z)"
-  case "$SCEN" in
-    1)  SCEN_NAME="Ransomware / destructive"; PLAN="artifacts persistence"; ATTACK="T1486,T1490,T1489,T1562.001"; FIRST="RAM FIRST (keys/beacon may be resident); check for deleted backups/snapshots (LVM/.snapshot/borg/restic); filesystem timeline via artifacts. DO NOT reboot.";;
-    2)  SCEN_NAME="BEC / cloud account compromise"; PLAN="artifacts"; ATTACK="T1078.004,T1114.003,T1098.002"; FIRST="Mostly OFF-HOST: pull M365 Unified Audit Log / Entra or cloud-IdP logs, forwarding rules, OAuth grants (docs/SCENARIOS.md). On-host is secondary.";;
-    3)  SCEN_NAME="Insider threat / data exfiltration"; PLAN="artifacts persistence filehashes"; ATTACK="T1567.002,T1052.001,T1560"; FIRST="Live process/handles + current network (rclone/scp/rsync in flight) + mounted media while live; then shell histories + ~/.config/rclone.";;
-    4)  SCEN_NAME="Web-server / public-app compromise (webshell)"; PLAN="weblogs artifacts persistence"; ATTACK="T1190,T1505.003,T1059"; FIRST="Live ss + process tree of the web service FIRST (memory-only shells), then web logs + webroot mtime timeline (job 7).";;
-    5)  SCEN_NAME="Commodity malware / C2 beacon"; PLAN="artifacts persistence"; ATTACK="T1071.001,T1071.004,T1573,T1055"; FIRST="RAM FIRST (beacon/injected code is memory-only), then live conn->PID->exe hash (/proc/<pid>/exe), DNS.";;
-    6)  SCEN_NAME="AD / Domain-Controller compromise"; PLAN="artifacts ad persistence"; ATTACK="T1003.006,T1558.001,T1207,T1003.003"; FIRST="Kerberos tickets (klist) + sssd/realm state + krb5.keytab; the Windows DCs are the primary target - this Linux host is a supporting angle.";;
-    7)  SCEN_NAME="Lateral movement / credential theft"; PLAN="artifacts persistence ad"; ATTACK="T1021.004,T1078,T1552.004"; FIRST="auth.log/secure (SSH lateral), ~/.ssh (authorized_keys/known_hosts/id_*), lastlog/wtmp/btmp, live sessions.";;
-    8)  SCEN_NAME="Living-off-the-land / fileless"; PLAN="artifacts persistence"; ATTACK="T1059.004,T1071,T1546"; FIRST="RAM + live process cmdlines (/proc/<pid>/cmdline), shell histories, /dev/shm + /tmp payloads, cron/systemd transient units.";;
-    9)  SCEN_NAME="Phishing initial access"; PLAN="artifacts persistence"; ATTACK="T1566,T1204,T1059"; FIRST="Downloads + /tmp payloads, mail spools, browser history; on Linux usually a server pivot - chain to C2/lateral.";;
-    10) SCEN_NAME="Cryptomining"; PLAN="persistence artifacts"; ATTACK="T1496,T1543.002,T1053.003"; FIRST="Live high-CPU process + cmdline + pool connections, cron/systemd/rc.local persistence, /tmp+/dev/shm miners; check for rootkit-hidden PIDs.";;
-    *)  SCEN="U"; SCEN_NAME="Unknown / broad triage"; PLAN="artifacts persistence ad"; ATTACK=""; FIRST="Standard RFC 3227 order-of-volatility triage.";;
-  esac
+  read -rp "Select scenario [A] " SCEN </dev/tty; SCEN="$(echo "${SCEN:-A}" | tr a-z A-Z)"
+  resolve_scenario
   echo "  -> FIRST: $FIRST"
 
   # mobile device trigger: a phone is often the real endpoint (BEC token / smishing / exfil target)
@@ -877,11 +890,33 @@ EOF
   read -rp "Press Enter to begin (Ctrl-C to abort) " _ </dev/tty
 }
 
+noninteractive_intake() {  # --scenario/--host-role/--known-bad-* : prompt-free intake (automation/lab/E2E)
+  SCEN="$(echo "${SCENARIO_ARG:-A}" | tr a-z A-Z)"
+  resolve_scenario
+  HOST_ROLE="${HOST_ROLE_ARG:-workstation}"
+  case "$HOST_ROLE" in ot-ics) DO_NO_HARM=1;; esac
+  [ "$DO_NO_HARM" = "1" ] && PLAN="$(echo "$PLAN" | sed -E 's/(^| )filehashes( |$)/ /g; s/(^| )diskimage( |$)/ /g')"
+  [ "$SKIP_AD" = "1" ] && PLAN="$(echo "$PLAN" | sed -E 's/(^| )ad( |$)/ /g')"
+  PLAN="$(echo "$PLAN" | tr -s ' ' | sed 's/^ //; s/ $//')"
+  cat > "$D_META/intake.json" 2>/dev/null <<EOF
+{ "case_id":"$(sani "$CASE")","exercise":${LAB:-0},"mobile_involved":0,"mobile_profile":"${MOBPROF:-U}","scenario":"$SCEN","scenario_name":"$(sani "$SCEN_NAME")",
+  "attack_tags":$(json_arr "$ATTACK"),
+  "host_role":"$HOST_ROLE","scope":"single","connectivity":"connected",
+  "known_bad_ips":$(json_arr "${KB_IPS_ARG:-}"),"known_bad_domains":$(json_arr "${KB_DOMAINS_ARG:-}"),
+  "known_bad_hashes":$(json_arr "${KB_HASHES_ARG:-}"),"known_bad_accounts":[],"known_bad_paths":[],
+  "noninteractive":1,"plan":"$PLAN","generated_by":"ir-collect.sh" }
+EOF
+  GUIDED=1
+  audit "INTAKE(auto) scenario=$SCEN role=$HOST_ROLE plan=$PLAN attack=$ATTACK"
+  echo "Scenario: $SCEN_NAME | Role: $HOST_ROLE | Plan: ${PLAN:-(volatile only)}"
+}
+
 # ===========================================================================
 # MAIN
 # ===========================================================================
 # guided intake is the default when interactive and no mode flag was given
 if [ -n "${RESUME_DIR:-}" ]; then load_prior_state "$OUTDIR"
+elif [ -n "${SCENARIO_ARG:-}" ]; then noninteractive_intake
 elif [ "$AUTO" != "1" ] && [ "$RAPID_ONLY" != "1" ] && [ -e /dev/tty ]; then guided_intake; fi
 
 integrity_baseline
