@@ -978,6 +978,7 @@ $Scenarios = [ordered]@{
   '8'  = @{ name='Living-off-the-land / fileless';                  plan=@('1','3','4','2');     attack=@('T1059','T1218','T1047','T1546.003'); first='RAM + live process command lines (fileless = memory-only). Capture PowerShell scriptblock/transcript (4104/4103) and the WMI repository (OBJECTS.DATA).'; note='Emit a LOLBin execution report from 4688/Sysmon1 vs a LOLBAS list.' }
   '9'  = @{ name='Phishing initial access (workstation)';           plan=@('6','2','3','4');     attack=@('T1566.001','T1204.002','T1059.005','T1218'); first='Browser session/cookies (AiTM token theft), running first-stage process, %TEMP% before cleanup.'; note='Hunt Office (WINWORD/EXCEL/OUTLOOK)->cmd/powershell/mshta. Often chains to C2/lateral - add those as secondary.' }
   '10' = @{ name='Cryptomining';                                    plan=@('4','2','3');         attack=@('T1496','T1543.003','T1053.005'); first='Live high-CPU/GPU process + cmdline + pool connections, then persistence (cron/service/task).'; note='Usually a symptom of a broader compromise - consider C2-beacon as secondary. Check for rootkit-hidden PIDs.' }
+  'A'  = @{ name='FULL forensic sweep (no scenario yet) - order-of-volatility + all analysis artifacts'; plan=@('1','2','3','9','4','5','6','10'); attack=@(); first='No specific lead: capture EVERYTHING our tools analyse, in RFC 3227 order of volatility - RAM -> artifact triage (hives/EVTX/$MFT/SRUM) -> event logs -> Volume Shadow state -> persistence -> AD -> browser -> web logs.'; note='Do-everything default when you have no scenario. The two hours-long GROUND-TRUTH steps stay opt-in: add job 7 (full-FS SHA-256) / job 8 (full-disk image) from the Stage-2 menu (or -Auto) for a dead-box baseline.' }
   'U'  = @{ name='Unknown / broad triage';                          plan=@();                    attack=@(); first='Standard RFC 3227 order-of-volatility triage (RAM -> processes -> network -> artifacts).'; note='Default behaviour - no reprioritisation.' }
 }
 
@@ -992,8 +993,9 @@ function Invoke-GuidedIntake {
     if ($c2live) { Write-Host "  -> Capture NETWORK first, OFF-host (PCAP at a TAP/SPAN; firewall/proxy/DNS logs). Running me can tip the attacker; keep enrichment PASSIVE." -ForegroundColor Yellow }
 
     Write-Host ""; Write-Host "-- Incident scenario (drives collection order + detection handoff) --" -ForegroundColor Gray
+    Write-Host "   (No scenario yet? Choose A = full order-of-volatility sweep + everything our tools analyse.)" -ForegroundColor DarkGray
     foreach($k in $Scenarios.Keys){ Write-Host ("  {0,-3} {1}" -f $k, $Scenarios[$k].name) }
-    $sc = (Read-Def "Select scenario" 'U').ToUpper(); if (-not $Scenarios.Contains($sc)) { $sc='U' }
+    $sc = (Read-Def "Select scenario" 'A').ToUpper(); if (-not $Scenarios.Contains($sc)) { $sc='A' }
     $scen = $Scenarios[$sc]
     Write-Host ("  -> FIRST: {0}" -f $scen.first) -ForegroundColor Yellow
     if ($scen.note) { Write-Host ("     NOTE:  {0}" -f $scen.note) -ForegroundColor DarkYellow }
