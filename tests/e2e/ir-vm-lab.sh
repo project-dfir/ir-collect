@@ -60,7 +60,26 @@ chmod o+x "$HOME" "$LAB" "$RUNS" "$RUN" 2>/dev/null || true
 qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$RUN/overlay.qcow2" >/dev/null
 qemu-img resize "$RUN/overlay.qcow2" 12G >/dev/null 2>&1
 chmod o+r "$RUN/overlay.qcow2" 2>/dev/null || true
-cat > "$RUN/user-data" <<CI
+printf 'instance-id: %s\nlocal-hostname: irvm\n' "$RUNID" > "$RUN/meta-data"
+if [ "$DISTRO" = freebsd ]; then
+  # nuageinit ignores packages:/sudo:/hostname: and cannot install pkgs; the collector needs bash
+  # (not in FreeBSD base). Use a SHEBANG-SCRIPT user-data (nuageinit execs it as root at firstboot)
+  # on an MSDOSFS seed (iso9660 has a no-chmod/exec gotcha). sshd is already enabled on this image.
+  cat > "$RUN/user-data" <<FBSD
+#!/bin/sh
+mkdir -p /root/.ssh
+printf '%s\n' '$PUBKEY' > /root/.ssh/authorized_keys
+chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys
+sysrc sshd_enable=YES
+sed -i.bak -e '/^[[:space:]]*PermitRootLogin/d' /etc/ssh/sshd_config
+echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+service sshd restart
+FBSD
+  truncate -s 8M "$RUN/seed.img"
+  mkfs.vfat -n CIDATA "$RUN/seed.img" >/dev/null 2>&1
+  mcopy -i "$RUN/seed.img" "$RUN/user-data" "$RUN/meta-data" :: 2>/dev/null
+else
+  cat > "$RUN/user-data" <<CI
 #cloud-config
 hostname: irvm
 users:
@@ -71,25 +90,26 @@ users:
       - $PUBKEY
 ssh_pwauth: true
 CI
-printf 'instance-id: %s\nlocal-hostname: irvm\n' "$RUNID" > "$RUN/meta-data"
-# FreeBSD base ships no bash (the collector is bash) and no sudo -> install them at first boot
-if [ "$DISTRO" = freebsd ]; then printf 'packages:\n  - bash\n  - sudo\n' >> "$RUN/user-data"; fi
-cloud-localds "$RUN/seed.img" "$RUN/user-data" "$RUN/meta-data"
+  cloud-localds "$RUN/seed.img" "$RUN/user-data" "$RUN/meta-data"
+fi
 chmod o+r "$RUN/seed.img" 2>/dev/null || true
 
 # ---- 2) boot headless (virtio net for DHCP lease + ssh; no 9p, no guest-agent) -----
+SEEDDISK="path=$RUN/seed.img,device=cdrom"
+[ "$DISTRO" = freebsd ] && SEEDDISK="path=$RUN/seed.img,device=disk,bus=virtio"
 log "creating + booting headless domain $DOM"
 sudo virt-install --connect "$URI" --name "$DOM" \
   --memory "$MEM" --vcpus "$VCPUS" --cpu host-passthrough --os-variant "$OSVARIANT" \
   --import \
   --disk "path=$RUN/overlay.qcow2,format=qcow2,bus=virtio" \
-  --disk "path=$RUN/seed.img,device=cdrom" \
+  --disk "$SEEDDISK" \
   --network network=default,model=virtio \
   --graphics none --noautoconsole --boot uefi 2>"$RUN/virtinstall.err" \
   || { log "virt-install failed:"; cat "$RUN/virtinstall.err"; exit 1; }
 
 # ---- 3) BOUNDED readiness: the guest's DHCP lease/IP (real boot+network signal) ----
 SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=6"
+RUSER=irlab; [ "$DISTRO" = freebsd ] && RUSER=root
 log "waiting for guest IP (bound 420s) ..."
 G=""; deadline=$(( $(date +%s) + 420 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -97,23 +117,27 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   [ -n "$G" ] && break; sleep 5
 done
 [ -n "$G" ] || { log "FAIL: guest never got an IP within timeout"; exit 1; }
-log "guest IP $G ; waiting for sshd (bound 150s) ..."
-deadline=$(( $(date +%s) + 150 )); sok=0
+log "guest IP $G ; waiting for sshd (bound 360s) ..."
+deadline=$(( $(date +%s) + 360 )); sok=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  ssh -i "$KEY" $SSHO irlab@"$G" true 2>/dev/null && { sok=1; break; }; sleep 4
+  ssh -i "$KEY" $SSHO $RUSER@"$G" true 2>/dev/null && { sok=1; break; }; sleep 4
 done
 [ "$sok" = 1 ] || { log "FAIL: sshd not ready"; exit 1; }
 
+# per-OS drive: FreeBSD -> ssh as root (no sudo; su/root works), install bash over ssh
+# (nuageinit cannot install pkgs, and the firstboot pkg install races DHCP); Linux -> irlab+sudo.
+RUSER=irlab; RSUDO="sudo "; RPREP=""
+if [ "$DISTRO" = freebsd ]; then RUSER=root; RSUDO=""; RPREP="env ASSUME_ALWAYS_YES=yes pkg install -y bash >/dev/null 2>&1; "; fi
 # ---- 4) UNIVERSAL channel: scp kit in, run, scp bundle out -------------------------
 log "pushing collector + running (scenario $SCEN) ..."
-scp -i "$KEY" $SSHO "$LAB/kit/ir-collect.sh" irlab@"$G":/tmp/ir-collect.sh >/dev/null 2>&1 \
+scp -i "$KEY" $SSHO "$LAB/kit/ir-collect.sh" $RUSER@"$G":/tmp/ir-collect.sh >/dev/null 2>&1 \
   || { log "FAIL: scp kit in"; exit 1; }
-EXITCODE="$(ssh -i "$KEY" $SSHO irlab@"$G" \
-  "sudo bash /tmp/ir-collect.sh --rapid-only --scenario $SCEN --host-role server -c VME2E -d /tmp/vmout </dev/null >/tmp/collector.log 2>&1; rc=\$?; sudo chmod -R a+rX /tmp/vmout /tmp/collector.log 2>/dev/null; echo \$rc" \
+EXITCODE="$(ssh -i "$KEY" $SSHO $RUSER@"$G" \
+  "${RPREP}${RSUDO}bash /tmp/ir-collect.sh --rapid-only --scenario $SCEN --host-role server -c VME2E -d /tmp/vmout </dev/null >/tmp/collector.log 2>&1; rc=\$?; ${RSUDO}chmod -R a+rX /tmp/vmout /tmp/collector.log 2>/dev/null; echo \$rc" \
   2>/dev/null | tail -1)"
 log "collector exit=$EXITCODE ; pulling bundle ..."
-scp -i "$KEY" $SSHO -r irlab@"$G":/tmp/vmout "$SHARE_OUT/" >/dev/null 2>&1
-scp -i "$KEY" $SSHO irlab@"$G":/tmp/collector.log "$SHARE_OUT/" >/dev/null 2>&1
+scp -i "$KEY" $SSHO -r $RUSER@"$G":/tmp/vmout "$SHARE_OUT/" >/dev/null 2>&1
+scp -i "$KEY" $SSHO $RUSER@"$G":/tmp/collector.log "$SHARE_OUT/" >/dev/null 2>&1
 
 # ---- 5) assert the sealed bundle (now redzeplin-owned via scp) ---------------------
 BASE_D="$(find "$SHARE_OUT" -type d -name 'VME2E_*' | head -1)"
