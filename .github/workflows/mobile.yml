@@ -54,3 +54,12 @@ jobs:
           name: mobile-android-api${{ matrix.api }}
           path: ./mobout
           if-no-files-found: warn
+
+  mobile-unit:
+    name: mobile unit (stubbed adb/idevice)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: iOS acquisition-branch + off-device unit tests
+        run: bash tests/ci/mobile-unit.sh
