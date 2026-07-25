@@ -15,7 +15,7 @@
 set -u
 LAB="$HOME/irvmlab"; IMG="$LAB/images"; RUNS="$LAB/runs"; mkdir -p "$IMG" "$RUNS"
 URI="qemu:///system"
-DISTRO=ubuntu; SCEN=A; MEM=2048; VCPUS=2; KEEP=0
+DISTRO=ubuntu; SCEN=A; MEM=3072; VCPUS=2; KEEP=0
 while [ $# -gt 0 ]; do case "$1" in
   --distro) DISTRO="$2"; shift 2;; --scenario) SCEN="$2"; shift 2;;
   --mem) MEM="$2"; shift 2;; --vcpus) VCPUS="$2"; shift 2;; --keep) KEEP=1; shift;;
@@ -36,6 +36,10 @@ case "$DISTRO" in
 RUNID="$(printf '%s' "${DISTRO}_$(date -u +%Y%m%d_%H%M%S)")"
 RUN="$RUNS/$RUNID"; SHARE_IN="$RUN/share_in"; SHARE_OUT="$RUN/share_out"
 mkdir -p "$SHARE_IN" "$SHARE_OUT"
+# system libvirt runs guests as libvirt-qemu (uid 64055): it must be able to traverse to
+# the disk images and WRITE the 9p output share. Open the path just enough for that.
+chmod o+x "$HOME" "$LAB" "$RUNS" "$RUN" 2>/dev/null || true
+chmod 0777 "$SHARE_OUT" 2>/dev/null || true
 DOM="irvm-$RUNID"
 log(){ echo "$(date -u +%H:%M:%S) | $*"; }
 
@@ -47,30 +51,23 @@ cleanup(){
 }
 trap cleanup EXIT
 
-# ---- 0) ensure a guest-agent-baked base exists (one-time per distro) ---------------
+# ---- 0) ensure the base cloud image is present (qemu-guest-agent is installed at
+#         first boot via cloud-init packages: - the guest has working NAT internet) ----
 [ -f "$BASE" ] || { log "downloading base $DISTRO ..."; curl -fL --retry 3 -o "$BASE" "$BASE_URL"; }
-READY_BASE="$IMG/${DISTRO}-ready.qcow2"
-if [ ! -f "$READY_BASE" ]; then
-  log "preparing base (install qemu-guest-agent) -> $READY_BASE"
-  cp "$BASE" "$READY_BASE"
-  # grow a little headroom + bake the agent so no in-guest apt is needed at boot
-  qemu-img resize "$READY_BASE" 6G >/dev/null 2>&1
-  sudo virt-customize -a "$READY_BASE" \
-    --install qemu-guest-agent \
-    --run-command 'systemctl enable qemu-guest-agent' \
-    --run-command 'echo ir-vm-lab-ready > /etc/ir-vm-lab' >/dev/null 2>&1 \
-    || { log "virt-customize failed"; exit 1; }
-fi
 
 # ---- 1) disposable overlay + cloud-init seed ---------------------------------------
 log "run $RUNID : overlay + seed"
-qemu-img create -f qcow2 -F qcow2 -b "$READY_BASE" "$RUN/overlay.qcow2" >/dev/null
+qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$RUN/overlay.qcow2" >/dev/null
+qemu-img resize "$RUN/overlay.qcow2" 12G >/dev/null 2>&1
 # stage the collector kit into the read-only share
 cp "$LAB/kit/ir-collect.sh" "$SHARE_IN/" 2>/dev/null || { log "kit not staged at $LAB/kit"; exit 1; }
 
 cat > "$RUN/user-data" <<CI
 #cloud-config
 hostname: irvm
+package_update: true
+packages:
+  - qemu-guest-agent
 users:
   - name: irlab
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -92,6 +89,7 @@ cloud-localds "$RUN/seed.img" "$RUN/user-data" "$RUN/meta-data"
 
 # ---- 2) define + boot headless with guest-agent channel + two 9p shares ------------
 log "creating + booting headless domain $DOM"
+chmod o+rx "$RUN" 2>/dev/null; chmod o+r "$RUN/overlay.qcow2" "$RUN/seed.img" 2>/dev/null || true
 sudo virt-install --connect "$URI" --name "$DOM" \
   --memory "$MEM" --vcpus "$VCPUS" --cpu host-passthrough \
   --os-variant "$OSVARIANT" \
@@ -116,32 +114,41 @@ done
 [ "$ready" = 1 ] || { log "FAIL: guest-agent never responded"; exit 1; }
 log "guest-agent UP"
 
-# ---- 4) run the collector inside via guest-exec; DONE marker on the 9p share -------
-log "running collector in guest (scenario $SCEN) ..."
-RUNCMD="for i in \$(seq 1 30); do mountpoint -q /mnt/irout && break; mount -a 2>/dev/null; sleep 2; done; \
-bash /mnt/irkit/ir-collect.sh --rapid-only --scenario $SCEN --host-role server -c VME2E -d /mnt/irout; \
-echo \$? > /mnt/irout/EXIT_CODE; sync; touch /mnt/irout/DONE"
-sudo virsh -c "$URI" guest-exec "$DOM" --cmd /bin/bash --arg -lc --arg "$RUNCMD" >/dev/null 2>&1
-
-log "waiting for collector DONE (bound 300s) ..."
-deadline=$(( $(date +%s) + 300 )); done=0
+# ---- 4) run the collector via SSH (readiness already confirmed by guest-agent above).
+#         Transport stays on the 9p share; SSH is only the synchronous RUN channel (blocks
+#         until the collector finishes, closes stdin). This is the SAME ssh-after-ready
+#         pattern used for the macOS guest (which has no guest agent). NOT a blind loop -
+#         we only connect AFTER a real readiness signal. ----------------------------------
+command -v sshpass >/dev/null 2>&1 || sudo -n apt-get install -y sshpass >/dev/null 2>&1
+G="$(sudo virsh -c "$URI" domifaddr "$DOM" 2>/dev/null | grep -oE '192\.168\.122\.[0-9]+' | head -1)"
+[ -n "$G" ] || { log "FAIL: no guest IP from domifaddr"; exit 1; }
+SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=6"
+log "guest IP $G ; waiting for sshd (bound 120s) ..."
+deadline=$(( $(date +%s) + 120 )); sok=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  [ -f "$SHARE_OUT/DONE" ] && { done=1; break; }; sleep 4
+  sshpass -p irlab ssh $SSHO irlab@"$G" true 2>/dev/null && { sok=1; break; }; sleep 4
 done
-[ "$done" = 1 ] || { log "FAIL: collector did not finish in guest"; exit 1; }
-EXITCODE="$(cat "$SHARE_OUT/EXIT_CODE" 2>/dev/null)"
-log "collector exit=$EXITCODE"
+[ "$sok" = 1 ] || { log "FAIL: sshd not ready"; exit 1; }
+log "running collector in guest (scenario $SCEN) ..."
+EXITCODE="$(sshpass -p irlab ssh $SSHO irlab@"$G" \
+  "sudo bash /mnt/irkit/ir-collect.sh --rapid-only --scenario $SCEN --host-role server -c VME2E -d /mnt/irout </dev/null >/mnt/irout/collector.log 2>&1; rc=\$?; sudo chmod -R a+rX /mnt/irout 2>/dev/null; echo \$rc" \
+  2>/dev/null | tail -1)"
+log "collector exit=$EXITCODE  (bundle written to 9p share)"
 
-# ---- 5) assert the sealed bundle (already on host via 9p) --------------------------
-BASE="$(find "$SHARE_OUT" -maxdepth 1 -type d -name 'VME2E_*' | head -1)"
-[ -n "$BASE" ] || { log "FAIL: no evidence dir on share"; ls -la "$SHARE_OUT"; exit 1; }
+# ---- 5) assert the sealed bundle. It is on the host via 9p but owned by libvirt-qemu
+#         with 700/600 modes (9p accessmode=mapped virtualises perms in xattrs, so an
+#         in-guest chmod does not change the real host mode) -> read it as root. ---------
+S(){ sudo "$@"; }   # bundle files are root/libvirt-qemu owned; read via sudo
+BASE="$(S find "$SHARE_OUT" -maxdepth 1 -type d -name 'VME2E_*' | head -1)"
+[ -n "$BASE" ] || { log "FAIL: no evidence dir on share"; sudo ls -la "$SHARE_OUT"; exit 1; }
 fail(){ log "ASSERT FAIL: $1"; exit 1; }
-[ -f "$BASE/00_metadata/intake.json" ] || fail "no intake.json"
-[ -f "$BASE/99_logs/run_state.json" ] || fail "no run_state.json"
-[ -f "$BASE/SUMMARY.md" ] || fail "no SUMMARY.md"
-[ -f "$BASE/99_logs/MANIFEST-SHA256.csv" ] || [ -f "$BASE/MANIFEST-SHA256.txt" ] || fail "no manifest"
-grep -q "\"scenario\":\"$SCEN\"" "$BASE/00_metadata/intake.json" || fail "scenario!=$SCEN"
-VERDICT="$(grep -o '"verdict":"[^"]*"' "$BASE/99_logs/run_state.json" | head -1)"
-PLAN="$(grep -o '"plan":"[^"]*"' "$BASE/00_metadata/intake.json" | head -1)"
-log "PASS: $DISTRO VM E2E | scenario=$SCEN $PLAN $VERDICT exit=$EXITCODE"
-echo "IR_VM_LAB_RESULT distro=$DISTRO result=PASS scenario=$SCEN verdict=$VERDICT exit=$EXITCODE"
+S test -f "$BASE/00_metadata/intake.json" || fail "no intake.json"
+S test -f "$BASE/99_logs/run_state.json" || fail "no run_state.json"
+S test -f "$BASE/SUMMARY.md" || fail "no SUMMARY.md"
+S test -f "$BASE/99_logs/MANIFEST-SHA256.csv" || S test -f "$BASE/99_logs/MANIFEST-SHA256.txt" || S test -f "$BASE/MANIFEST-SHA256.txt" || fail "no manifest"
+S grep -q "\"scenario\":\"$SCEN\"" "$BASE/00_metadata/intake.json" || fail "scenario!=$SCEN"
+VERDICT="$(S grep -o '"verdict":"[^"]*"' "$BASE/99_logs/run_state.json" | head -1)"
+PLAN="$(S grep -o '"plan":"[^"]*"' "$BASE/00_metadata/intake.json" | head -1)"
+NFILES="$(S find "$BASE" -type f | wc -l)"
+log "PASS: $DISTRO VM E2E | scenario=$SCEN $PLAN $VERDICT exit=$EXITCODE files=$NFILES"
+echo "IR_VM_LAB_RESULT distro=$DISTRO result=PASS scenario=$SCEN verdict=$VERDICT exit=$EXITCODE files=$NFILES"
