@@ -46,7 +46,7 @@ fail() { echo "FAIL: $1"; echo "--- call log ---"; cat "$LOG"; exit 1; }
 
 echo "===== TEST 1: iOS acquisition command construction (scenario spyware) ====="
 O1="$(mktemp -d)"
-"$COLLECTOR" --ios --serial 00008030-FAKEUDID0001 --auto --scenario spyware -c UTIOS -d "$O1" >/dev/null 2>&1
+bash "$COLLECTOR" --ios --serial 00008030-FAKEUDID0001 --auto --scenario spyware -c UTIOS -d "$O1" >/dev/null 2>&1
 B1="$(find "$O1" -maxdepth 1 -type d -name 'UTIOS_*' | head -1)"
 [ -n "$B1" ] || fail "no iOS bundle dir"
 [ -f "$B1/meta/collection_info.json" ] || fail "no collection_info.json"
@@ -60,7 +60,7 @@ echo "  OK: encrypted idevicebackup2 backup + pair + identity constructed; scena
 
 echo "===== TEST 2: off-device (lost/stolen) checklist path ====="
 O2="$(mktemp -d)"
-"$COLLECTOR" --ios --serial X --auto --scenario lost -c UTLOST -d "$O2" >/dev/null 2>&1
+bash "$COLLECTOR" --ios --serial X --auto --scenario lost -c UTLOST -d "$O2" >/dev/null 2>&1
 B2="$(find "$O2" -maxdepth 1 -type d -name 'UTLOST_*' | head -1)"
 [ -n "$B2" ] || fail "no lost bundle dir"
 [ -f "$B2/artifacts/OFF_DEVICE_CHECKLIST.md" ] || fail "off-device checklist not written"

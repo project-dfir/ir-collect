@@ -49,6 +49,7 @@ jobs:
 
       - name: Upload bundle
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: mobile-android-api${{ matrix.api }}
