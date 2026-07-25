@@ -1,27 +1,27 @@
 # Idempotent DC promotion. Registered as an at-startup SYSTEM task by ir-setup.ps1 so it survives
-# the promotion reboot. Once the box is a working DC (Get-ADDomain succeeds, ADWS+NTDS running) it
-# writes C:\Windows\Temp\DC_READY and removes its own task.
+# the promotion reboot. The "am I a DC?" guard uses DomainRole (a LOCAL WMI check) - NOT Get-ADDomain,
+# which needs ADWS and fails transiently right after the promo reboot (that false-negative caused a
+# re-promotion loop). Once DomainRole>=4, wait for ADWS to answer, write DC_READY, self-remove.
 $ErrorActionPreference = 'SilentlyContinue'
 $log = 'C:\Windows\Temp\promote-dc.log'
 function L($m){ "$(Get-Date -Format o) $m" | Out-File -Append $log }
 L "promote-dc invoked"
 
-# already a DC? -> mark ready, clean up, exit
-try {
-  Import-Module ActiveDirectory -ErrorAction Stop
-  $d = Get-ADDomain -ErrorAction Stop
-  if ($d) {
-    $svc = Get-Service NTDS,ADWS -ErrorAction SilentlyContinue | Where-Object Status -ne 'Running'
-    if (-not $svc) {
-      L "DC is up: $($d.DNSRoot)"
-      "READY $($d.DNSRoot) $(Get-Date -Format o)" | Out-File 'C:\Windows\Temp\DC_READY'
-      Unregister-ScheduledTask -TaskName 'IR-DCPromo' -Confirm:$false
-      exit 0
-    }
+$role = (Get-CimInstance Win32_ComputerSystem).DomainRole   # 4=backup DC, 5=primary DC
+if ($role -ge 4) {
+  L "already a DC (DomainRole=$role); waiting for ADWS to answer Get-ADDomain"
+  for ($i=0; $i -lt 30; $i++) {
+    try { Import-Module ActiveDirectory -ErrorAction Stop; if (Get-ADDomain -ErrorAction Stop) { break } }
+    catch { Start-Sleep 10 }
   }
-} catch { L "not a DC yet: $($_.Exception.Message)" }
+  $dom = (Get-CimInstance Win32_ComputerSystem).Domain
+  L "DC up: $dom -> writing DC_READY, removing task"
+  "READY $dom $(Get-Date -Format o)" | Out-File 'C:\Windows\Temp\DC_READY'
+  Unregister-ScheduledTask -TaskName 'IR-DCPromo' -Confirm:$false
+  return
+}
 
-# not a DC yet -> install role + promote (this reboots the machine)
+# not a DC yet -> install the role + promote (this reboots the machine)
 try {
   if (-not (Get-WindowsFeature AD-Domain-Services).Installed) {
     L "installing AD-Domain-Services"
