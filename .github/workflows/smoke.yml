@@ -1,0 +1,86 @@
+name: ir-collect cross-OS smoke
+
+# License-clean functional smoke test of the collectors on real Windows, Linux, and
+# macOS (macOS runners are genuine Apple hardware - the only EULA-clean macOS path,
+# since none of our own hardware is Apple). Heavy/realistic full-VM E2E lives elsewhere
+# (Windows -> l3e7 Hyper-V; Linux -> rick KVM). This is the every-push gate.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  posix:
+    name: posix (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run collector (RapidOnly, scenario A = full-sweep intake)
+        shell: bash
+        run: |
+          set -x
+          chmod +x kit/ir-collect.sh
+          # non-interactive: --scenario injects intake, --rapid-only seals after volatile
+          sudo ./kit/ir-collect.sh --rapid-only --scenario A --host-role workstation \
+               --known-bad-ips 203.0.113.5 --known-bad-domains evil.example \
+               -c CISMOKE -d ./out || echo "collector exit=$? (non-fatal; asserting artifacts next)"
+      - name: Assert sealed evidence contract
+        shell: bash
+        run: |
+          set -e
+          base=$(find ./out -maxdepth 1 -type d -name 'CISMOKE_*' | head -1)
+          echo "evidence dir: $base"
+          test -n "$base"
+          test -f "$base/00_metadata/intake.json"
+          test -f "$base/99_logs/run_state.json"
+          test -f "$base/SUMMARY.md"
+          echo "--- intake scenario/plan ---"
+          grep -o '"scenario":"[^"]*"' "$base/00_metadata/intake.json"
+          grep -o '"plan":"[^"]*"'     "$base/00_metadata/intake.json"
+          echo "--- run_state verdict ---"
+          grep -o '"verdict":"[^"]*"'  "$base/99_logs/run_state.json"
+          # scenario must be A on this smoke
+          grep -q '"scenario":"A"' "$base/00_metadata/intake.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bundle-${{ matrix.os }}
+          path: ./out
+          if-no-files-found: warn
+
+  windows:
+    name: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run collector (RapidOnly, scenario A)
+        shell: pwsh
+        run: |
+          .\kit\IR-Collect.ps1 -RapidOnly -Scenario A -HostRole workstation `
+            -KnownBadIps 203.0.113.5 -KnownBadDomains evil.example `
+            -CaseId CISMOKE -Dest .\out
+          "collector exit=$LASTEXITCODE"
+      - name: Assert sealed evidence contract
+        shell: pwsh
+        run: |
+          $base = Get-ChildItem .\out -Directory | Where-Object Name -like 'CISMOKE_*' | Select-Object -First 1
+          if (-not $base) { throw "no evidence dir" }
+          "evidence dir: $($base.FullName)"
+          foreach ($f in '00_metadata\intake.json','99_logs\run_state.json','SUMMARY.md') {
+            if (-not (Test-Path (Join-Path $base.FullName $f))) { throw "missing $f" }
+          }
+          $ik = Get-Content (Join-Path $base.FullName '00_metadata\intake.json') -Raw | ConvertFrom-Json
+          $rs = Get-Content (Join-Path $base.FullName '99_logs\run_state.json') -Raw | ConvertFrom-Json
+          "scenario=$($ik.scenario)  plan=$($ik.plan -join ',')  verdict=$($rs.completeness.verdict)"
+          if ($ik.scenario -ne 'A') { throw "scenario not A" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bundle-windows
+          path: .\out
+          if-no-files-found: warn
