@@ -11,6 +11,8 @@
 # Usage: ir-vm-lab.sh [--distro ubuntu] [--scenario A] [--mem 3072] [--vcpus 2] [--keep]
 set -u
 LAB="$HOME/irvmlab"; IMG="$LAB/images"; RUNS="$LAB/runs"; mkdir -p "$IMG" "$RUNS"
+KEY="$LAB/lab_key"; [ -f "$KEY" ] || ssh-keygen -t ed25519 -N '' -f "$KEY" -q 2>/dev/null
+PUBKEY="$(cat "$KEY.pub" 2>/dev/null)"
 URI="qemu:///system"
 DISTRO=ubuntu; SCEN=A; MEM=3072; VCPUS=2; KEEP=0
 while [ $# -gt 0 ]; do case "$1" in
@@ -27,6 +29,8 @@ case "$DISTRO" in
           BASE="$IMG/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"; OSVARIANT="almalinux9";;
   fedora) BASE_URL="https://dl.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2"
           BASE="$IMG/Fedora-Cloud-Base-42.qcow2"; OSVARIANT="fedora42";;
+  freebsd) BASE_URL="https://download.freebsd.org/releases/VM-IMAGES/14.3-RELEASE/amd64/Latest/FreeBSD-14.3-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz"
+          BASE="$IMG/FreeBSD-14.3-BASIC-CLOUDINIT-ufs.qcow2"; OSVARIANT="freebsd14.0";;
   *) echo "unknown distro $DISTRO"; exit 2;; esac
 
 RUNID="${DISTRO}_$(date -u +%Y%m%d_%H%M%S)"
@@ -42,7 +46,13 @@ cleanup(){
 trap cleanup EXIT
 
 # ---- 0) base image ----------------------------------------------------------------
-[ -f "$BASE" ] || { log "downloading base $DISTRO ..."; curl -fL --retry 3 -o "$BASE" "$BASE_URL" || { log "download failed"; exit 1; }; }
+if [ ! -f "$BASE" ]; then
+  log "downloading base $DISTRO ..."
+  case "$BASE_URL" in
+    *.xz) curl -fL --retry 3 -o "$BASE.xz" "$BASE_URL" && unxz -f "$BASE.xz" || { log "download/decompress failed"; exit 1; };;
+    *)    curl -fL --retry 3 -o "$BASE" "$BASE_URL" || { log "download failed"; exit 1; };;
+  esac
+fi
 
 # ---- 1) disposable overlay + cloud-init seed (user + ssh only) ---------------------
 log "run $RUNID : overlay + seed"
@@ -50,18 +60,20 @@ chmod o+x "$HOME" "$LAB" "$RUNS" "$RUN" 2>/dev/null || true
 qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$RUN/overlay.qcow2" >/dev/null
 qemu-img resize "$RUN/overlay.qcow2" 12G >/dev/null 2>&1
 chmod o+r "$RUN/overlay.qcow2" 2>/dev/null || true
-cat > "$RUN/user-data" <<'CI'
+cat > "$RUN/user-data" <<CI
 #cloud-config
 hostname: irvm
 users:
   - name: irlab
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
-    plain_text_passwd: irlab
-    shell: /bin/bash
+    ssh_authorized_keys:
+      - $PUBKEY
 ssh_pwauth: true
 CI
 printf 'instance-id: %s\nlocal-hostname: irvm\n' "$RUNID" > "$RUN/meta-data"
+# FreeBSD base ships no bash (the collector is bash) and no sudo -> install them at first boot
+if [ "$DISTRO" = freebsd ]; then printf 'packages:\n  - bash\n  - sudo\n' >> "$RUN/user-data"; fi
 cloud-localds "$RUN/seed.img" "$RUN/user-data" "$RUN/meta-data"
 chmod o+r "$RUN/seed.img" 2>/dev/null || true
 
@@ -77,7 +89,6 @@ sudo virt-install --connect "$URI" --name "$DOM" \
   || { log "virt-install failed:"; cat "$RUN/virtinstall.err"; exit 1; }
 
 # ---- 3) BOUNDED readiness: the guest's DHCP lease/IP (real boot+network signal) ----
-command -v sshpass >/dev/null 2>&1 || sudo -n apt-get install -y sshpass >/dev/null 2>&1
 SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=6"
 log "waiting for guest IP (bound 420s) ..."
 G=""; deadline=$(( $(date +%s) + 420 ))
@@ -89,20 +100,20 @@ done
 log "guest IP $G ; waiting for sshd (bound 150s) ..."
 deadline=$(( $(date +%s) + 150 )); sok=0
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  sshpass -p irlab ssh $SSHO irlab@"$G" true 2>/dev/null && { sok=1; break; }; sleep 4
+  ssh -i "$KEY" $SSHO irlab@"$G" true 2>/dev/null && { sok=1; break; }; sleep 4
 done
 [ "$sok" = 1 ] || { log "FAIL: sshd not ready"; exit 1; }
 
 # ---- 4) UNIVERSAL channel: scp kit in, run, scp bundle out -------------------------
 log "pushing collector + running (scenario $SCEN) ..."
-sshpass -p irlab scp $SSHO "$LAB/kit/ir-collect.sh" irlab@"$G":/tmp/ir-collect.sh >/dev/null 2>&1 \
+scp -i "$KEY" $SSHO "$LAB/kit/ir-collect.sh" irlab@"$G":/tmp/ir-collect.sh >/dev/null 2>&1 \
   || { log "FAIL: scp kit in"; exit 1; }
-EXITCODE="$(sshpass -p irlab ssh $SSHO irlab@"$G" \
+EXITCODE="$(ssh -i "$KEY" $SSHO irlab@"$G" \
   "sudo bash /tmp/ir-collect.sh --rapid-only --scenario $SCEN --host-role server -c VME2E -d /tmp/vmout </dev/null >/tmp/collector.log 2>&1; rc=\$?; sudo chmod -R a+rX /tmp/vmout /tmp/collector.log 2>/dev/null; echo \$rc" \
   2>/dev/null | tail -1)"
 log "collector exit=$EXITCODE ; pulling bundle ..."
-sshpass -p irlab scp $SSHO -r irlab@"$G":/tmp/vmout "$SHARE_OUT/" >/dev/null 2>&1
-sshpass -p irlab scp $SSHO irlab@"$G":/tmp/collector.log "$SHARE_OUT/" >/dev/null 2>&1
+scp -i "$KEY" $SSHO -r irlab@"$G":/tmp/vmout "$SHARE_OUT/" >/dev/null 2>&1
+scp -i "$KEY" $SSHO irlab@"$G":/tmp/collector.log "$SHARE_OUT/" >/dev/null 2>&1
 
 # ---- 5) assert the sealed bundle (now redzeplin-owned via scp) ---------------------
 BASE_D="$(find "$SHARE_OUT" -type d -name 'VME2E_*' | head -1)"
