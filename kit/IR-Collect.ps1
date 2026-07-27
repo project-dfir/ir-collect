@@ -21,7 +21,9 @@
 .PARAMETER OutputRoot   Case folder location (point at an external drive). Default: script dir.
 .PARAMETER CaseId       Case identifier. Default: IR.
 .PARAMETER StepTimeoutSec  Default per-step timeout. Default: 120.
-.PARAMETER Auto         Run Stage 1 then ALL Stage-2 jobs, no menu (unattended full collection).
+.PARAMETER Auto         Run Stage 1 then all Stage-2 jobs EXCEPT the two hours-long ground-truth jobs
+                        (full-filesystem SHA-256 + full-disk image); no menu (practical unattended triage).
+.PARAMETER IncludeGroundTruth  With -Auto, also run the hours-long ground-truth jobs (7 full-FS hash, 8 disk image).
 .PARAMETER RapidOnly    Run only Stage 1 (volatile) and seal.
 .PARAMETER SkipAD       Never run the AD phase.
 
@@ -42,6 +44,7 @@ param(
     [switch]$Auto,
     [switch]$RapidOnly,
     [switch]$SkipAD,
+    [switch]$IncludeGroundTruth,   # with -Auto: also run the hours-long ground-truth jobs (full-FS hash + disk image)
     [switch]$DeferMemory,  # capture RAM AFTER the volatile-command battery instead of before it
     [switch]$Lab,          # training/exercise mode: read-only-media launch, VM detection, HTTP egress, relaxed contamination
     [string]$Authorizer = '',   # who authorized this collection (chain of custody)
@@ -1198,8 +1201,11 @@ try {
     if ($RapidOnly -or $script:VolatileOnly) {
         Write-Host "Volatile-only - sealing." -ForegroundColor Yellow
     } elseif ($Auto) {
-        Write-Audit "Auto mode: running ALL heavy (non-volatile) jobs."
-        foreach ($k in $MenuItems.Keys) { try { & $MenuItems[$k].fn } catch { Write-Audit "Job $($MenuItems[$k].key) fault: $($_.Exception.Message) - continuing." } }
+        # -Auto is unattended triage: skip the two hours-long GROUND-TRUTH jobs (7 full-FS hash, 8 disk image)
+        # unless -IncludeGroundTruth is given, so an automated run actually finishes in minutes not hours.
+        $autoJobs = @($MenuItems.Keys | Where-Object { $IncludeGroundTruth -or ($_ -notin '7','8') })
+        Write-Audit ("Auto mode: heavy jobs " + $(if($IncludeGroundTruth){'INCLUDING ground-truth 7/8'}else{'EXCEPT hours-long ground-truth 7(full-FS hash)/8(disk image); pass -IncludeGroundTruth to add them'}) + ".")
+        foreach ($k in $autoJobs) { try { & $MenuItems[$k].fn } catch { Write-Audit "Job $($MenuItems[$k].key) fault: $($_.Exception.Message) - continuing." } }
     } elseif ($null -ne $script:Plan) {
         Write-Audit "Guided plan: $($script:Plan -join ',')"
         foreach ($k in $script:Plan) { try { & $MenuItems[$k].fn } catch { Write-Audit "Job fault: $($_.Exception.Message) - continuing." } }
