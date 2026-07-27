@@ -195,6 +195,8 @@ function Get-ErrorClass { param([string]$Kind,[string]$Text)
         'RPC server is unavailable|network path was not found|is unreachable|actively refused|A connection attempt failed' { return 'net_unreachable' }
         'ConstrainedLanguage|not allowed in ConstrainedLanguage|LanguageMode|blocked by .* policy|AppLocker' { return 'clm_blocked' }
         'Invalid namespace|provider load failure|WMI|CIM|WinRM cannot' { return 'wmi_failure' }
+        'Start-Job|background job|Cannot start.*job|maximum number of.*jobs|child process|runspace|PSRemoting' { return 'job_subsystem' }
+        'fully qualified file name must be less|PathTooLong|path.*too long|filename or extension is too long' { return 'path_too_long' }
         default { return 'unknown' }
     }
 }
@@ -291,6 +293,38 @@ $TOOL = @{
 }
 
 # ---------------------------------------------------------------------------
+# In-process bounded executor: run a scriptblock with a hard timeout WITHOUT Start-Job.
+# Self-heal fallback for hardened hosts where the background-job subsystem is unavailable
+# (job quota exhausted, local PSRemoting/WinRM off, some ConstrainedLanguage configs).
+# Returns @{ done=<completed?>; out=<merged data + ErrorRecords, matching the job 2>&1 shape> }.
+# ---------------------------------------------------------------------------
+function Invoke-InProcBounded { param([scriptblock]$Script,[int]$TimeoutSec)
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    try {
+        [void]$ps.AddScript($Script.ToString())
+        $async = $ps.BeginInvoke()
+        if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Max(1,$TimeoutSec)))) {
+            $data = @(); $exErr = $null
+            try { $data = @($ps.EndInvoke($async)) } catch { $exErr = $_ }   # a TERMINATING error surfaces here, not in Streams.Error
+            $errs = @($ps.Streams.Error)          # non-terminating ErrorRecords (same type Start-Job merges via 2>&1)
+            if ($exErr) { $errs = @($errs) + @($exErr) }   # fold terminating error in so Invoke-Step sees error-only (parity with Start-Job)
+            return @{ done=$true; out=(@($data)+@($errs)) }
+        } else {
+            try { $ps.Stop() } catch {}
+            return @{ done=$false; out=$null }
+        }
+    } finally { try { $ps.Dispose() } catch {} }
+}
+# Probe the background-job subsystem ONCE at startup; if it is unavailable, every Invoke-Step
+# transparently switches to the in-process executor instead of failing every single step.
+$script:JobsOk = $true
+try { $__tj = Start-Job -ScriptBlock { 1 } -ErrorAction Stop; $null = Wait-Job $__tj -Timeout 15; Remove-Job $__tj -Force -ErrorAction SilentlyContinue }
+catch { $script:JobsOk = $false }
+# operator/test override: set env IRCOLLECT_FORCE_INPROC=1 to force the in-process path (verify the fallback)
+if ($env:IRCOLLECT_FORCE_INPROC -eq '1') { $script:JobsOk = $false }
+if (-not $script:JobsOk) { try { Write-Audit "SELF-HEAL: background-job subsystem unavailable -> using in-process bounded execution for all steps." } catch { Write-Host "SELF-HEAL: in-process execution mode" -ForegroundColor Yellow } }
+
+# ---------------------------------------------------------------------------
 # Invoke-Step : self-healing collection primitive (timeout + retry + log; never throws)
 # ---------------------------------------------------------------------------
 $script:StepNum = 0; $script:StepsOk = 0; $script:StepsFail = 0
@@ -320,11 +354,22 @@ function Invoke-Step {
         $attempt++; $job = $null
         Write-Ledger $id $Name $phase 'running' @{ attempt=$attempt }
         try {
-            $job = Start-Job -ScriptBlock $Script
-            if (Wait-Job $job -Timeout $TimeoutSec) {
-                $out = Receive-Job $job -ErrorAction SilentlyContinue 2>&1
-                Remove-Job $job -Force -ErrorAction SilentlyContinue
-                # separate real data from non-terminating error records (Start-Job merges stderr via 2>&1)
+            $out = $null; $stepTimedOut = $false; $job = $null
+            if ($script:JobsOk) { try { $job = Start-Job -ScriptBlock $Script } catch { $script:JobsOk = $false; Write-Audit "STEP $id INFO | $Name | job start failed -> in-process ($($_.Exception.Message.Split([Environment]::NewLine)[0]))" } }
+            if ($script:JobsOk -and $job) {
+                if (Wait-Job $job -Timeout $TimeoutSec) {
+                    $out = Receive-Job $job -ErrorAction SilentlyContinue 2>&1
+                    Remove-Job $job -Force -ErrorAction SilentlyContinue
+                } else {
+                    Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue
+                    $stepTimedOut = $true
+                }
+            } else {
+                $r = Invoke-InProcBounded $Script $TimeoutSec
+                if ($r.done) { $out = $r.out } else { $stepTimedOut = $true }
+            }
+            if (-not $stepTimedOut) {
+                # separate real data from non-terminating error records (job merges stderr via 2>&1)
                 $errRecs  = @($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
                 $hasData  = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }).Count -gt 0
                 if ($target -and $hasData) { try { [IO.File]::WriteAllText($target, (($out | Out-String -Width 4096)), (New-Object Text.UTF8Encoding($false))) } catch { try { $out | Out-File -FilePath $target -Encoding UTF8 -Width 4096 } catch {} } }
@@ -344,9 +389,8 @@ function Invoke-Step {
                 Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines }
                 $script:StepsOk++; return $out
             } else {
-                Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue
-                # Start-Job cannot kill the NATIVE grandchild (e.g. winpmem) it launched; do it by name
-                # so a hung imager stops appending to its file before the size/stability verify runs.
+                # timed out (either transport). The job (if any) is already stopped above. Kill any NATIVE
+                # grandchild (e.g. winpmem) by name so a hung imager stops appending before the verify.
                 foreach($pn in $KillOnTimeout){ try { Get-Process -Name $pn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch {} }
                 $cls = 'timeout'
                 Write-Audit "STEP $id WARN | $Name | TIMEOUT ${TimeoutSec}s | try $attempt"
