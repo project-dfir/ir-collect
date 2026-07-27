@@ -11,6 +11,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Pure-logic unit tests. They pull the real functions out of the collector via the
+  # PowerShell AST (no side effects), so they run anywhere pwsh does - seconds, not minutes.
+  unit:
+    name: unit (pwsh, no side effects)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests/unit
+        shell: pwsh
+        run: |
+          $fail = 0
+          Get-ChildItem tests/unit -Filter 'Test-*.ps1' | ForEach-Object {
+            "::group::$($_.Name)"
+            & $_.FullName
+            if ($LASTEXITCODE -ne 0) { $fail++; "::error::$($_.Name) failed (exit $LASTEXITCODE)" }
+            '::endgroup::'
+          }
+          if ($fail) { throw "$fail unit test file(s) failed" }
+
   posix:
     name: posix (${{ matrix.os }})
     strategy:

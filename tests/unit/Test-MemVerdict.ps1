@@ -20,7 +20,8 @@ $ErrorActionPreference = 'Stop'
 # $PSScriptRoot is not reliably populated in a param default under -File, so resolve here.
 if (-not $CollectorPath) {
     $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-    $CollectorPath = Join-Path $root '..\..\kit\IR-Collect.ps1'
+    # build with Join-Path segments, not a '..\..\' literal - backslash is not a separator on Linux CI
+    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'kit') 'IR-Collect.ps1'
 }
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path $CollectorPath), [ref]$null, [ref]$null)
