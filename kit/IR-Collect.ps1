@@ -661,7 +661,20 @@ function Job-Artifacts {
 function Job-EventLogs {
     Write-Audit "--- HEAVY: full event-log export ---"; $A=$Dirs.artifacts
     Collect 'evtx-inventory' { Get-WinEvent -ListLog * 2>$null | Where-Object RecordCount -gt 0 | Select-Object LogName,RecordCount,FileSize,LastWriteTime | Sort-Object RecordCount -Descending | Format-Table -AutoSize } 'event_logs_inventory.txt' $A -Timeout 180
-    Invoke-Step 'evtx-copy' ([scriptblock]::Create("robocopy '$env:WINDIR\System32\winevt\Logs' '$A\evtx' *.evtx /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 1200 -Retries 0 | Out-Null
+    $src = "$env:WINDIR\System32\winevt\Logs"
+    # PASS 1 - secure the compact, high-signal channels FIRST (seconds), so a slow/interrupted bulk
+    # copy on a busy DC (multi-GB Security.evtx) can never lose the crown-jewel behavioural logs.
+    # (winevt filenames use %4 for '/'; some contain spaces - each is quoted for robocopy.)
+    $priority = @('System','Application',
+      'Microsoft-Windows-Sysmon%4Operational','Microsoft-Windows-PowerShell%4Operational','Windows PowerShell',
+      'Microsoft-Windows-TaskScheduler%4Operational','Microsoft-Windows-Windows Defender%4Operational',
+      'Microsoft-Windows-WinRM%4Operational','Microsoft-Windows-WMI-Activity%4Operational',
+      'Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational','Microsoft-Windows-Bits-Client%4Operational',
+      'Directory Service','DNS Server','File Replication Service','Security')
+    $pl = ($priority | ForEach-Object { '"{0}.evtx"' -f $_ }) -join ' '
+    Invoke-Step 'evtx-priority' ([scriptblock]::Create("robocopy '$src' '$A\evtx' $pl /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 600 -Retries 0 | Out-Null
+    # PASS 2 - bulk copy everything else; /XO skips the files already secured in pass 1.
+    Invoke-Step 'evtx-bulk' ([scriptblock]::Create("robocopy '$src' '$A\evtx' *.evtx /XO /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 1200 -Retries 0 | Out-Null
     $script:Done['eventlogs']=$true
 }
 
