@@ -808,14 +808,19 @@ $MenuItems = [ordered]@{
     '10' = @{ label='Web-server logs + webroot timeline (webshell)      [~min]';            key='weblogs';     fn={Job-WebLogs} }
 }
 function Show-Menu {
+    $rec = @($script:Plan)   # scenario-recommended job numbers (may be empty)
     Write-Host ""; Write-Host "================ STAGE 2: HEAVY COLLECTION MENU ================" -ForegroundColor Cyan
-    Write-Host "Volatile data already secured. Select long-running jobs to run now." -ForegroundColor Gray
+    Write-Host "Volatile data already secured. Choose heavy job(s) to run now." -ForegroundColor Gray
+    if ($rec.Count) { Write-Host ("  >> Recommended for this scenario: " + ($rec -join ', ') + "   (press R to run just these)") -ForegroundColor Green }
     foreach ($k in $MenuItems.Keys) {
-        $mk=$MenuItems[$k].key; $mark = if($script:Done[$mk]){'[x]'}else{'[ ]'}
-        Write-Host ("  {0} {1} {2}" -f $k, $mark, $MenuItems[$k].label)
+        $mk=$MenuItems[$k].key
+        $mark = if($script:Done[$mk]){'[x]'}else{'[ ]'}
+        $star = if($rec -contains $k){'*'}else{' '}
+        $color = if($script:Done[$mk]){'DarkGray'}elseif($rec -contains $k){'Green'}else{'Gray'}
+        Write-Host ("  {0}{1,2} {2} {3}" -f $star, $k, $mark, $MenuItems[$k].label) -ForegroundColor $color
     }
-    Write-Host "  A  Run ALL remaining"
-    Write-Host "  Q  Finish & seal (manifest + report)"
+    Write-Host ""
+    Write-Host "  Enter number(s) e.g. 1,3,4   |   R run recommended   A run ALL remaining   ? help   Q finish & seal" -ForegroundColor Cyan
     Write-Host ""
 }
 function Invoke-Menu {
@@ -825,13 +830,31 @@ function Invoke-Menu {
         foreach ($k in $MenuItems.Keys) { try { & $MenuItems[$k].fn } catch { Write-Audit "Job fault: $($_.Exception.Message)" } }
         return
     }
+    $run = { param($k) if($script:Done[$MenuItems[$k].key]){ Write-Host "  $k already collected - skipping." -ForegroundColor DarkGray; return }
+             try { & $MenuItems[$k].fn } catch { Write-Audit "Job fault: $($_.Exception.Message)" } }
     while ($true) {
         Show-Menu
-        $c = try { (Read-Host "Select (number / A / Q)").Trim().ToUpper() } catch { 'Q' }
-        if ($c -eq 'Q') { break }
-        elseif ($c -eq 'A') { foreach($k in $MenuItems.Keys){ if(-not $script:Done[$MenuItems[$k].key]){ try { & $MenuItems[$k].fn } catch { Write-Audit "Job fault: $($_.Exception.Message)" } } } }
-        elseif ($MenuItems.Contains($c)) { try { & $MenuItems[$c].fn } catch { Write-Audit "Job fault: $($_.Exception.Message)" } }
-        else { Write-Host "Invalid selection." -ForegroundColor Yellow }
+        $c = try { (Read-Host "Select").Trim().ToUpper() } catch { 'Q' }
+        if ($c -eq '') { continue }
+        elseif ($c -eq 'Q') { break }
+        elseif ($c -eq '?' -or $c -eq 'H') {
+            Write-Host "  Enter one or more job numbers, comma/space separated (e.g. '1,3,4' or '2 5')." -ForegroundColor Gray
+            Write-Host "  [x] = already collected this run.   * = recommended for the chosen scenario." -ForegroundColor Gray
+            Write-Host "  R = run the recommended set.   A = run everything not yet done.   Q = finish & seal." -ForegroundColor Gray
+        }
+        elseif ($c -eq 'A') { foreach($k in $MenuItems.Keys){ if(-not $script:Done[$MenuItems[$k].key]){ & $run $k } } }
+        elseif ($c -eq 'R') {
+            $rec=@($script:Plan)
+            if(-not $rec.Count){ Write-Host "  No scenario recommendation set - pick numbers or A." -ForegroundColor Yellow }
+            else { foreach($k in $rec){ if($MenuItems.Contains("$k")){ & $run "$k" } } }
+        }
+        else {
+            # multi-select: split on comma/whitespace, run each valid number in order
+            $sel = @($c -split '[,\s]+' | Where-Object { $_ })
+            $bad = @($sel | Where-Object { -not $MenuItems.Contains($_) })
+            if ($bad.Count) { Write-Host "  Not on the menu: $($bad -join ', ')" -ForegroundColor Yellow }
+            foreach($k in ($sel | Where-Object { $MenuItems.Contains($_) })) { & $run $k }
+        }
     }
 }
 
