@@ -862,6 +862,7 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
           [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
     # --- completion rollup + completeness verdict (reduce run_state.jsonl) ---
     $rsj = $script:StateJsonl; $nok=0; $nfail=0; $ntmo=0; $nskip=0; $nplan=0; $failedNames=@()
+    $script:DiagClass=[ordered]@{}; $script:DiagRem=[ordered]@{}
     if (Test-Path $rsj) {
         foreach ($ln in [IO.File]::ReadAllLines($rsj)) {
             if     ($ln -match '"ev":"ok"')      { $nok++ }
@@ -869,7 +870,8 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
             elseif ($ln -match '"ev":"timeout"') { $ntmo++ }
             elseif ($ln -match '"ev":"skipped"') { $nskip++ }
             elseif ($ln -match '"ev":"planned"') { $nplan++ }
-            if ($ln -match '"ev":"(failed|timeout)"') { try { $o=$ln|ConvertFrom-Json; if($o.name){$failedNames+=$o.name} } catch {} }
+            if ($ln -match '"ev":"(failed|timeout)"') { try { $o=$ln|ConvertFrom-Json; if($o.name){$failedNames+=$o.name}; $ec=if($o.error_class){[string]$o.error_class}else{'unknown'}; if(-not $script:DiagClass.Contains($ec)){$script:DiagClass[$ec]=[ordered]@{count=0;sample=''}}; $script:DiagClass[$ec].count++; if((-not $script:DiagClass[$ec].sample) -and $o.error_msg){$script:DiagClass[$ec].sample=[string]$o.error_msg} } catch {} }
+            elseif ($ln -match '"ev":"remediation"') { try { $o=$ln|ConvertFrom-Json; $ra="$($o.action)/$($o.result)"; if(-not $script:DiagRem.Contains($ra)){$script:DiagRem[$ra]=0}; $script:DiagRem[$ra]++ } catch {} }
         }
     }
     $incomplete = @($failedNames | Sort-Object -Unique)
@@ -882,11 +884,17 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
         memory_verified=[bool]$script:MemOk
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
+        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
     try { [IO.File]::WriteAllText((Join-Path $Dirs.logs 'run_state.json'), ($rs | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } catch {}
     $comp = "`n## Completeness - $verdict`n- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)`n"
     if ($incomplete.Count -gt 0) { $comp += "- incomplete: $($incomplete -join ', ')`n" }
     $comp += "- resume: .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'`n"
+    if (($script:DiagClass.Count -gt 0) -or (-not $script:JobsOk)) {
+        $comp += "`n## Diagnostics (self-diagnosis)`n- exec mode: $(if($script:JobsOk){'background-job'}else{'in-process fallback (job subsystem unavailable)'})`n"
+        foreach($k in $script:DiagClass.Keys){ $sm=$script:DiagClass[$k].sample; $comp += "- ${k}: $($script:DiagClass[$k].count) step(s)$(if($sm){" - e.g. $sm"})`n" }
+        if ($script:DiagRem.Count -gt 0) { $comp += "- self-heal actions: " + (($script:DiagRem.GetEnumerator()|ForEach-Object{"$($_.Key) x$($_.Value)"}) -join ', ') + "`n" }
+    }
     try { Add-Content -Path (Join-Path $OutDir 'SUMMARY.md') -Value $comp -Encoding UTF8 } catch {}
     $script:RunIncomplete = ($verdict -eq 'INCOMPLETE')
     Write-Audit "COMPLETENESS $verdict | ok=$nok fail=$nfail timeout=$ntmo skip=$nskip planned=$nplan"
