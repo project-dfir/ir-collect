@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     IR-Collect - Self-healing incident-response collector for Windows (two-stage: rapid volatile + menu).
 
@@ -93,6 +93,37 @@ function Get-Inv { param([string]$Class,[string]$Filter='',[string]$NS='root\cim
             else         { return Get-WmiObject -Class $Class -Namespace $NS -ErrorAction Stop } } } catch {}
     return $null
 }
+
+# --- hashing shim: Get-FileHash is NOT guaranteed to exist -------------------
+# Observed on a real, fully-patched 5.1 host in FullLanguage mode: PSModulePath inherited from a
+# parent process listed PowerShell 7's module directories first, so Windows PowerShell loaded pwsh
+# 7's Microsoft.PowerShell.Utility (7.0.0.0) instead of its own - and Get-FileHash was simply gone.
+# It is also absent outright on PS < 4.0 (Win7/2008R2, which this collector still supports).
+# The previous behaviour was to catch the error and write 'ERR' into every manifest row, then seal:
+# an evidence bundle whose manifest verifies NOTHING, with no warning to the operator.
+# Everything that hashes goes through this shim. It is kept as TEXT as well as live functions
+# because Start-Job children do not inherit script functions - generated job scripts prepend it.
+$script:HashShimText = @'
+function Get-IRHashNet { param([string]$Path,[string]$Alg)
+    # .NET fallback. FileShare ReadWrite so an open/locked evidence file still hashes.
+    $a = [Security.Cryptography.HashAlgorithm]::Create($Alg)
+    if (-not $a) { throw "no provider for $Alg" }
+    try {
+        $fs = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        try { (($a.ComputeHash($fs)) | ForEach-Object { $_.ToString('X2') }) -join '' } finally { $fs.Dispose() }
+    } finally { $a.Dispose() }
+}
+function Get-IRSha256 { param([string]$Path)
+    # try/catch (not a Get-Command probe) so a BROKEN Get-FileHash falls back too, not just a missing one
+    try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+    Get-IRHashNet $Path 'SHA256'
+}
+function Get-IRMd5 { param([string]$Path)
+    try { return (Get-FileHash -LiteralPath $Path -Algorithm MD5 -ErrorAction Stop).Hash } catch {}
+    Get-IRHashNet $Path 'MD5'
+}
+'@
+. ([scriptblock]::Create($script:HashShimText))   # also define them in the parent scope
 
 if ([string]::IsNullOrWhiteSpace($Dest)) { $Dest = (Get-Location).Path }
 $hostName = $env:COMPUTERNAME
@@ -450,7 +481,7 @@ if (Test-Path $ToolDir) {
     Write-Audit "DOCTRINE: carried tools present in .\tools - preferred over host binaries."
     try {
         Get-ChildItem $ToolDir -Recurse -File -Include *.exe,*.ps1 -ErrorAction SilentlyContinue |
-          ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.FullName } |
+          ForEach-Object { "{0}  {1}" -f (Get-IRSha256 $_.FullName), $_.FullName } |
           Out-File (Join-Path $Dirs.metadata 'carried_tools_sha256.txt') -Encoding ASCII
     } catch {}
 } else {
@@ -653,7 +684,7 @@ function Job-Memory {
         $script:MemOk = $true
         Write-Audit ("RAM VERIFIED: {0:N1} GB {1} image, stable + not locked (threshold {2:N1} GB)." -f ($script:MemBytes/1GB), $(if($compressed){'compressed'}else{'raw'}), ($need/1GB))
         # post-acquisition verify: re-read + hash (SHA-256 + MD5) so a truncated image can't seal silently
-        Invoke-Step 'mem-hash-verify' ([scriptblock]::Create("Get-ChildItem '$D' -File | Where-Object { `$_.Length -gt 1MB } | ForEach-Object { 'SHA256 ' + (Get-FileHash `$_.FullName -Algorithm SHA256).Hash + '  ' + `$_.Name; 'MD5    ' + (Get-FileHash `$_.FullName -Algorithm MD5).Hash + '  ' + `$_.Name }")) 'memory_hashes.txt' $D -TimeoutSec 1800 | Out-Null
+        Invoke-Step 'mem-hash-verify' ([scriptblock]::Create($script:HashShimText + "Get-ChildItem '$D' -File -Force | Where-Object { `$_.Length -gt 1MB } | ForEach-Object { 'SHA256 ' + (Get-IRSha256 `$_.FullName) + '  ' + `$_.Name; 'MD5    ' + (Get-IRMd5 `$_.FullName) + '  ' + `$_.Name }")) 'memory_hashes.txt' $D -TimeoutSec 1800 | Out-Null
     } else {
         $script:MemOk = $false
         $why = $verdict.Reason
@@ -686,8 +717,34 @@ function Job-Artifacts {
         Invoke-Step 'copy-prefetch' ([scriptblock]::Create("robocopy '$env:WINDIR\Prefetch' '$A\prefetch' *.pf /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 600 -Retries 0 | Out-Null
         Collect 'amcache-copy' ([scriptblock]::Create("Copy-Item '$env:WINDIR\AppCompat\Programs\Amcache.hve' '$A\Amcache.hve' -Force -ErrorAction SilentlyContinue; 'copied if present'")) 'amcache_note.txt' $A
         # per-user hives (UserAssist/ShellBags/RunMRU/TypedPaths...) + PowerShell history + USB history
-        Invoke-Step 'copy-userhives' ([scriptblock]::Create("robocopy 'C:\Users' '$A\userhives' NTUSER.DAT UsrClass.dat /S /B /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 600 -Retries 0 | Out-Null
-        Invoke-Step 'copy-pshistory' ([scriptblock]::Create("robocopy 'C:\Users' '$A\ps_history' ConsoleHost_history.txt /S /R:1 /W:1 /NFL /NDL /NP")) $null $A -TimeoutSec 300 -Retries 0 | Out-Null
+        # TARGETED, not a tree walk. These artifacts live at FIXED paths, but the previous
+        # `robocopy 'C:\Users' ... /S` recursed every profile's whole AppData (OneDrive caches,
+        # node_modules, browser caches) to find a handful of files: 322s on range-FS01/SQL01 and a
+        # repeated 300s timeout on range-WS01 - i.e. the step that hunts per-user evidence was the
+        # single most likely one to time out and return NOTHING. Enumerate profiles once, then copy
+        # exact directories (robocopy without /S is top-level-only, so each copy is bounded).
+        # Profile root comes from ProfileList, not a hardcoded C:\Users - a relocated profile
+        # directory previously meant we silently collected nothing at all.
+        $profRoot = try { [Environment]::ExpandEnvironmentVariables((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -Name ProfilesDirectory -ErrorAction Stop).ProfilesDirectory) } catch { Join-Path $env:SystemDrive 'Users' }
+        $rcOpt = '/B /R:1 /W:1 /NFL /NDL /NP /NJH /NJS'   # /B = backup semantics, needed for in-use hives
+        Invoke-Step 'copy-userhives' ([scriptblock]::Create(@"
+foreach (`$p in (Get-ChildItem '$profRoot' -Directory -Force -ErrorAction SilentlyContinue)) {
+    `$d = Join-Path '$A\userhives' `$p.Name
+    robocopy `$p.FullName `$d NTUSER.DAT $rcOpt | Out-Null
+    `$uc = Join-Path `$p.FullName 'AppData\Local\Microsoft\Windows'
+    if (Test-Path -LiteralPath `$uc) { robocopy `$uc `$d UsrClass.dat $rcOpt | Out-Null }
+    "`$(`$p.Name): NTUSER.DAT=`$(Test-Path (Join-Path `$d 'NTUSER.DAT')) UsrClass.dat=`$(Test-Path (Join-Path `$d 'UsrClass.dat'))"
+}
+"@)) 'userhives_copied.txt' $A -TimeoutSec 600 -Retries 0 | Out-Null
+        Invoke-Step 'copy-pshistory' ([scriptblock]::Create(@"
+foreach (`$p in (Get-ChildItem '$profRoot' -Directory -Force -ErrorAction SilentlyContinue)) {
+    `$src = Join-Path `$p.FullName 'AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine'
+    if (-not (Test-Path -LiteralPath `$src)) { continue }
+    `$d = Join-Path '$A\ps_history' `$p.Name
+    robocopy `$src `$d ConsoleHost_history.txt $rcOpt | Out-Null
+    "`$(`$p.Name): ConsoleHost_history.txt=`$(Test-Path (Join-Path `$d 'ConsoleHost_history.txt'))"
+}
+"@)) 'pshistory_copied.txt' $A -TimeoutSec 300 -Retries 0 | Out-Null
         Collect 'usb-history' ([scriptblock]::Create("Copy-Item '$env:WINDIR\INF\setupapi.dev.log' '$A\setupapi.dev.log' -Force -ErrorAction SilentlyContinue; '=== USBSTOR (also in SYSTEM hive) ==='; Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*' -ErrorAction SilentlyContinue | Select-Object FriendlyName,PSChildName | Format-Table -AutoSize")) 'usb_devices.txt' $A
         Collect 'ps-transcript-note' { 'Note: full NTFS metadata ($MFT/$UsnJrnl/$LogFile), SRUM, and locked per-user hives are best captured by the Velociraptor/CyLR triage path (uses VSS/raw). This native fallback is best-effort.' } '_TRIAGE_LIMITATIONS.txt' $A
     }
@@ -736,9 +793,9 @@ function Job-FileHashes {
     Write-Audit "--- HEAVY: full filesystem hash inventory ---"; $A=$Dirs.artifacts
     if ($script:DoNoHarm) { Write-Audit 'filehashes skipped (do-no-harm / OT-ICS mode)'; Collect 'hash-skip-ot' { 'Skipped: do-no-harm (OT/ICS) mode - a full live-filesystem hash walk is too intrusive for control systems.' } 'FILEHASH_SKIPPED_OT.txt' $A; $script:Done['filehashes']=$true; return }
     foreach ($drv in (Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3').DeviceID) {
-        Invoke-Step "hash-$drv" ([scriptblock]::Create(@"
+        Invoke-Step "hash-$drv" ([scriptblock]::Create($script:HashShimText + @"
 Get-ChildItem '$drv\' -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-  try { `$h=(Get-FileHash `$_.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch { `$h='ERR' }
+  try { `$h=Get-IRSha256 `$_.FullName } catch { `$h='ERR' }
   '{0},{1},{2},{3}' -f `$h, `$_.Length, `$_.LastWriteTimeUtc.ToString('o'), `$_.FullName }
 "@)) "filehashes_$($drv.TrimEnd(':')).csv" $A -TimeoutSec 7200 -Retries 0 | Out-Null
     }
@@ -913,6 +970,25 @@ function Invoke-Menu {
 # ===========================================================================
 # SEAL - manifest + report
 # ===========================================================================
+# Build the evidence-manifest script. Emitted as TEXT (not a scriptblock) because the manifest
+# runs in a Start-Job child, which does not inherit script functions - so it must be self-contained.
+# Factoring the generator out makes it unit-testable: see tests/unit/Test-ManifestScript.ps1.
+#
+# -Force is LOAD-BEARING. Without it Get-ChildItem skips hidden+system files, and the copied
+# per-user hives (NTUSER.DAT, UsrClass.dat) carry those attributes - so on real range hosts every
+# single one of them (17/17 on SQL01, 19/19 on WS02) was collected into evidence but absent from
+# MANIFEST-SHA256.csv. An evidence manifest that silently omits the most valuable artifacts cannot
+# support a tamper/corruption check on them, which is the whole point of having one.
+function New-ManifestScript {
+    param([Parameter(Mandatory)][string]$Dir)
+    $script:HashShimText + @"
+Get-ChildItem '$Dir' -Recurse -File -Force -ErrorAction SilentlyContinue |
+  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256\.csv$' -and `$_.FullName -notmatch '99_logs\\(audit|errors)\.log$' } |
+  ForEach-Object { try { `$h=Get-IRSha256 `$_.FullName } catch { `$h='ERR' }
+    '{0},{1},{2}' -f `$h, `$_.Length, `$_.FullName.Replace('$Dir','') }
+"@
+}
+
 function Invoke-Seal {
     Write-Audit "--- SEAL: manifest + report ---"; $L=$Dirs.logs
     $endUtc=Now-Utc
@@ -975,19 +1051,14 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
     $script:RunIncomplete = ($verdict -eq 'INCOMPLETE')
     Write-Audit "COMPLETENESS $verdict | ok=$nok fail=$nfail timeout=$ntmo skip=$nskip planned=$nplan"
     # manifest LAST so it covers SUMMARY.md + final collection_info.json (fixed literal path strip)
-    Invoke-Step 'manifest-sha256' ([scriptblock]::Create(@"
-Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
-  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256\.csv$' -and `$_.FullName -notmatch '99_logs\\(audit|errors)\.log$' } |
-  ForEach-Object { try { `$h=(Get-FileHash `$_.FullName -Algorithm SHA256).Hash } catch { `$h='ERR' }
-    '{0},{1},{2}' -f `$h, `$_.Length, `$_.FullName.Replace('$OutDir','') }
-"@)) 'MANIFEST-SHA256.csv' $L -TimeoutSec 1800 | Out-Null
+    Invoke-Step 'manifest-sha256' ([scriptblock]::Create((New-ManifestScript $OutDir))) 'MANIFEST-SHA256.csv' $L -TimeoutSec 1800 | Out-Null
 
     # freeze + hash the custody trail itself. audit.log is excluded from the manifest above because it
     # is still being written when the manifest runs; snapshot a frozen copy and hash THAT so the
     # timeline record has an integrity seal too.
     try {
         Copy-Item $AuditLog (Join-Path $L 'audit.frozen.log') -Force -ErrorAction SilentlyContinue
-        $ah = (Get-FileHash (Join-Path $L 'audit.frozen.log') -Algorithm SHA256).Hash
+        $ah = Get-IRSha256 (Join-Path $L 'audit.frozen.log')
         [IO.File]::WriteAllText((Join-Path $OutDir 'MANIFEST-audit-log.sha256'), "$ah  99_logs/audit.frozen.log`n", (New-Object Text.UTF8Encoding($false)))
         Write-Audit "Custody trail frozen + hashed: $ah"
     } catch { Write-Audit "Could not freeze/hash audit.log: $($_.Exception.Message)" }
@@ -1006,7 +1077,7 @@ Get-ChildItem '$OutDir' -Recurse -File -ErrorAction SilentlyContinue |
             Write-Audit "seal-zip produced no archive - shipping raw folder via robocopy instead."
             Invoke-Step 'ship-folder' ([scriptblock]::Create("robocopy '$OutDir' '$NetworkDest\$(Split-Path $OutDir -Leaf)' /E /Z /R:1 /W:1 /NFL /NDL /NP")) $null $Dirs.logs -TimeoutSec 7200 -Retries 0 | Out-Null
         }
-        try { (Get-FileHash $zip -Algorithm SHA256).Hash | Out-File "$zip.sha256" -Encoding ASCII } catch {}
+        try { (Get-IRSha256 $zip) | Out-File "$zip.sha256" -Encoding ASCII } catch {}
         if ($NetworkDest) {
             try {
                 if ($Cred) { New-PSDrive -Name IRDEST -PSProvider FileSystem -Root $NetworkDest -Credential $Cred -ErrorAction Stop | Out-Null; $tgt='IRDEST:\' }

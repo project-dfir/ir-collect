@@ -1,0 +1,104 @@
+<#
+.SYNOPSIS
+    Unit test for New-ManifestScript in kit/IR-Collect.ps1 (evidence-manifest coverage).
+
+.DESCRIPTION
+    Extracts the real generator via the PowerShell AST, runs the script it emits against a
+    synthetic evidence tree, and asserts the manifest covers every file - including HIDDEN and
+    SYSTEM ones.
+
+    Regression this locks in: the manifest enumerated with `Get-ChildItem -Recurse -File` and no
+    -Force, so hidden+system files were invisible to it. Copied per-user hives (NTUSER.DAT,
+    UsrClass.dat) carry those attributes, so on real range hosts 17/17 (SQL01) and 19/19 (WS02)
+    per-user hives were in evidence but had NO manifest entry - nothing to verify them against.
+    Measured 2026-07-27.
+
+.EXAMPLE  pwsh -File tests/unit/Test-ManifestScript.ps1
+#>
+[CmdletBinding()]
+param([string]$CollectorPath)
+
+$ErrorActionPreference = 'Stop'
+if (-not $CollectorPath) {
+    $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'kit') 'IR-Collect.ps1'
+}
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path $CollectorPath), [ref]$null, [ref]$null)
+$fn = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                     $args[0].Name -eq 'New-ManifestScript' }, $true)
+if ($fn.Count -ne 1) { throw "expected exactly 1 New-ManifestScript definition, found $($fn.Count)" }
+. ([scriptblock]::Create($fn[0].Extent.Text))
+
+# New-ManifestScript prepends the hashing shim, so the test must reproduce the real runtime
+# composition - $script:HashShimText has to exist here or every hash silently becomes 'ERR'
+# (which is precisely the failure mode this file guards against).
+$asg = $ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    "$($args[0].Left)" -match 'HashShimText' }, $true)
+if ($asg.Count -ne 1) { throw "expected 1 HashShimText assignment, found $($asg.Count)" }
+$script:HashShimText = $asg[0].Right.Expression.Value
+
+# --- synthetic evidence tree -------------------------------------------------
+$dir = Join-Path ([IO.Path]::GetTempPath()) ("manitest_" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force $dir | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $dir '99_logs') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $dir '05_artifacts\userhives\alice') | Out-Null
+
+$plainRel  = 'SUMMARY.md'
+$hiveRel   = '05_artifacts\userhives\alice\NTUSER.DAT'
+$auditRel  = '99_logs\audit.log'
+$manRel    = '99_logs\MANIFEST-SHA256.csv'
+Set-Content (Join-Path $dir $plainRel) 'summary'   -Encoding UTF8
+Set-Content (Join-Path $dir $hiveRel)  'fakehive'  -Encoding UTF8
+Set-Content (Join-Path $dir $auditRel) 'audit'     -Encoding UTF8
+Set-Content (Join-Path $dir $manRel)   'stale'     -Encoding UTF8
+
+# mark the hive hidden+system exactly as a robocopy'd NTUSER.DAT arrives.
+# (Attribute juggling is Windows-only; on Linux CI the coverage assertion still runs, and the
+#  -Force flag assertion below is the platform-independent guard.)
+$isWindows_ = $true
+try { if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) { $isWindows_ = $false } } catch {}
+if ($isWindows_) {
+    $fi = Get-Item (Join-Path $dir $hiveRel) -Force
+    $fi.Attributes = $fi.Attributes -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
+    "hive attributes set to: $((Get-Item (Join-Path $dir $hiveRel) -Force).Attributes)"
+} else {
+    'non-Windows: skipping hidden/system attribute step (coverage assertion still applies)'
+}
+
+# --- run the generated manifest script ---------------------------------------
+$scriptText = New-ManifestScript $dir
+$rows = & ([scriptblock]::Create($scriptText))
+$covered = @{}
+foreach ($r in @($rows)) {
+    $p = ($r -split ',', 3)
+    if ($p.Count -eq 3) { $covered[$p[2].TrimStart('\','/')] = $p[0] }
+}
+
+$fail = 0
+function Check($cond, $msg) {
+    if ($cond) { Write-Host "ok    $msg" -ForegroundColor Green }
+    else { Write-Host "FAIL  $msg" -ForegroundColor Red; $script:fail++ }
+}
+
+Check ($scriptText -match '-Force') 'generated manifest script passes -Force to Get-ChildItem'
+# without the shim prepended, Get-IRSha256 is undefined inside the Start-Job child and every
+# row degrades to 'ERR' - assert the dependency explicitly so a refactor cannot drop it silently
+Check ($scriptText -match 'function Get-IRSha256') 'generated script carries the hashing shim (Start-Job children inherit no functions)'
+Check ($covered.ContainsKey($plainRel)) "covers a normal file ($plainRel)"
+Check ($covered.ContainsKey($hiveRel))  "covers a HIDDEN+SYSTEM per-user hive ($hiveRel)  <-- the regression"
+Check (-not $covered.ContainsKey($manRel))   'excludes MANIFEST-SHA256.csv itself (it is being written)'
+Check (-not $covered.ContainsKey($auditRel)) 'excludes the live audit.log (frozen copy is hashed separately)'
+if ($covered.ContainsKey($hiveRel)) {
+    Check ($covered[$hiveRel] -match '^[0-9A-Fa-f]{64}$') 'hive entry carries a real SHA-256, not ERR'
+}
+# every file present must be accounted for as either covered or deliberately excluded
+$expectExcluded = @($manRel, $auditRel)
+$onDisk = Get-ChildItem $dir -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($dir.Length).TrimStart('\','/') }
+$unaccounted = @($onDisk | Where-Object { -not $covered.ContainsKey($_) -and $_ -notin $expectExcluded })
+Check ($unaccounted.Count -eq 0) "no file is silently unaccounted for (found $($unaccounted.Count): $($unaccounted -join ', '))"
+
+Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+Write-Host "`n$fail failed" -ForegroundColor $(if($fail){'Red'}else{'Green'})
+exit $(if ($fail) { 1 } else { 0 })
