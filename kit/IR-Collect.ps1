@@ -1216,8 +1216,11 @@ try {
     } elseif ($Auto) {
         # -Auto is unattended triage: skip the two hours-long GROUND-TRUTH jobs (7 full-FS hash, 8 disk image)
         # unless -IncludeGroundTruth is given, so an automated run actually finishes in minutes not hours.
-        $autoJobs = @($MenuItems.Keys | Where-Object { $IncludeGroundTruth -or ($_ -notin '7','8') })
-        Write-Audit ("Auto mode: heavy jobs " + $(if($IncludeGroundTruth){'INCLUDING ground-truth 7/8'}else{'EXCEPT hours-long ground-truth 7(full-FS hash)/8(disk image); pass -IncludeGroundTruth to add them'}) + ".")
+        # run scenario-relevant jobs FIRST (so the important evidence is secured before unrelated
+        # jobs), then everything else in menu order; ground-truth 7/8 excluded unless requested.
+        $order = @(); if ($script:Plan) { $order += @($script:Plan) }; $order += @($MenuItems.Keys)
+        $autoJobs = @($order | Where-Object { $MenuItems.Contains("$_") -and ($IncludeGroundTruth -or ("$_" -notin '7','8')) } | Select-Object -Unique)
+        Write-Audit ("Auto mode: order=$($autoJobs -join ',') " + $(if($IncludeGroundTruth){'INCLUDING ground-truth 7/8'}else{'EXCEPT hours-long ground-truth 7(full-FS hash)/8(disk image); pass -IncludeGroundTruth to add them'}) + ".")
         foreach ($k in $autoJobs) { try { & $MenuItems[$k].fn } catch { Write-Audit "Job $($MenuItems[$k].key) fault: $($_.Exception.Message) - continuing." } }
     } elseif ($null -ne $script:Plan) {
         Write-Audit "Guided plan: $($script:Plan -join ',')"
