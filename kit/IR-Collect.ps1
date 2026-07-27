@@ -587,7 +587,35 @@ function Invoke-RapidVolatile {
 # STAGE 2 - HEAVY / LONG-RUNNING COLLECTIONS (menu-selectable)
 # ===========================================================================
 $script:Done = @{}
-$script:MemOk = $false; $script:MemBytes = 0
+$script:MemOk = $false; $script:MemBytes = 0; $script:MemFailCode = 'not-attempted'
+
+# Classify a memory-acquisition attempt into a verdict + an operator-ACTIONABLE reason.
+# Pure (takes observed facts, does no I/O) so it is unit-testable - see tests/unit.
+# The reason drives what the analyst does next, so the distinctions matter: "no imager was
+# staged" is a kit-provisioning miss fixable in seconds, while "imager produced nothing" is
+# a host-hardening problem (Secure Boot/HVCI/EDR). Conflating them sends people the wrong way.
+function Resolve-MemVerdict {
+    param(
+        [int64]$Bytes,           # size of the largest candidate image (0 = none found)
+        [int64]$Need,            # format-aware minimum size to accept
+        [bool]$HaveImage,        # a candidate image file exists on disk
+        [bool]$Stable,           # size did not change across the sample window
+        [bool]$Locked,           # another process still holds the file open
+        [bool]$ImagerPresent     # an acquisition tool was found and invoked
+    )
+    if ($HaveImage -and $Bytes -ge $Need -and $Stable -and -not $Locked) {
+        return [pscustomobject]@{ Ok=$true; Code='verified'; Reason=''; DriverHint=$false }
+    }
+    # ORDER MATTERS: absence of a tool, then absence of a file, BEFORE the stability/lock
+    # signals - those are only meaningful once a file actually exists. (Getting this order
+    # wrong made every no-image run report "file still growing" and blame Secure Boot.)
+    $code='image-too-small'; $why=('image too small for its format ({0:N1} MB < {1:N1} MB)' -f ($Bytes/1MB),($Need/1MB)); $hint=$true
+    if     (-not $ImagerPresent) { $code='no-imager-staged';  $why='no acquisition tool was staged (place winpmem.exe/DumpIt.exe in .\tools)'; $hint=$false }
+    elseif (-not $HaveImage)     { $code='no-image-produced'; $why='the imager ran but produced no image file' }
+    elseif ($Locked)             { $code='imager-holds-file'; $why='imager still holds the file (hung/incomplete)' }
+    elseif (-not $Stable)        { $code='image-growing';     $why='file still growing (imager not finished)' }
+    [pscustomobject]@{ Ok=$false; Code=$code; Reason=$why; DriverHint=$hint }
+}
 
 function Job-Memory {
     if ($script:Done['memory']) { Write-Audit "RAM already captured - skipping."; return }
@@ -596,6 +624,7 @@ function Job-Memory {
     $ram = try { (Get-Inv Win32_ComputerSystem).TotalPhysicalMemory } catch { 8GB }
     if (-not (Test-Space $D ($ram*1.1) 'RAM-image')) { Collect 'mem-skip-space' { 'RAM image skipped: insufficient destination free space.' } 'RAM_SKIPPED_NO_SPACE.txt' $D; $script:Done['memory']=$true; return }
     $img = Join-Path $D 'memory.raw'
+    $imagerPresent = [bool]($TOOL.winpmem -or $TOOL.dumpit -or $TOOL.magnetram)
     if     ($TOOL.winpmem) { $wp=$TOOL.winpmem; Invoke-Step 'mem-winpmem' ([scriptblock]::Create("& '$wp' acquire '$img' 2>&1; if(-not (Test-Path '$img')){ & '$wp' '$img' 2>&1 }")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($wp)) | Out-Null }
     elseif ($TOOL.dumpit)  { Invoke-Step 'mem-dumpit'  ([scriptblock]::Create("& '$($TOOL.dumpit)' /OUTPUT '$($D)\memory.dmp' /QUIET")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($TOOL.dumpit)) | Out-Null }
     elseif ($TOOL.magnetram){Invoke-Step 'mem-magnet'  ([scriptblock]::Create("& '$($TOOL.magnetram)' /accepteula /go '$D'")) $null $D -TimeoutSec 3600 -Retries 0 -KillOnTimeout @([IO.Path]::GetFileNameWithoutExtension($TOOL.magnetram)) | Out-Null }
@@ -617,16 +646,23 @@ function Job-Memory {
     # threshold is FORMAT-AWARE: a compressed AFF4/zip is legitimately far smaller than raw RAM.
     $compressed = $imgFile -and ($imgFile.Extension -in '.aff4','.zip')
     $need = if ($compressed) { [int64][math]::Max(200MB, $totalRam*0.05) } else { [int64]($totalRam*0.4) }
-    if ($script:MemBytes -ge $need -and $stable -and -not $locked) {
+    $verdict = Resolve-MemVerdict -Bytes $script:MemBytes -Need $need -HaveImage ([bool]$imgFile) `
+                                  -Stable $stable -Locked $locked -ImagerPresent $imagerPresent
+    $script:MemFailCode = $verdict.Code
+    if ($verdict.Ok) {
         $script:MemOk = $true
         Write-Audit ("RAM VERIFIED: {0:N1} GB {1} image, stable + not locked (threshold {2:N1} GB)." -f ($script:MemBytes/1GB), $(if($compressed){'compressed'}else{'raw'}), ($need/1GB))
         # post-acquisition verify: re-read + hash (SHA-256 + MD5) so a truncated image can't seal silently
         Invoke-Step 'mem-hash-verify' ([scriptblock]::Create("Get-ChildItem '$D' -File | Where-Object { `$_.Length -gt 1MB } | ForEach-Object { 'SHA256 ' + (Get-FileHash `$_.FullName -Algorithm SHA256).Hash + '  ' + `$_.Name; 'MD5    ' + (Get-FileHash `$_.FullName -Algorithm MD5).Hash + '  ' + `$_.Name }")) 'memory_hashes.txt' $D -TimeoutSec 1800 | Out-Null
     } else {
         $script:MemOk = $false
-        $why = if ($locked) { 'imager still holds the file (hung/incomplete)' } elseif (-not $stable) { 'file still growing (imager not finished)' } elseif ($imgFile) { 'image too small for its format' } else { 'no image produced' }
-        Write-Audit ("RAM WARNING: {0:N1} MB - capture NOT verified ({1}). Secure Boot/HVCI/EDR may have blocked the driver. *** Do NOT power off an encrypted host without a recovery key - the FVEK is only in RAM. ***" -f ($script:MemBytes/1MB), $why)
-        Collect 'mem-fail-warning' ([scriptblock]::Create("'RAM CAPTURE NOT VERIFIED: $why. Causes: Secure Boot/HVCI/VBS blocking the driver, EDR quarantine, hung imager, or no imager. If the disk is encrypted, DO NOT power off without a recovery key.'")) 'RAM_CAPTURE_FAILED.txt' $D
+        $why = $verdict.Reason
+        # only blame the driver/host hardening when a tool actually ran - otherwise the fix is to stage one.
+        $hint = if ($verdict.DriverHint) { ' Secure Boot/HVCI/EDR may have blocked the driver.' } else { ' Stage an imager in .\tools and re-run.' }
+        Write-Audit ("RAM WARNING: {0:N1} MB - capture NOT verified [{1}]: {2}.{3} *** Do NOT power off an encrypted host without a recovery key - the FVEK is only in RAM. ***" -f ($script:MemBytes/1MB), $verdict.Code, $why, $hint)
+        $causes = if ($verdict.DriverHint) { 'Causes: Secure Boot/HVCI/VBS blocking the driver, EDR quarantine, or a hung imager.' } else { 'Fix: place winpmem.exe or DumpIt.exe in the kit tools folder and re-run.' }
+        $note = ("RAM CAPTURE NOT VERIFIED [{0}]: {1}. {2} If the disk is encrypted, DO NOT power off without a recovery key." -f $verdict.Code, $why, $causes).Replace("'","''")
+        Collect 'mem-fail-warning' ([scriptblock]::Create("'$note'")) 'RAM_CAPTURE_FAILED.txt' $D
     }
     $script:Done['memory']=$true
 }
@@ -914,7 +950,8 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
         }
     }
     $incomplete = @($failedNames | Sort-Object -Unique)
-    if (-not $script:MemOk -and -not $RapidOnly) { $incomplete += 'memory(no-verified-RAM)' }
+    # carry the specific reason so the verdict tells the analyst what to fix, not just that RAM is missing
+    if (-not $script:MemOk -and -not $RapidOnly) { $incomplete += "memory($($script:MemFailCode))" }
     $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$CaseId; host=$hostName; output_dir=$OutDir
@@ -1233,10 +1270,12 @@ try {
 catch { Write-Audit "FATAL in main: $($_.Exception.Message) - proceeding to seal." }
 finally { Complete-Run }
 
-# --- exit-code contract: 0 clean | 10 completed-with-skips | 20 RAM not verified | 40 fatal ---
+# --- exit-code contract: 0 clean | 10 completed-with-skips | 15 incomplete-critical | 20 RAM not verified | 40 fatal ---
 $exitCode = 0
+# ascending severity - the LAST condition that holds wins, so 20 (no RAM) is not masked by 15.
+# (It was: no-verified-RAM also sets RunIncomplete, so exit 20 could never be observed.)
 if ($script:StepsFail -gt 0) { $exitCode = 10 }
-if (-not $script:MemOk -and -not $RapidOnly) { $exitCode = 20 }
 if ($script:RunIncomplete) { $exitCode = 15 }
+if (-not $script:MemOk -and -not $RapidOnly) { $exitCode = 20 }
 Write-Audit "EXIT $exitCode (0=clean 10=skips 15=incomplete-critical 20=no-RAM 40=fatal)"
 exit $exitCode
