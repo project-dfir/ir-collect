@@ -1050,6 +1050,28 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
     try { Add-Content -Path (Join-Path $OutDir 'SUMMARY.md') -Value $comp -Encoding UTF8 } catch {}
     $script:RunIncomplete = ($verdict -eq 'INCOMPLETE')
     Write-Audit "COMPLETENESS $verdict | ok=$nok fail=$nfail timeout=$ntmo skip=$nskip planned=$nplan"
+    # Document the manifest's own gaps INSIDE the bundle. Four files cannot be in
+    # MANIFEST-SHA256.csv (it is being written, or they are produced after it), and a verifier
+    # who finds unlisted files has no way to tell "deliberately excluded" from "tampered".
+    # Written BEFORE the manifest step so this note is itself covered by the manifest.
+    $exclNote = @"
+MANIFEST-SHA256.csv coverage
+============================
+Format (headerless): <sha256>,<length>,<path relative to the evidence root>
+It covers every file in the evidence tree, INCLUDING hidden/system ones (the per-user
+registry hives NTUSER.DAT and UsrClass.dat carry those attributes).
+
+Deliberately NOT listed, and why:
+  99_logs/MANIFEST-SHA256.csv   the manifest cannot hash itself
+  99_logs/audit.log             still being appended to while the manifest runs
+  99_logs/errors.log            same
+  99_logs/audit.frozen.log      created after the manifest - a frozen snapshot of audit.log,
+                                hashed separately into MANIFEST-audit-log.sha256
+  MANIFEST-audit-log.sha256     created after the manifest; holds the hash above
+
+Anything else absent from the manifest was NOT excluded by design - treat it as unexplained.
+"@
+    try { [IO.File]::WriteAllText((Join-Path $L 'MANIFEST-README.txt'), $exclNote, (New-Object Text.UTF8Encoding($false))) } catch {}
     # manifest LAST so it covers SUMMARY.md + final collection_info.json (fixed literal path strip)
     Invoke-Step 'manifest-sha256' ([scriptblock]::Create((New-ManifestScript $OutDir))) 'MANIFEST-SHA256.csv' $L -TimeoutSec 1800 | Out-Null
 
