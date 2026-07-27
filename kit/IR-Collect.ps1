@@ -395,7 +395,7 @@ function Invoke-Step {
                 $cls = 'timeout'
                 Write-Audit "STEP $id WARN | $Name | TIMEOUT ${TimeoutSec}s | try $attempt"
                 if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
-                Write-Ledger $id $Name $phase 'timeout' @{ rc='timeout'; error_class=$cls; attempts=$attempt }
+                Write-Ledger $id $Name $phase 'timeout' @{ rc='timeout'; error_class=$cls; attempts=$attempt; error_msg="exceeded ${TimeoutSec}s timeout" }
                 Add-Content $ErrLog "$(Now-Utc) [$id] $Name : timeout ${TimeoutSec}s"; $script:StepsFail++; return $null
             }
         } catch {
