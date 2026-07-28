@@ -326,3 +326,27 @@ destination that was **perfectly writable** was reported unwritable - while the 
 succeeded and the bundle arrived. stderr now goes to its own file and is used only for the reason
 string. Both controls are asserted every time: a working target must produce **zero** warnings and
 `preflight_ok: true`; an unreachable one exactly one warning and the real reason.
+
+## Exit-contract audit (2026-07-28)
+
+The exit code is the machine-readable answer to "can I trust this bundle?" and the only part of
+the tool most automation reads. `tests/unit/Test-ExitContract.ps1` now asserts both collectors
+implement and document the *same* contract, parsed from the shipped scripts.
+
+**Resolved a non-issue.** A failed ship not appearing in the completeness verdict looked like a
+Linux/Windows divergence. It is neither, and it is not a gap: on both platforms `run_state.json`
+is written and hashed into the manifest **before** the bundle ships, so the ship outcome cannot
+enter the verdict without either lying or invalidating the seal. It reaches the **exit code**
+instead - Windows through an explicit `ShipOk` rule, Linux through `STEPS_FAIL` because rsync/scp
+run via `run_step` - and the detail goes to `<bundle>.ship.json`. Recorded so it is not
+re-litigated.
+
+**Found a real one.** The shell collector could never return **40**. It had *no refusal path at
+all* - its only non-zero early exit was for an unknown argument - so it would start a collection
+onto a destination too small to hold one and die partway with nothing able to record why. The
+Windows twin has refused since B2. Linux now performs the same preflight (creatable, writable,
+≥64 MB free) and refuses with exit 40.
+
+Verified with both controls: a normal destination still collects (exit 15, bundle created); a
+3 MB loop filesystem is refused with exit 40, names the actual free space, and leaves **zero**
+files behind.

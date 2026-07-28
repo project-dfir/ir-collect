@@ -289,6 +289,34 @@ CASE="$(printf '%s' "$CASE" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)"
 CASE_RAW_J="${CASE_RAW//\\/\\\\}"
 CASE_RAW_J="${CASE_RAW_J//\"/\\\"}"
 [ -n "$CASE" ] || CASE="IR"
+# Refuse a destination that cannot hold a collection, BEFORE anything depends on it. Parity with
+# the Windows twin, which has refused with exit 40 since scenario B2; this collector had no
+# refusal path at all - its only non-zero early exit was for an unknown argument - so it would
+# happily start a collection onto a full disk and die partway with nothing able to record why.
+# Found 2026-07-28 by tests/unit/Test-ExitContract.ps1, which asserts both collectors implement
+# the same exit contract.
+#
+# 64 MB is the same floor the Windows collector uses: below that a run cannot even write its own
+# diagnostics, so starting one produces a bundle that explains nothing.
+_preflight_dest() {
+  local root="$1" need_kb=65536 free_kb=''
+  mkdir -p "$root" 2>/dev/null || { echo "$root: cannot be created"; return 1; }
+  ( : > "$root/.w_$STAMP" ) 2>/dev/null || { echo "$root: not writable"; return 1; }
+  rm -f "$root/.w_$STAMP" 2>/dev/null
+  free_kb="$(df -Pk "$root" 2>/dev/null | awk 'NR==2{print $4}')"
+  case "$free_kb" in ''|*[!0-9]*) return 0 ;; esac   # unknown free space is not proof of failure
+  [ "$free_kb" -ge "$need_kb" ] && return 0
+  echo "$root: only $(( free_kb / 1024 )) MB free; a collection needs at least $(( need_kb / 1024 )) MB"
+  return 1
+}
+_pf_msg="$(_preflight_dest "$OUT_ROOT")" || {
+  echo "" >&2
+  echo "  !! $_pf_msg" >&2
+  echo "  !! Refusing to start: on a destination this small the run dies before it can record WHY." >&2
+  echo "  !! Point -d at larger writable media, or free space and re-run." >&2
+  echo "" >&2
+  exit 40
+}
 OUTDIR="$OUT_ROOT/${CASE}_${HOSTN}_${STAMP}"
 [ -n "${RESUME_DIR:-}" ] && OUTDIR="$RESUME_DIR"   # --resume: finish an existing capture
 
@@ -1594,5 +1622,9 @@ EXIT_CODE=0
 [ "${STEPS_FAIL:-0}" -gt 0 ] && EXIT_CODE=10
 [ "${RUN_INCOMPLETE:-0}" = "1" ] && EXIT_CODE=15
 [ "${MEM_OK:-0}" != "1" ] && [ "$RAPID_ONLY" != "1" ] && EXIT_CODE=20
-audit "EXIT $EXIT_CODE (0=clean 10=skips 15=incomplete-critical 20=no-RAM 40=fatal)"
+# Legend kept identical to the Windows twin: the exit code is the machine-readable contract and
+# two collectors documenting it differently is how consumers end up handling only one of them.
+# A failed ship reaches 10 here via STEPS_FAIL (rsync/scp run through run_step), which is the same
+# outcome the Windows collector reaches with an explicit ShipOk rule.
+audit "EXIT $EXIT_CODE (0=clean 10=skips/ship-failed 15=incomplete-critical 20=no-RAM 40=fatal)"
 exit $EXIT_CODE
