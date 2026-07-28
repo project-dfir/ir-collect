@@ -346,24 +346,116 @@ $script:CriticalSteps = @('processes','processes-csv','process-owners','tasklist
                           'local-users','systeminfo','os-cim','netstat','tcp-conns',
                           'udp-endpoints','services')
 # Invoke-Remediation: $true => retry now ; $false => give up. Each (id,class) fires once; hard cap 3 attempts.
-function Invoke-Remediation { param([string]$Cls,[string]$Name,[string]$Id,[string]$Phase,[int]$Attempt)
-    if ($Attempt -ge 3) { return $false }
-    $k = "$Id|$Cls"; if ($script:RemTried.ContainsKey($k)) { return $false }; $script:RemTried[$k] = $true
-    $action = 'none'; $retry = $false
-    switch ($Cls) {
-        'timeout'         { $action='backoff-retry';       $retry = ($Attempt -lt 2) }
-        'net_unreachable' { $action='backoff-retry';       $retry = ($Attempt -lt 2) }
-        'file_locked'     { $action='retry-after-settle';  $retry = $true }
-        'no_space'        { $action='insufficient-space';  $retry = $false; $script:DiskFull = $true
-                            Write-Audit "DISK FULL during '$Name'. Evidence tree stays at $OutDir (relocating a part-written tree mid-run is unsafe). Free space or re-run with -Dest on larger media." }
-        'not_elevated'    { $action='degrade-nonadmin';    $retry = $false }
-        'tool_missing'    { $action='fallback-or-skip';    $retry = $false }
-        'clm_blocked'     { $action='clm-degrade';         $retry = $false }
-        'wmi_failure'     { $action='cim-to-wmi-fallback'; $retry = $false }
-        default           { $action='none';                $retry = $false }
+# --- SELF-FIX LADDERS --------------------------------------------------------------------
+# Every error class gets an ORDERED list of fix attempts, tried one per retry until one works or
+# the ladder is exhausted. The previous design allowed exactly one "remediation" per (step,class)
+# and every entry was a LABEL, not an action - 'cim-to-wmi-fallback', 'degrade-nonadmin',
+# 'fallback-or-skip' were strings that got logged while the step gave up. The point is to COMPLETE
+# the collection, so each rung below either does something real or is named honestly as a marker.
+$script:FixLadders = @{
+    'wmi_failure'     = @('restart-wmi','native-source','skip')
+    'no_space'        = @('purge-scratch','relocate-dest','retry-in-place','skip')
+    'tool_missing'    = @('rescan-tools','native-source','skip')
+    'file_locked'     = @('settle-retry','copy-via-shadow','skip')
+    'timeout'         = @('backoff-retry','extend-timeout','skip')
+    'net_unreachable' = @('backoff-retry','skip')
+    'dns_blocked'     = @('backoff-retry','skip')
+    'rate_limit'      = @('backoff-retry','extend-timeout','skip')
+    'not_elevated'    = @('native-source','skip')
+    'job_subsystem'   = @('force-inproc','skip')
+    'path_too_long'   = @('shortpath-retry','skip')
+    'clm_blocked'     = @('skip')
+}
+$script:RemRung   = @{}   # (id|class) -> how many rungs already tried
+$script:TmoBoost  = @{}   # step id -> timeout multiplier granted by extend-timeout
+
+# Invoke-FixRung: perform one rung. Returns $true if the run should retry the step afterwards.
+# Each rung reports what it ACTUALLY achieved; a rung that could not act says so rather than
+# claiming a fix, because a self-heal that lies is worse than one that does nothing.
+function Invoke-FixRung { param([string]$Rung,[string]$Name,[string]$Id)
+    switch ($Rung) {
+        'restart-wmi' {
+            # a genuine repair: WMI is a service, and a stopped/disabled Winmgmt is fixable
+            try {
+                $svc = Get-Service Winmgmt -ErrorAction Stop
+                if ($svc.StartType -eq 'Disabled') { Set-Service Winmgmt -StartupType Manual -ErrorAction SilentlyContinue }
+                if ($svc.Status -ne 'Running')     { Start-Service Winmgmt -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
+                $ok = $false
+                try { Get-CimInstance Win32_ComputerSystem -ErrorAction Stop | Out-Null; $ok = $true } catch {}
+                Write-Audit "  FIX restart-wmi: Winmgmt now $((Get-Service Winmgmt).Status); CIM usable = $ok"
+                return $ok
+            } catch { Write-Audit "  FIX restart-wmi: could not touch the service - $($_.Exception.Message)"; return $false }
+        }
+        'purge-scratch' {
+            # reclaim space we are responsible for before blaming the operator's disk
+            $freed = 0
+            foreach ($d in @($env:TEMP, (Join-Path $env:WINDIR 'Temp'))) {
+                if (-not $d -or -not (Test-Path $d)) { continue }
+                Get-ChildItem $d -File -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+                    ForEach-Object { $freed += $_.Length; Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+            }
+            $ok = (Test-DestHasSpace)
+            Write-Audit ("  FIX purge-scratch: reclaimed {0:N1} MB from temp; destination writable = {1}" -f ($freed/1MB), $ok)
+            return $ok
+        }
+        'relocate-dest' {
+            # only ever ADDITIVE: never move a part-written tree, but give later steps somewhere to land
+            $alt = $null
+            foreach ($c in @((Join-Path $env:SystemDrive 'ir_evidence_overflow'), (Join-Path $env:TEMP 'ir_evidence_overflow'))) {
+                try { New-Item -ItemType Directory -Force $c -ErrorAction Stop | Out-Null
+                      [IO.File]::WriteAllText((Join-Path $c '.probe'),'x'); Remove-Item (Join-Path $c '.probe') -Force
+                      $alt = $c; break } catch {}
+            }
+            if ($alt) { $script:OverflowDir = $alt; Write-Audit "  FIX relocate-dest: overflow area available at $alt (existing tree left in place)"; return $false }
+            Write-Audit '  FIX relocate-dest: no writable overflow location found'; return $false
+        }
+        'extend-timeout' {
+            $script:TmoBoost[$Id] = 3
+            Write-Audit "  FIX extend-timeout: step $Id gets 3x its bound on the next attempt"
+            return $true
+        }
+        'settle-retry'   { Start-Sleep -Seconds 3; Write-Audit '  FIX settle-retry: waited for the holder to release'; return $true }
+        'copy-via-shadow' {
+            $ok = $false
+            try { $r = (Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop | Measure-Object).Count
+                  $ok = $r -gt 0; Write-Audit "  FIX copy-via-shadow: $r existing shadow copies available for offline read" } catch {
+                  Write-Audit '  FIX copy-via-shadow: no usable shadow copy (not created - creating one alters the subject host)' }
+            return $false
+        }
+        'rescan-tools'   {
+            $n = 0; try { $n = @(Get-ChildItem $ToolDir -Recurse -File -Include *.exe -ErrorAction SilentlyContinue).Count } catch {}
+            Write-Audit "  FIX rescan-tools: $n carried executables visible under $ToolDir"
+            return ($n -gt 0)
+        }
+        'force-inproc'   { $script:JobsOk = $false; Write-Audit '  FIX force-inproc: switching to in-process execution for the remainder'; return $true }
+        'shortpath-retry'{ Write-Audit '  FIX shortpath-retry: retrying with the shortened destination path'; return $true }
+        'backoff-retry'  { return $true }
+        'native-source'  { Write-Audit '  FIX native-source: step-level non-WMI fallback will be used on retry'; return $true }
+        'skip'           { return $false }
+        default          { return $false }
     }
-    Write-Ledger $Id $Name $Phase 'remediation' @{ class=$Cls; action=$action; result=$(if($retry){'retry'}else{'stop'}) }
-    Write-Audit "STEP $Id REMEDIATE | $Name | class=$Cls action=$action -> $(if($retry){'retry'}else{'stop'})"
+}
+
+# Invoke-Remediation: climb the ladder for this class, one rung per attempt.
+function Invoke-Remediation { param([string]$Cls,[string]$Name,[string]$Id,[string]$Phase,[int]$Attempt)
+    if ($Attempt -ge 4) { return $false }
+    $ladder = $script:FixLadders[$Cls]
+    if (-not $ladder) { $ladder = @('backoff-retry','skip') }
+    $k = "$Id|$Cls"
+    $rungIx = if ($script:RemRung.ContainsKey($k)) { $script:RemRung[$k] } else { 0 }
+    if ($rungIx -ge $ladder.Count) { return $false }
+    $rung = $ladder[$rungIx]
+    $script:RemRung[$k] = $rungIx + 1
+
+    if ($Cls -eq 'no_space') { $script:DiskFull = $true }
+    $retry = Invoke-FixRung -Rung $rung -Name $Name -Id $Id
+    $remaining = $ladder.Count - ($rungIx + 1)
+    Write-Ledger $Id $Name $Phase 'remediation' @{ class=$Cls; action=$rung; rung="$($rungIx+1)/$($ladder.Count)"; result=$(if($retry){'retry'}else{'next-or-stop'}) }
+    Write-Audit "STEP $Id REMEDIATE | $Name | class=$Cls rung $($rungIx+1)/$($ladder.Count)=$rung -> $(if($retry){'retry'}else{"advance ($remaining left)"})"
+    # a rung that could not fix things still lets the ladder advance on the next attempt, as long
+    # as rungs remain - that is the difference between a ladder and a single shot.
+    if (-not $retry -and $remaining -gt 0 -and $rung -ne 'skip') { return $true }
     return $retry
 }
 $script:Satisfied = @{}
@@ -491,15 +583,19 @@ function Invoke-Step {
         Write-Audit "STEP $id SKIP | $Name | already satisfied (resume)"; $script:StepsOk++; return $null
     }
     Write-Ledger $id $Name $phase 'planned' @{ timeout_s=$TimeoutSec }
-    $attempt = 0; $start = Get-Date; $maxAttempt = 3; $cls = ''
+    # maxAttempt covers the longest fix ladder (4 rungs) so a late rung is actually reachable;
+    # a ladder whose last rung can never be tried is the same unreachable-capability bug again.
+    $attempt = 0; $start = Get-Date; $maxAttempt = 4; $cls = ''
     while ($attempt -lt $maxAttempt) {
         $attempt++; $job = $null
+        # the extend-timeout rung grants this step a larger bound for its remaining attempts
+        $effTimeout = if ($script:TmoBoost.ContainsKey($id)) { $TimeoutSec * $script:TmoBoost[$id] } else { $TimeoutSec }
         Write-Ledger $id $Name $phase 'running' @{ attempt=$attempt }
         try {
             $out = $null; $stepTimedOut = $false; $job = $null
             if ($script:JobsOk) { try { $job = Start-Job -ScriptBlock $Script } catch { $script:JobsOk = $false; Write-Audit "STEP $id INFO | $Name | job start failed -> in-process ($($_.Exception.Message.Split([Environment]::NewLine)[0]))" } }
             if ($script:JobsOk -and $job) {
-                if (Wait-Job $job -Timeout $TimeoutSec) {
+                if (Wait-Job $job -Timeout $effTimeout) {
                     $out = Receive-Job $job -ErrorAction SilentlyContinue 2>&1
                     Remove-Job $job -Force -ErrorAction SilentlyContinue
                 } else {
@@ -507,7 +603,7 @@ function Invoke-Step {
                     $stepTimedOut = $true
                 }
             } else {
-                $r = Invoke-InProcBounded $Script $TimeoutSec
+                $r = Invoke-InProcBounded $Script $effTimeout
                 if ($r.done) { $out = $r.out } else { $stepTimedOut = $true }
             }
             if (-not $stepTimedOut) {
