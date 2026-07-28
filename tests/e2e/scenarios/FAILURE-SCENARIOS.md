@@ -61,7 +61,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ✅ tested on WS02 — found the worst defect of the session (see below); `wmi_failure` still never fires because the steps do not error, they return nothing — emptiness detection is what catches it |
 | E2 | **No `sha256sum`** (stock macOS/BSD/busybox) | `HASH_BACKEND` forced per backend | shasum/sha256/openssl/digest/python3 fallback | ✅ unit-tested across 4 backends |
-| E3 | **Domain unreachable** for AD enumeration | block LDAP to the DC | Skip cleanly, mark incomplete, do not hang | ⬜ |
+| E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ⚠️ PARTIAL 2026-07-29 - no-hang and the clock UNAVAILABLE path proven; AD steps NOT yet exercised (see below) |
 | E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to |
 | E5 | **PS 2.0 / Server 2008R2** | old guest | `Get-Inv` WMI path; graceful degradation | ⬜ |
 
@@ -631,3 +631,35 @@ named `IR-DC01.lab.local`. Clock restored and confirmed at `+0.01s` vs the DC.
 **Harness note.** My own assertion expected a positive number and failed on correct output - which
 is how the inverted label was found. A failing assertion on working code is worth reading before
 "fixing" the assertion.
+
+## E3 - domain unreachable (PARTIAL 2026-07-29)
+
+**Setup.** Outbound firewall rules on WS02 blocking TCP 389/636/445/88/3268 and UDP 88/123/389 to
+`10.20.50.233`. Baseline asserted reachable first, the block asserted effective
+(`445=False 389=False`) before judging, and both rules removed by a teardown that **verifies**
+removal and re-tests reachability.
+
+**Proven.**
+- **No hang.** The run completed in 95 s against ~25 s baseline - slower, but bounded and
+  self-terminating. No step waited on the dead DC indefinitely.
+- **The clock step's UNAVAILABLE path works**, which is what E4 built it for. It still names the
+  configured source and reports the peer honestly:
+  `Time source: IR-DC01.lab.local` / `Reference peer: NONE REACHABLE` /
+  `Measured offset: UNAVAILABLE - ... this bundle carries no independent evidence that the host
+  clock is correct.` That is the right answer: absent a reference, say so rather than imply the
+  clock is fine.
+
+**NOT proven, and the reason.** The run reported `verdict: COMPLETE, ok=33, failed=0` - because
+`-RapidOnly` seals after Stage 1 and never reaches the AD section. The AD steps
+(`ad-net-accounts`, `ad-net-da`, `ad-net-ea`, `ad-nltest`, `ad-gpresult`, `ad-domain`) were never
+planned, so **nothing was skipped, nothing could be marked incomplete, and the scenario's central
+claim is untested.** A COMPLETE verdict here is correct for the steps that ran and says nothing
+about AD.
+
+**To finish this**, the same block must be applied to a run that actually plans the AD section
+(`-Auto`, 13-20 min), asserting those six steps fail or skip cleanly, land in the verdict, and do
+not hang. Queued rather than claimed.
+
+**Found while checking:** the diagnostic report's resume hint still pointed at `.\kit\IR-Collect.ps1`
+in **three** places - a path that has not existed since the repo reorganised to `collectors/`. An
+analyst following the bundle's own instructions would have run nothing. Fixed.

@@ -1012,7 +1012,7 @@ what is missing.
 
 Resume with:
 
-    .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'
+    .\collectors\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'
 
 Resuming also performs the seal, after which this file is deleted automatically.
 Do not treat an unsealed tree as a failed collection until you have tried the above.
@@ -2102,13 +2102,13 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         [void]$rep.AppendLine("## Reproducing this")
         [void]$rep.AppendLine("")
         [void]$rep.AppendLine('```powershell')
-        [void]$rep.AppendLine(".\kit\IR-Collect.ps1 -CaseId '$CaseId'$(if($Scenario){" -Scenario $Scenario"})$(if($HostRole){" -HostRole $HostRole"})$(if($RapidOnly){' -RapidOnly'})$(if($Auto){' -Auto'})")
+        [void]$rep.AppendLine(".\collectors\IR-Collect.ps1 -CaseId '$CaseId'$(if($Scenario){" -Scenario $Scenario"})$(if($HostRole){" -HostRole $HostRole"})$(if($RapidOnly){' -RapidOnly'})$(if($Auto){' -Auto'})")
         [void]$rep.AppendLine('```')
         [void]$rep.AppendLine("")
         [void]$rep.AppendLine("Resume just the unsatisfied steps of THIS run:")
         [void]$rep.AppendLine("")
         [void]$rep.AppendLine('```powershell')
-        [void]$rep.AppendLine(".\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'")
+        [void]$rep.AppendLine(".\collectors\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'")
         [void]$rep.AppendLine('```')
         [void]$rep.AppendLine("")
         [void]$rep.AppendLine("## Also send, if you can")
