@@ -33,7 +33,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; seal what exists somewhere writable; say the destination vanished | ⬜ **high value, untested** |
 | B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ⬜ |
 | B5 | **UNC auth failure** | wrong credentials to an SMB share | Fail at preflight, not after an hour of collecting | ⬜ |
-| B6 | **MAX_PATH exceeded** | deep nested profile paths | `path_too_long` classified (branch exists, never fired) | ⬜ |
+| B6 | **MAX_PATH exceeded** | long `-Dest`, or deep nested profile paths | Refuse up front with an actionable message; never report success for a tree that was never written | ✅ CLOSED 2026-07-28 - found the worst false-success yet, see below |
 
 ## C. Process lifetime
 
@@ -220,3 +220,49 @@ The benign tool staged alongside it was **not** implicated. An intact toolkit st
 `splunkd.exe`). The cause was not established — and `Remove-MpThreat` was run during cleanup,
 destroying the quarantine history that might have shown it. The imager has been restored from
 the rick-pve staging copy and re-verified. Lesson: do not clear AV state before reading it.
+
+## B6 - MAX_PATH exceeded (CLOSED 2026-07-28)
+
+**Setup.** `LongPathsEnabled=0` (the Windows default) on range-WS02, PS 5.1, and a 229-character
+`-Dest`. Condition gated: a plain write at collector-like depth (287 chars) must be **refused**
+before the scenario is scored, otherwise long paths are permitted here and B6 cannot be provoked.
+
+**What the collector did (the defect).** Every directory creation failed on MAX_PATH. Not one
+byte was written. `audit.log` itself was unwritable, so the run could not even record why it
+failed. And it printed:
+
+```
+Collection complete. Output: C:\b6\deep_case_folder_segment_abcdef\...\B6_WS02_20260728_184400Z
+```
+
+naming a directory that did not exist. This is the most misleading thing the tool has done: the
+operator walks away believing they have a bundle. Free space was fine — the preflight only ever
+asked about **space**, never about whether the destination could hold the collector's own paths.
+
+**Fixes.**
+1. `Resolve-UsableOutDir` probes the destination at the depth actually used
+   (`05_artifacts\userhives\<user>\NTUSER.DAT`) before anything depends on it. A shallow probe
+   would sail under MAX_PATH and hand back a "healthy" destination that dies mid-run, so the
+   probe depth is itself asserted in the unit test.
+2. An unusable destination is **refused with exit 40** and an actionable message naming the
+   limit and the actual length, instead of starting a run that cannot record its own failure.
+3. The closing line is now a statement about the tree on disk, not about reaching the end of the
+   script: zero files prints `COLLECTION PRODUCED NO EVIDENCE`, and a partial run says
+   `Collection INCOMPLETE (n files)`.
+4. Evidence writes use `-LiteralPath`, never `-Path`. `-Path` treats its argument as a **wildcard
+   pattern**, so any evidence path containing `[ ] ? *` — which a username or filename
+   legitimately can — silently resolves to nothing and the write is lost.
+
+**Rejected on evidence: adopting `\?\` for the output tree.** It was implemented and measured.
+The probe passes and directories get created, but every drive-qualifier operation downstream
+(free-space checks, `Split-Path -Qualifier`, `DriveInfo`) returns null for such a path — free
+space read `0.0 GB`, Stage 1 aborted on a null reference, the seal failed, and the run exited
+**0** having produced an **empty bundle**. A destination that probes healthy and yields no
+evidence is strictly worse than one that is refused. Full extended-length support means auditing
+every path-derived operation in the script; until that is done, the collector refuses honestly.
+`Resolve-UsableOutDir` therefore returns only `plain` or `unusable`, and the unit test asserts
+`extended` is never handed back.
+
+**Result.** 229-char dest → exit 40, refusal naming the limit and the length, nothing left
+behind. Normal dest → exit 0, COMPLETE, 49 files. Three mutations of the new probe caught in
+both directions.

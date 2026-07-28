@@ -249,6 +249,89 @@ if ($NetworkDest -or $HttpDest) {
 $OutDir = Join-Path $OutputRoot ("{0}_{1}_{2}" -f $CaseId, $hostName, $stamp)
 if ($Resume) { $OutDir = $Resume }
 
+function ConvertTo-ExtendedPath {
+    <#  Rewrite a path into its extended-length form so the Win32 file APIs stop enforcing
+        MAX_PATH (260). Local paths take \\?\, UNC paths take \\?\UNC\, and an already-extended
+        path is returned untouched.
+
+        A RELATIVE path is first resolved against the current directory by GetFullPath and then
+        prefixed - the extended form requires a fully-qualified path, so anchoring it is the only
+        way to produce a usable one, and it matches how every other PowerShell path operation
+        treats a relative input. Anything GetFullPath cannot anchor comes back unchanged. #>
+    param([string]$Path)
+    if (-not $Path -or $Path.StartsWith('\\?\')) { return $Path }
+    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $Path }
+    if ($full.StartsWith('\\')) { return '\\?\UNC\' + $full.Substring(2) }
+    if ($full -match '^[A-Za-z]:\\')  { return '\\?\' + $full }
+    return $Path
+}
+
+function Resolve-UsableOutDir {
+    <#  Prove the destination can hold the paths this collector actually writes, BEFORE anything
+        depends on it - and repair it if it cannot.
+
+        Free space is not the only way a destination can be unusable. Measured on range-WS02
+        2026-07-28 (scenario B6) with a 229-char -Dest and LongPathsEnabled=0: every directory
+        creation failed on MAX_PATH, not one byte was written, audit.log itself was unwritable so
+        even the failure could not be recorded - and the collector still printed
+        "Collection complete. Output: <path>" naming a directory that did not exist.
+
+        The deepest thing the tree holds is a per-user hive
+        (05_artifacts\userhives\<user>\NTUSER.DAT), so that is what gets probed. If the plain
+        path is refused, the extended-length (\\?\) form is tried, which genuinely lifts the
+        260-char limit for the Win32 file APIs. Only if BOTH fail is the destination unusable.
+
+        Returns .Path (what to use), .Mode (plain | extended | unusable) and .ProbeLength. #>
+    param([string]$Base)
+    $rel   = Join-Path (Join-Path (Join-Path '05_artifacts' 'userhives') 'a_reasonably_long_username') 'NTUSER.DAT'
+    $probeLen = ($Base.Length + 1 + $rel.Length)
+    # ONLY the plain form is offered as a working destination. Adopting the extended-length
+    # (\\?\) form for the whole output tree was tried and MEASURED on range-WS02 2026-07-28: the
+    # probe passes and the directories get created, but the drive-qualifier logic downstream
+    # (free-space checks, Split-Path -Qualifier, DriveInfo) all return null for a \\?\ path, so
+    # free space read 0.0 GB, Stage 1 aborted on a null reference, the seal failed, and the run
+    # exited 0 having written an EMPTY bundle. A destination that "works" in the probe but
+    # produces no evidence is worse than one that is refused. Full extended-length support means
+    # auditing every path-derived operation in this script; until that is done, refuse honestly.
+    foreach ($mode in @('plain')) {
+        # [IO.Path]::Combine, not Join-Path: Join-Path validates the PSDrive and THROWS for a
+        # destination on a drive that does not exist ("Cannot find drive 'Q'"). A probe whose job
+        # is to decide whether a destination is usable must never itself die on an unusable one.
+        $b = try { if ($mode -eq 'plain') { $Base } else { ConvertTo-ExtendedPath $Base } } catch { $null }
+        if (-not $b) { continue }
+        if ($mode -eq 'extended' -and $b -eq $Base) { continue }   # nothing new to try
+        $probe = [IO.Path]::Combine($b, $rel)
+        try {
+            $null = New-Item -ItemType Directory -Force (Split-Path $probe -Parent) -ErrorAction Stop
+            [IO.File]::WriteAllText($probe, 'probe')
+            if (-not (Test-Path -LiteralPath $probe)) { throw 'probe file did not materialise' }
+            # leave nothing behind: remove the probe file and the scaffold it needed
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            try { Remove-Item -LiteralPath ([IO.Path]::Combine($b,'05_artifacts')) -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+            return [pscustomobject]@{ Path = $b; Mode = $mode; ProbeLength = $probeLen }
+        } catch {
+            try { Remove-Item -LiteralPath ([IO.Path]::Combine($b,'05_artifacts')) -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+    return [pscustomobject]@{ Path = $Base; Mode = 'unusable'; ProbeLength = $probeLen }
+}
+
+# Resume paths are the operator's own and already exist - do not rewrite them out from under a
+# partially collected tree.
+if (-not $Resume) {
+    $script:DestProbe = Resolve-UsableOutDir $OutDir
+    if ($script:DestProbe.Mode -eq 'unusable') {
+        Write-Host ''
+        Write-Host "  !! Destination cannot hold this collection's paths." -ForegroundColor Red
+        Write-Host ("  !! The deepest artifact path would be ~{0} characters and the filesystem refused it," -f $script:DestProbe.ProbeLength) -ForegroundColor Red
+        Write-Host ("  !! MAX_PATH here is 260 characters and this destination is {0}." -f $Dest.Length) -ForegroundColor Red
+        Write-Host '  !! Refusing to start: a run that cannot create its own tree cannot record why it failed.' -ForegroundColor Red
+        Write-Host '  !! Use a shorter -Dest (a drive root or a short folder is ideal).' -ForegroundColor Yellow
+        Write-Host ''
+        exit 40
+    }
+}
+
 $Dirs = [ordered]@{
     root        = $OutDir
     metadata    = Join-Path $OutDir '00_metadata'
@@ -271,7 +354,12 @@ try { if (-not (Test-Path $script:StateJsonl)) { New-Item -ItemType File -Path $
 function Write-Audit {
     param([string]$Message)
     $line = "{0} | {1} | {2}" -f (Now-Utc), $env:USERNAME, $Message
-    try { Add-Content -Path $AuditLog -Value $line -Encoding UTF8 } catch {}
+    # -LiteralPath, never -Path: -Path treats its argument as a WILDCARD pattern. An
+    # extended-length destination begins \?\ and the '?' is a single-character wildcard, so the
+    # audit log silently resolved to nothing and every custody line was lost - the run wrote no
+    # files at all while reporting success (scenario B6, 2026-07-28). The same trap applies to any
+    # evidence path containing [ ] ? or *, which a username or filename legitimately can.
+    try { Add-Content -LiteralPath $AuditLog -Value $line -Encoding UTF8 } catch {}
     Write-Host $line
 }
 
@@ -284,7 +372,7 @@ function Write-Ledger { param([string]$Id,[string]$Name,[string]$Phase,[string]$
     if (-not $script:StateJsonl) { return }
     $o = [ordered]@{ t=(Now-Utc); id=$Id; name=$Name; phase=$Phase; ev=$Ev }
     if ($Extra) { foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] } }
-    try { Add-Content -Path $script:StateJsonl -Value ($o | ConvertTo-Json -Compress -Depth 4) -Encoding UTF8 } catch {}
+    try { Add-Content -LiteralPath $script:StateJsonl -Value ($o | ConvertTo-Json -Compress -Depth 4) -Encoding UTF8 } catch {}
 }
 # Test-DestHasSpace: can we still WRITE to the evidence tree? Text matching alone misses a full
 # destination whenever the message is localized, wrapped by a provider, or absent entirely - and a
@@ -431,18 +519,6 @@ $script:FixLadders = @{
 $script:RemRung   = @{}   # (id|class) -> how many rungs already tried
 $script:TmoBoost  = @{}   # step id -> timeout multiplier granted by extend-timeout
 $script:LongPathIds = @{} # step id -> use an extended-length (\\?\) destination, granted by shortpath-retry
-function ConvertTo-ExtendedPath {
-    <#  Rewrite an absolute path into its extended-length form so the Win32 file APIs stop
-        enforcing MAX_PATH (260). Local paths take \\?\, UNC paths take \\?\UNC\. A path that is
-        already extended, or is relative (nothing to anchor), is returned untouched - prefixing
-        a relative path produces something the APIs reject outright. #>
-    param([string]$Path)
-    if (-not $Path -or $Path.StartsWith('\\?\')) { return $Path }
-    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $Path }
-    if ($full.StartsWith('\\')) { return '\\?\UNC\' + $full.Substring(2) }
-    if ($full -match '^[A-Za-z]:\\')  { return '\\?\' + $full }
-    return $Path
-}
 
 # Invoke-FixRung: perform one rung. Returns $true if the run should retry the step afterwards.
 # Each rung reports what it ACTUALLY achieved; a rung that could not act says so rather than
@@ -732,7 +808,7 @@ function Invoke-Step {
                     Write-Audit "STEP $id WARN | $Name | error-only (class=$cls) | try $attempt"
                     if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
                     Write-Ledger $id $Name $phase 'failed' @{ rc='error'; error_class=$cls; error_msg=$errText.Substring(0,[Math]::Min(200,$errText.Length)) }
-                    Add-Content $ErrLog "$(Now-Utc) [$id] $Name : $errText"; $script:StepsFail++; return $out
+                    Add-Content -LiteralPath $ErrLog -Value "$(Now-Utc) [$id] $Name : $errText"; $script:StepsFail++; return $out
                 }
                 $bytes = if ($target -and (Test-Path $target)) { (Get-Item $target).Length } else { 0 }
                 $lines = if ($out) { @($out).Count } else { 0 }
@@ -765,7 +841,7 @@ function Invoke-Step {
                 Write-Audit "STEP $id WARN | $Name | TIMEOUT ${TimeoutSec}s | try $attempt"
                 if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
                 Write-Ledger $id $Name $phase 'timeout' @{ rc='timeout'; error_class=$cls; attempts=$attempt; error_msg="exceeded ${TimeoutSec}s timeout" }
-                Add-Content $ErrLog "$(Now-Utc) [$id] $Name : timeout ${TimeoutSec}s"; $script:StepsFail++; return $null
+                Add-Content -LiteralPath $ErrLog -Value "$(Now-Utc) [$id] $Name : timeout ${TimeoutSec}s"; $script:StepsFail++; return $null
             }
         } catch {
             if ($job) { try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {} }
@@ -773,7 +849,7 @@ function Invoke-Step {
             Write-Audit "STEP $id ERR  | $Name | $emsg | try $attempt (class=$cls)"
             if (Invoke-Remediation $cls $Name $id $phase $attempt) { Start-Sleep -Milliseconds (Get-Backoff $cls $attempt); continue }
             Write-Ledger $id $Name $phase 'failed' @{ rc='exception'; error_class=$cls; error_msg=$emsg.Substring(0,[Math]::Min(200,$emsg.Length)) }
-            Add-Content $ErrLog "$(Now-Utc) [$id] $Name : $($_.Exception|Out-String)"; $script:StepsFail++; return $null
+            Add-Content -LiteralPath $ErrLog -Value "$(Now-Utc) [$id] $Name : $($_.Exception|Out-String)"; $script:StepsFail++; return $null
         }
     }
     Write-Ledger $id $Name $phase 'failed' @{ rc='exhausted'; error_class=$cls; attempts=$attempt }
@@ -945,7 +1021,7 @@ if ($Lab) { Write-Host "=== LAB / TRAINING MODE (hypervisor=$script:Hypervisor) 
 
 # --- destination preflight: write-test + FAT32 4GB cap -----------------------
 try {
-    $tf = Join-Path $OutputRoot ('.irwrite_' + $stamp); Set-Content $tf 'x' -ErrorAction Stop; Remove-Item $tf -Force -ErrorAction SilentlyContinue
+    $tf = Join-Path $OutputRoot ('.irwrite_' + $stamp); Set-Content -LiteralPath $tf -Value 'x' -ErrorAction Stop; Remove-Item -LiteralPath $tf -Force -ErrorAction SilentlyContinue
 } catch { Write-Audit "PREFLIGHT: destination NOT writable - $($_.Exception.Message)"; Write-Host "!!! DESTINATION NOT WRITABLE: $OutputRoot - fix the drive/path; this collection may capture nothing !!!" -ForegroundColor Red }
 try {
     $destRoot = [System.IO.Path]::GetPathRoot((Resolve-Path $OutputRoot).Path)
@@ -1947,8 +2023,24 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
         Write-Audit "LAB host-pull hint ($script:Hypervisor): $hint"
     }
     Write-Audit "===== IR-Collect DONE | OK=$script:StepsOk FAIL=$script:StepsFail TOTAL=$script:StepNum ====="
-    Write-Host ""; Write-Host "Collection complete. Output: $OutDir" -ForegroundColor Green
-    Write-Host "Summary: $(Join-Path $OutDir 'SUMMARY.md')  |  Audit: $AuditLog"
+    # Never announce a completed collection without confirming the evidence is actually THERE.
+    # With a 229-char -Dest (scenario B6) every write failed on MAX_PATH and the run still printed
+    # "Collection complete. Output: <path>" for a directory that did not exist - the single most
+    # misleading thing this tool has done, because the operator walks away believing they have a
+    # bundle. The closing line is now a statement about the tree on disk, not about reaching the
+    # end of the script.
+    $bundleFiles = @(Get-ChildItem -LiteralPath $OutDir -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+    Write-Host ""
+    if ($bundleFiles -eq 0) {
+        Write-Host "COLLECTION PRODUCED NO EVIDENCE. Nothing was written to: $OutDir" -ForegroundColor Red
+        Write-Host "The destination could not be written to. Re-run with a shorter -Dest on writable media." -ForegroundColor Yellow
+        try { Write-Audit "FINAL: no files present under $OutDir - reporting failure, not completion." } catch {}
+    } else {
+        $verdictWord = if ($script:RunIncomplete) { 'Collection INCOMPLETE' } else { 'Collection complete' }
+        $colour      = if ($script:RunIncomplete) { 'Yellow' } else { 'Green' }
+        Write-Host "$verdictWord ($bundleFiles files). Output: $OutDir" -ForegroundColor $colour
+        Write-Host "Summary: $(Join-Path $OutDir 'SUMMARY.md')  |  Audit: $AuditLog"
+    }
 }
 
 # ---------------------------------------------------------------------------
