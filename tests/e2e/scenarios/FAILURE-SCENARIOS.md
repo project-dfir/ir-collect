@@ -303,3 +303,26 @@ automating it could tell the evidence never arrived.
 **Result.** Warned at **0.3 s** instead of 197 s; exit **10**; `ship.json` carries
 `ok=false, error="Access is denied"`; manifest still 45 rows / 0 ERR, so the seal is untouched.
 A local destination still exits 0 with `attempted=false`.
+
+
+## Linux ship parity (2026-07-28)
+
+B5 gave the Windows collector three things the shell twin lacked: a preflight probe of the ship
+target, a machine-readable ship result, and a non-zero exit when the evidence never arrived.
+Parity across the two collectors is a standing requirement, so the shell side now has all three.
+
+- `test_network_dest` probes over ssh: `mkdir -p`, write a byte, **read it back**, remove it.
+  Bounded with `timeout 20`, because an unreachable host is slow to fail. It warns and continues
+  - the bundle is staged locally and is not at risk, so aborting would destroy volatile data over
+  a routing or credential problem.
+- `<bundle>.tar.gz.ship.json` is written beside the bundle (never inside it - the archive is
+  already hashed) with `ok`, `preflight_ok`, `preflight_reason` and the local copy's path.
+- Exit signalling already worked by accident: rsync/scp run through `run_step`, so a failure
+  raises `STEPS_FAIL` and the run exits 10.
+
+**A false negative found by the positive control.** The first probe merged stderr into stdout, so
+ssh's "Warning: Permanently added ... to the list of known hosts" made the readback `!= "x"` and a
+destination that was **perfectly writable** was reported unwritable - while the ship then
+succeeded and the bundle arrived. stderr now goes to its own file and is used only for the reason
+string. Both controls are asserted every time: a working target must produce **zero** warnings and
+`preflight_ok: true`; an unreachable one exactly one warning and the real reason.

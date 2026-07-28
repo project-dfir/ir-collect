@@ -220,6 +220,49 @@ if [ -n "$NETWORK_DEST" ] || [ -n "$HTTP_DEST" ]; then
     echo "!!! CONTAMINATION WARNING: cannot stage on the collection media - staging on the TARGET disk ($OUT_ROOT)."
     echo "    Attach writable removable media and re-run if at all possible. !!!"
   elif [ "${LAB:-0}" = "1" ]; then echo "Lab mode: staging at $OUT_ROOT; ships/POSTs at seal."; fi
+
+# Prove the ship target is reachable and writable NOW, not at seal time. Parity with the Windows
+# twin's Test-NetworkDestination: measured there, an operator pointed at a destination they could
+# not write to ran the ENTIRE collection before finding out.
+#
+# WARN, never refuse: the bundle is staged locally and is not at risk, so aborting would destroy
+# volatile data over a credential or routing problem. Bounded, because an unreachable host is slow
+# to fail and waiting longer than the operator would tolerate defeats the point of probing early.
+NET_PROBE_OK=""; NET_PROBE_REASON=""
+test_network_dest() {
+  local dest="$1" host="${1%%:*}" path="${1#*:}" out=""
+  [ -n "$dest" ] || return 0
+  command -v ssh >/dev/null 2>&1 || { NET_PROBE_REASON="no ssh client to probe with"; return 1; }
+  # stderr goes to its OWN file, never merged into the value being compared: ssh emits
+  # "Warning: Permanently added ... to the list of known hosts" on first contact, and folding that
+  # into stdout made the readback != "x" for a destination that was perfectly writable. Measured
+  # 2026-07-28: a ship that SUCCEEDED was reported unwritable at preflight.
+  local errf; errf="$(mktemp 2>/dev/null || echo /tmp/.irprobe.err.$$)"
+  out="$(timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new          "$host" "mkdir -p '$path' && t=\"$path/.irprobe.\$\$\" && printf x > \"\$t\" && cat \"\$t\" && rm -f \"\$t\"" 2>"$errf")"
+  local rc=$?
+  if [ $rc -eq 124 ]; then rm -f "$errf"; NET_PROBE_REASON="no response within 20s (host unreachable or ssh hung)"; return 1; fi
+  # verify the byte came BACK - an exit status alone does not prove the write landed
+  if [ "$out" = "x" ]; then rm -f "$errf"; return 0; fi
+  NET_PROBE_REASON="$(head -1 "$errf" 2>/dev/null | cut -c1-160)"
+  rm -f "$errf"
+  [ -n "$NET_PROBE_REASON" ] || NET_PROBE_REASON="probe wrote no readable byte back (rc=$rc)"
+  return 1
+}
+if [ -n "$NETWORK_DEST" ]; then
+  if test_network_dest "$NETWORK_DEST"; then
+    NET_PROBE_OK=1
+    audit "PREFLIGHT ship target: $NETWORK_DEST is writable."
+  else
+    NET_PROBE_OK=0
+    audit "PREFLIGHT SHIP TARGET UNWRITABLE: $NETWORK_DEST - $NET_PROBE_REASON. Collection CONTINUES and the bundle will be retained locally; fix access now if you want it shipped."
+    echo ""
+    echo "  !! Ship target $NETWORK_DEST is NOT writable: $NET_PROBE_REASON"
+    echo "  !! Collecting anyway - evidence is staged locally and will be retained there."
+    echo "  !! Fix access now and the seal-time ship will succeed."
+    echo ""
+  fi
+fi
+
 else
   OUT_ROOT="$DEST"
   # read-only-media / non-writable target: redirect to a writable evidence location so we can run at all
@@ -1268,6 +1311,7 @@ MREOF
     local zip="$OUTDIR.tar.gz"
     run_sh seal-tar - "$D_LOG" 3600 0 "tar czf '$zip' -C '$OUT_ROOT' '$(basename "$OUTDIR")' && irhash '$zip' > '$zip.sha256'"
     if [ -n "$NETWORK_DEST" ]; then
+      local _fail_before_ship="${STEPS_FAIL:-0}"
       local SSHOPT="-o StrictHostKeyChecking=accept-new"
       [ -n "$IR_SSH_KNOWN_HOSTS" ] && SSHOPT="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$IR_SSH_KNOWN_HOSTS"
       if command -v rsync >/dev/null 2>&1; then
@@ -1275,6 +1319,39 @@ MREOF
       elif command -v scp >/dev/null 2>&1; then
         run_step ship-scp - "$D_LOG" 3600 0 scp $SSHOPT "$zip" "$zip.sha256" "$NETWORK_DEST/"
       else audit "No rsync/scp - evidence kept locally at $zip"; fi
+      # Record whether the evidence actually ARRIVED, beside the bundle and never inside it: the
+      # bundle is already sealed and hashed, and an evidence container that changes after its
+      # manifest is worthless. Parity with the Windows twin's <bundle>.ship.json.
+      # STEPS_FAIL rising across the ship step is the signal - a run_step failure is how rsync/scp
+      # report here, and it is what drives the exit code.
+      _ship_ok=0
+      [ "${STEPS_FAIL:-0}" = "${_fail_before_ship:-0}" ] && _ship_ok=1
+      {
+        printf '{
+'
+        printf '  "schema": "ir-collect/ship-result@1",
+'
+        printf '  "case": "%s",
+' "$CASE_RAW_J"
+        printf '  "bundle": "%s",
+' "$(basename "$zip")"
+        printf '  "target": "%s",
+' "$NETWORK_DEST"
+        printf '  "ok": %s,
+' "$( [ "$_ship_ok" = 1 ] && echo true || echo false )"
+        printf '  "preflight_ok": %s,
+' "$( [ "${NET_PROBE_OK:-}" = 1 ] && echo true || [ "${NET_PROBE_OK:-}" = 0 ] && echo false || echo null )"
+        printf '  "preflight_reason": "%s",
+' "$NET_PROBE_REASON"
+        printf '  "local_copy": "%s",
+' "$zip"
+        printf '  "utc": "%s"
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '}
+'
+      } > "$zip.ship.json" 2>/dev/null
+      audit "Ship result recorded: $zip.ship.json (ok=$_ship_ok)"
+      [ "$_ship_ok" = 1 ] || echo "  Network ship failed - evidence kept locally: $zip (the COLLECTION is intact; only the transfer failed)"
     fi
     if [ -n "$HTTP_DEST" ] && [ -f "$zip" ]; then
       local url="$HTTP_DEST"; case "$HTTP_DEST" in */) url="$HTTP_DEST$(basename "$zip")";; esac
