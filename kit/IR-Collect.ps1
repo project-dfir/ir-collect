@@ -708,6 +708,14 @@ if ($freeNow -ge 0 -and $freeNow -lt $minFree) {
     Write-Host '  !! Point -Dest at larger media, or free space and re-run.' -ForegroundColor Yellow
     Write-Host ''
     try { Write-Audit "PREFLIGHT REFUSED: $msg" } catch {}
+    # Do not leave the empty output tree behind. Refusing while a case folder sits on the target
+    # reads as "it collected something" - remove it so the refusal is unambiguous. Only ever
+    # removes a directory this run just created and never wrote evidence into.
+    try {
+        $leftovers = @(Get-ChildItem $OutDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -notin 'audit.log','errors.log' })
+        if ($leftovers.Count -eq 0) { Remove-Item $OutDir -Recurse -Force -ErrorAction SilentlyContinue }
+    } catch {}
     exit 40
 }
 Write-Audit ("PREFLIGHT destination: {0:N1} GB free" -f ($freeNow/1GB))
