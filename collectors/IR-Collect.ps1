@@ -1207,8 +1207,15 @@ Write-Audit "PREFLIGHT: privilege=$(if($isAdmin){'full'}else{'PARTIAL - not elev
 # unknown is not the same as unreachable, and the verdict text says which.
 $script:DomainReachable = $null
 if ($domainJoined) {
-    $dcHost = $env:LOGONSERVER -replace '^\\',''
-    if (-not $dcHost) { $dcHost = $env:USERDNSDOMAIN }
+    # Win32_ComputerSystem.Domain FIRST. LOGONSERVER and USERDNSDOMAIN are empty for SYSTEM and,
+    # measured on range-WS02 2026-07-29, empty for an interactive admin over SSH too - so a probe
+    # keyed on them silently never ran and the verdict could only ever say "reachability unknown".
+    # The CIM value is populated in both contexts. Env vars remain as a fallback for hosts where
+    # CIM is broken (scenario E1).
+    $dcHost = $null
+    try { $cs = Get-Inv Win32_ComputerSystem; if ($cs -and $cs.Domain -and $cs.Domain -ne $cs.Workgroup) { $dcHost = "$($cs.Domain)".Trim() } } catch {}
+    if (-not $dcHost) { $dcHost = "$env:LOGONSERVER".TrimStart([char]92) }
+    if (-not $dcHost) { $dcHost = "$env:USERDNSDOMAIN" }
     if ($dcHost) {
         $script:DomainReachable = try {
             $c = New-Object Net.Sockets.TcpClient

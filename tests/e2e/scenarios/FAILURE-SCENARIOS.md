@@ -735,3 +735,39 @@ iteration: a verdict change needs its own live `-Auto` run to verify, and that i
 
 **Range restored:** E3B bundle removed, `IRTEST-BlockDC*` rules 0, DC 445 reachable, E3Run and
 IRWatchdog tasks deleted, C:\evidence back to 3 directories.
+
+### E3 fix - verdict mechanism PROVEN, cause attribution was not (2026-07-29)
+
+**Negative control, live under a blocked DC:**
+
+```
+E3NEG verdict=INCOMPLETE ok=85 failed=0  emptyAD=13
+E3NEG incomplete=domain-evidence-missing(reachability unknown; 13 AD step(s) empty:
+  ad-admincount/ad-asrep/ad-computers/ad-cons/ad-domain/ad-groups/ad-laps/
+  ad-rbcd/ad-spn/ad-this-host/ad-trusts-ldap/ad-uncons/ad-users)
+```
+
+The defect is fixed: the same run that previously sealed COMPLETE now seals **INCOMPLETE** and
+names all thirteen missing AD steps. An analyst can no longer be handed a COMPLETE bundle from a
+domain-joined host with no domain data in it.
+
+**But it fired through the wrong branch.** The note says *"reachability unknown"*, not *"domain
+controller unreachable"* - `$script:DomainReachable` was `$null`, so the LDAP probe never ran. The
+probe keyed on `$env:LOGONSERVER` / `$env:USERDNSDOMAIN`, and measurement showed both are empty
+**for SYSTEM and for an interactive administrator over SSH**. In this environment that probe could
+essentially never run, so the verdict could only ever reach the "unknown" wording.
+
+**The three-state design is the reason this was safe.** Had `DomainReachable` been a plain boolean,
+an unrun probe would have defaulted to `$false` and the bundle would have asserted a cause nobody
+established - "domain controller unreachable" on evidence that only showed AD returned nothing.
+Instead it surfaced the gap and labelled its own uncertainty honestly. That is the
+"never state a cause the code has not established" rule doing real work rather than sitting in a
+comment.
+
+**Fix.** The probe now derives the domain from `Win32_ComputerSystem.Domain` (populated in both
+contexts, `lab.local` on this host), keeping the environment variables as a fallback for hosts
+where CIM is broken (scenario E1).
+
+**Outstanding:** the positive control (DC reachable - the same steps must NOT force INCOMPLETE) was
+still running when this was recorded, and the negative control must be re-run with the corrected
+probe to confirm the note reads *"domain controller unreachable"*. Neither is claimed.
