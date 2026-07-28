@@ -1296,6 +1296,118 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     try { Add-Content -Path (Join-Path $OutDir 'SUMMARY.md') -Value $comp -Encoding UTF8 } catch {}
     $script:RunIncomplete = ($verdict -eq 'INCOMPLETE')
     Write-Audit "COMPLETENESS $verdict | ok=$nok fail=$nfail timeout=$ntmo skip=$nskip planned=$nplan"
+
+    # --- DIAGNOSTIC-REPORT.md: the one file to hand to whoever fixes the tool -------------------
+    # run_state.json is machine-readable and SUMMARY.md is about the EVIDENCE; neither is a
+    # troubleshooting artifact. This is: what the host looked like, which execution paths were
+    # taken, exactly what failed and how the self-heal responded, and how to reproduce it.
+    #
+    # SAFE TO SHARE BY CONSTRUCTION: metadata only. No collected evidence, no file contents, no
+    # key material, no IOC values - so it can be sent to a tool maintainer without a data-handling
+    # review. Anything that could carry case data is deliberately reduced to a count or a path.
+    try {
+        $failRows = @()
+        if (Test-Path $rsj) {
+            foreach ($ln in [IO.File]::ReadAllLines($rsj)) {
+                if ($ln -match '"ev":"(failed|timeout)"') {
+                    try { $o = $ln | ConvertFrom-Json
+                          $failRows += [pscustomobject]@{ id=$o.id; name=$o.name; phase=$o.phase; ev=$o.ev
+                                                          cls=$o.error_class; att=$o.attempts; msg=$o.error_msg } } catch {}
+                }
+            }
+        }
+        $remRows = @()
+        if (Test-Path $rsj) {
+            foreach ($ln in [IO.File]::ReadAllLines($rsj)) {
+                if ($ln -match '"ev":"remediation"') {
+                    try { $o = $ln | ConvertFrom-Json
+                          $remRows += [pscustomobject]@{ id=$o.id; name=$o.name; cls=$o.class; action=$o.action; result=$o.result } } catch {}
+                }
+            }
+        }
+        $destInfo = try {
+            $d = Get-Item $OutDir -ErrorAction Stop
+            $drv = Get-PSDrive -Name ($d.PSDrive.Name) -ErrorAction SilentlyContinue
+            "$OutDir  (free: $([math]::Round(($drv.Free/1GB),1)) GB)"
+        } catch { "$OutDir  (could not stat)" }
+
+        $rep = New-Object Text.StringBuilder
+        [void]$rep.AppendLine("# IR-Collect diagnostic report")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("Hand this file to whoever maintains the tool. It is **metadata only** - no collected")
+        [void]$rep.AppendLine("evidence, no file contents, no key material - so it is safe to send as-is.")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## Verdict")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("| | |")
+        [void]$rep.AppendLine("|---|---|")
+        [void]$rep.AppendLine("| verdict | ``$verdict`` |")
+        [void]$rep.AppendLine("| steps | ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip planned=$nplan |")
+        [void]$rep.AppendLine("| incomplete | $(if($incomplete.Count){($incomplete -join ', ')}else{'(nothing)'}) |")
+        [void]$rep.AppendLine("| memory verified | $([bool]$script:MemOk) ($($script:MemFailCode)) |")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## Host and execution environment")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("| | |")
+        [void]$rep.AppendLine("|---|---|")
+        [void]$rep.AppendLine("| host / role | $hostName / $(if($HostRole){$HostRole}else{'(unset)'}) |")
+        [void]$rep.AppendLine("| OS | $((Get-Inv Win32_OperatingSystem).Caption) build $([Environment]::OSVersion.Version) |")
+        [void]$rep.AppendLine("| PowerShell | $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)), 64-bit process: $([Environment]::Is64BitProcess) |")
+        [void]$rep.AppendLine("| language mode | ``$script:LangMode`` |")
+        [void]$rep.AppendLine("| elevated | $isAdmin |")
+        [void]$rep.AppendLine("| exec mode | $(if($script:JobsOk){'background-job'}else{'in-process (self-heal fallback)'}) |")
+        [void]$rep.AppendLine("| hash backend | ``$script:HashBackend`` |")
+        [void]$rep.AppendLine("| destination | $destInfo |")
+        [void]$rep.AppendLine("| tools detected | $(if($info.toolsDetected){$info.toolsDetected}else{'native only'}) |")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## What failed")
+        [void]$rep.AppendLine("")
+        if ($failRows.Count -eq 0) {
+            [void]$rep.AppendLine("No step failed or timed out.")
+        } else {
+            [void]$rep.AppendLine("| step | name | phase | outcome | class | message |")
+            [void]$rep.AppendLine("|---|---|---|---|---|---|")
+            foreach ($f in $failRows) {
+                $m = "$($f.msg)" -replace '\|','\|'
+                if ($m.Length -gt 120) { $m = $m.Substring(0,120) + '...' }
+                [void]$rep.AppendLine("| $($f.id) | $($f.name) | $($f.phase) | $($f.ev) | ``$($f.cls)`` | $m |")
+            }
+        }
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## What the self-heal did about it")
+        [void]$rep.AppendLine("")
+        if ($remRows.Count -eq 0) { [void]$rep.AppendLine("No remediation fired.") }
+        else {
+            [void]$rep.AppendLine("| step | name | class | action | result |")
+            [void]$rep.AppendLine("|---|---|---|---|---|")
+            foreach ($r in $remRows) { [void]$rep.AppendLine("| $($r.id) | $($r.name) | ``$($r.cls)`` | $($r.action) | $($r.result) |") }
+        }
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## Reproducing this")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine('```powershell')
+        [void]$rep.AppendLine(".\kit\IR-Collect.ps1 -CaseId '$CaseId'$(if($Scenario){" -Scenario $Scenario"})$(if($HostRole){" -HostRole $HostRole"})$(if($RapidOnly){' -RapidOnly'})$(if($Auto){' -Auto'})")
+        [void]$rep.AppendLine('```')
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("Resume just the unsatisfied steps of THIS run:")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine('```powershell')
+        [void]$rep.AppendLine(".\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'")
+        [void]$rep.AppendLine('```')
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## Also send, if you can")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("- ``99_logs/run_state.json`` - machine-readable rollup (metadata only, safe)")
+        [void]$rep.AppendLine("- ``99_logs/run_state.jsonl`` - per-step ledger (metadata only, safe)")
+        [void]$rep.AppendLine("- ``99_logs/audit.log`` - full command trail. **Review before sending**: it records")
+        [void]$rep.AppendLine("  the commands run and the paths touched on the subject host.")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("Do NOT send ``00_metadata/`` (contains volume encryption keys) or any collected artifact.")
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("_Generated $endUtc by IR-Collect._")
+        [IO.File]::WriteAllText((Join-Path $L 'DIAGNOSTIC-REPORT.md'), $rep.ToString(), (New-Object Text.UTF8Encoding($false)))
+        Write-Audit "Diagnostic report written: 99_logs\DIAGNOSTIC-REPORT.md (metadata only, safe to share)"
+    } catch { Write-Audit "Diagnostic report generation failed: $($_.Exception.Message)" }
     # Document the manifest's own gaps INSIDE the bundle. Four files cannot be in
     # MANIFEST-SHA256.csv (it is being written, or they are produced after it), and a verifier
     # who finds unlisted files has no way to tell "deliberately excluded" from "tampered".
