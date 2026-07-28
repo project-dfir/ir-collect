@@ -39,7 +39,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 
 | # | Scenario | Reproduce | Correct behaviour | Status |
 |---|---|---|---|---|
-| C1 | **Killed mid-run** — EDR live-response harnesses commonly cap child tools at ~30 min | `Stop-Process -Force` / `kill -9` during Stage 2 | Always-seal wrapper produces a usable partial bundle; `-Resume` picks up the rest | ⬜ **high value** — the wrapper and signal traps have never been tested against a hard kill |
+| C1 | **Killed mid-run** — EDR live-response harnesses commonly cap child tools at ~30 min | `Stop-Process -Force` / `kill -9` **during Stage 2** — must be a job that actually runs long enough | Always-seal wrapper produces a usable partial bundle; `-Resume` picks up the rest | ⬜ **attempted 2026-07-28, TEST INVALID** — RapidOnly with no imager staged completes in <25s, so the kill landed after the run had already sealed. Re-run against `-Auto` (or with an imager staged) and kill during a heavy Stage-2 job. NOTE: a hard `Stop-Process -Force` does not run PowerShell `finally`, so the seal wrapper is expected NOT to fire — the real question is whether the append-only ledger lets `-Resume` recover |
 | C2 | **Host reboots mid-run** | `qm reset <vmid>` | Partial bundle is still parseable; resume works | ⬜ |
 | C3 | **Step hangs forever** | carried tool that `sleep`s past its bound | Watchdog kills the whole process group, `timeout` classified | ✅ |
 | C4 | **Console closed / no TTY** | run detached | Non-interactive fallback runs everything, no prompt deadlock | ⬜ |
