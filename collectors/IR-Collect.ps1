@@ -539,6 +539,31 @@ function Compare-ToolInventory {
 # is therefore tracked separately from empty output, and both bear on the verdict.
 $script:DegradedSteps = @()
 $script:DenialPattern = 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation'
+function Get-DomainEvidenceVerdict {
+    <#  Decide whether empty AD enumeration belongs in the completeness verdict.
+
+        Measured on range-WS02 2026-07-29 (scenario E3): with the DC firewalled off, FOURTEEN AD
+        steps produced no output, every one was recorded in diagnostics.empty_outputs, and the
+        bundle still sealed verdict=COMPLETE with an empty incomplete list. An analyst receives a
+        COMPLETE bundle from a DOMAIN-JOINED host containing no domain data and nothing saying the
+        domain was never reached.
+
+        The distinction that matters, and the reason this is not simply "add ad-* to
+        CriticalSteps": an AD query can be legitimately empty. A domain with no LAPS deployment,
+        no unconstrained delegation and no AS-REP-roastable accounts SHOULD return nothing, and
+        calling that INCOMPLETE would cry wolf on a healthy collection - the same over-trigger
+        A3's degraded-output check had to avoid.
+
+        So emptiness only counts against the verdict when the domain was UNREACHABLE. Pure, so it
+        is unit-testable without a domain. #>
+    param([bool]$DomainJoined, [System.Nullable[bool]]$DomainReachable, [string[]]$EmptyAdSteps)
+    if (-not $DomainJoined)            { return $null }   # nothing to enumerate
+    if (-not $EmptyAdSteps -or $EmptyAdSteps.Count -eq 0) { return $null }   # AD answered
+    if ($DomainReachable -eq $true)    { return $null }   # reachable and empty = genuinely empty
+    $why = if ($null -eq $DomainReachable) { 'reachability unknown' } else { 'domain controller unreachable' }
+    return ("domain-evidence-missing({0}; {1} AD step(s) empty: {2})" -f $why, $EmptyAdSteps.Count, (($EmptyAdSteps | Sort-Object) -join '/'))
+}
+
 function Test-DegradedOutput {
     <#  True when a step's output is dominated by an access refusal rather than by data.
         Two independent signals, either sufficient - a tiny file that mentions a denial, or a
@@ -1177,6 +1202,22 @@ try {
     } elseif ($vol) { Write-Audit "PREFLIGHT: destination filesystem = $($vol.FileSystem)" }
 } catch {}
 Write-Audit "PREFLIGHT: privilege=$(if($isAdmin){'full'}else{'PARTIAL - not elevated'}) langMode=$($ExecutionContext.SessionState.LanguageMode) 64bit=$([Environment]::Is64BitProcess)"
+# Probe the domain ONCE so the verdict can distinguish "AD returned nothing" from "AD was never
+# reachable". $null (not $false) when there is no domain to probe or the probe itself cannot run -
+# unknown is not the same as unreachable, and the verdict text says which.
+$script:DomainReachable = $null
+if ($domainJoined) {
+    $dcHost = $env:LOGONSERVER -replace '^\\',''
+    if (-not $dcHost) { $dcHost = $env:USERDNSDOMAIN }
+    if ($dcHost) {
+        $script:DomainReachable = try {
+            $c = New-Object Net.Sockets.TcpClient
+            $ok = $c.BeginConnect($dcHost, 389, $null, $null).AsyncWaitHandle.WaitOne(3000, $false)
+            if ($ok -and $c.Connected) { $c.Close(); $true } else { $c.Close(); $false }
+        } catch { $false }
+    }
+    Write-Audit "PREFLIGHT domain: joined=True host=$dcHost ldap389Reachable=$(if($null -eq $script:DomainReachable){'unknown'}else{$script:DomainReachable})"
+}
 # The redirect decision happens before the audit log exists, so it is buffered and flushed here -
 # same pattern the ship preflight needed, enforced by tests/unit/Test-AuditTrailOrder.ps1.
 if ($script:PendingRedirectNote) { Write-Audit $script:PendingRedirectNote }
@@ -1926,6 +1967,12 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     if ($script:ToolVanished.Count -or $script:ToolChanged.Count) {
         $incomplete += "toolkit-tampered($((@($script:ToolVanished) + @($script:ToolChanged)) -join '/'))"
     }
+    # AD enumeration that came back empty because the domain was unreachable is missing evidence,
+    # not an empty result set. See Get-DomainEvidenceVerdict for why this is not just more entries
+    # in CriticalSteps.
+    $emptyAd = @($script:EmptySteps | Where-Object { $_.name -like 'ad-*' } | ForEach-Object { $_.name } | Sort-Object -Unique)
+    $domNote = Get-DomainEvidenceVerdict -DomainJoined ([bool]$domainJoined) -DomainReachable $script:DomainReachable -EmptyAdSteps $emptyAd
+    if ($domNote) { $incomplete += $domNote; Write-Audit "VERDICT: $domNote" }
     $criticalEmpty = @($script:EmptySteps | Where-Object { $script:CriticalSteps -contains $_.name } | ForEach-Object { $_.name } | Sort-Object -Unique)
     if ($criticalEmpty.Count) { $incomplete += "core-volatile-empty($($criticalEmpty -join '/'))" }
     # output that is an access refusal rather than data is missing evidence, whatever its byte count
