@@ -663,3 +663,30 @@ not hang. Queued rather than claimed.
 **Found while checking:** the diagnostic report's resume hint still pointed at `.\kit\IR-Collect.ps1`
 in **three** places - a path that has not existed since the repo reorganised to `collectors/`. An
 analyst following the bundle's own instructions would have run nothing. Fixed.
+
+### E3 attempt 2 - VOID (2026-07-29)
+
+An `-Auto` run was launched under the same DC block so the AD section would actually be planned.
+It is **not scored**, for a reason that is entirely a harness error:
+
+`e3b.ps1` blocked the DC, launched the collector, and waited - but had **no teardown**. The
+orchestrating call timed out at ~10 minutes while the guest run continued (bounded at 25 min
+there), leaving firewall rules on a range VM with nothing scheduled to remove them. Removing them
+immediately was the right call for the range, but it un-did the test condition mid-run: by the
+time the collector reaches the AD section the DC is reachable again, so those steps will succeed
+normally and prove nothing.
+
+State at teardown: 279 files collected, `run_state.json` not yet written, **0 AD ledger records** -
+the AD section had not been reached. Firewall rules removed and verified (0 remaining, 445 and 389
+both reachable again).
+
+**The lesson is the one already on the board, applied to the harness rather than the collector:**
+every scenario script must tear down in a `finally`/trap that runs whether the orchestrator is
+still watching or not. A long-running scenario cannot depend on the caller staying alive to clean
+up after it. The Linux harnesses already do this with `trap ... EXIT`; the PowerShell ones must
+too, and a bounded wait inside the guest is not a substitute.
+
+**Still required to close E3:** the AD steps must run *while* the DC is unreachable. Either the
+teardown moves inside the guest script (block, run, evaluate, unblock, all in one process), or a
+watchdog scheduled task removes the rules at a fixed deadline regardless of what the orchestrator
+does.
