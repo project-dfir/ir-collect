@@ -19,7 +19,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | A1 | **ConstrainedLanguage** (AppLocker/WDAC) | `tests/e2e/policy/Set-TestPolicy.ps1 -Policy clm-applocker` | Refuse with exit 40 before writing anything; never redirect evidence to the target's `C:` | ✅ gate added; 🔬 still to run under a *real* AppLocker policy, not a session switch |
 | A2 | **Job subsystem blocked** | `IRCOLLECT_FORCE_INPROC=1` | Transparent in-process fallback, `exec_mode` reports it | ✅ |
-| A3 | **Not elevated** | run as a standard user | Degrade, log what is unobtainable, do not claim completeness | ⬜ Linux done (29/29, graceful); Windows untested |
+| A3 | **Not elevated** | run as a standard user | Degrade, log what is unobtainable, do not claim completeness | ✅ CLOSED 2026-07-28 - found + fixed a false-COMPLETE, see below |
 | A4 | **`Get-FileHash` unavailable** | inherit a `PSModulePath` that loads pwsh 7's Utility into 5.1 | .NET fallback, `hash_backend` says which | ✅ |
 | A5 | **AV/EDR quarantines a carried tool** | drop EICAR beside `winpmem.exe`, or let Defender flag it | Tool marked missing, run continues, `tool_missing` classified — never a silent skip | ⬜ (winpmem is *routinely* flagged in the field) |
 | A6 | **Execution policy / unsigned script blocked** | `Set-ExecutionPolicy AllSigned` (machine) | Clear failure at launch, not a half-run | ⬜ |
@@ -123,3 +123,57 @@ powershell -File C:\ir\IR-Collect.ps1 -RapidOnly -Scenario A -CaseId SCN_<id> -D
 
 A scenario is only "handled" when the artifacts state the truth. A run that quietly produced less
 evidence than it claimed is a **failure**, even if it exited 0.
+
+## A3 - not elevated (CLOSED 2026-07-28)
+
+**Setup.** Local standard user `iruser` on range-WS02 (10.20.50.239), explicitly removed from
+Administrators and asserted at 0 members. Run via `schtasks /RL LIMITED`, which yields a genuine
+non-elevated token; `Start-Process -Credential` was abandoned because the child cannot open
+redirect files it does not own, so it died in <20 s with empty logs and proved nothing.
+Validity gate: the bundle's own `elevated` field must read `False`, otherwise the attempt is
+discarded rather than scored.
+
+Two environment defects surfaced first and were fixed before the scenario could run at all:
+`winmgmt` was left **disabled** by an earlier WMI-broken scenario, and the GPO baseline denies
+`SeBatchLogonRight`, so the task registered but never executed.
+
+**What the collector did (the defect).** It sealed the bundle **COMPLETE**, `ok=33 fail=0
+skip=0 timeout=0`, `empty_outputs=0`, exit 0 - byte-for-byte the shape of a healthy elevated
+run. Diffed against an elevated bundle from the same host:
+
+| artifact | elevated | unelevated |
+|---|---|---|
+| `01_volatile/drivers.txt` | 115 096 B | **155 B** ("Access is denied") |
+| `02_network/netstat_anob.txt` | 8 140 B | **45 B** |
+| `01_volatile/sessions.txt` | 597 B | **10 B** |
+| `03_memory/memory.raw` | 6.3 GB | absent |
+
+Every stub cleared the `-le 2` emptiness threshold, so nothing was recorded. An analyst would
+read "no unusual drivers" off a driver list that was never permitted to load - the failure mode
+this whole test suite exists to prevent.
+
+**Fixes.**
+1. `Test-DegradedOutput` / `test_degraded_output` - output dominated by an access refusal is
+   tracked separately from empty output, via a size gate and a density gate (both mutation-
+   tested; a large healthy artifact that merely mentions "Access is denied" must not trip).
+2. An unelevated run can no longer be COMPLETE. RAM, hives, the Security log and per-connection
+   ownership all require a privileged token, so absence of a finding is not evidence of absence.
+   SUMMARY.md gains an explicit "READ BEFORE DRAWING CONCLUSIONS" block listing what was
+   unobtainable.
+3. Real `not_elevated` recovery rungs, not markers: `netstat -anob` -> `-ano` +
+   `Get-NetTCPConnection` (keeps every endpoint and owning PID, loses only the EXE-name column);
+   `Win32_SystemDriver` -> `sc.exe query` -> `driverquery /v` -> on-disk inventory;
+   `net session` -> `Win32_LogonSession` + shell owners.
+
+**Result after the fix.** verdict `INCOMPLETE`, exit 15, unelevated block present, and the
+ladder recovered real data: `drivers.txt` 155 B -> **29 870 B**, with `netstat_anob.txt` and
+`sessions.txt` both leaving the loss list entirely.
+
+**Linux parity.** Non-root run on rick-pve: exit 15, `INCOMPLETE`,
+`unprivileged(privileged-artifacts-unobtainable-without-root)`. Linux already fails these steps
+loudly rather than writing stubs, so its four refusals were classified as failures.
+
+**A trap this created.** The fallback banner first read `### netstat -anob requires elevation
+###` - the collector's own prose matched the denial pattern, so on a quiet host a small but
+perfectly healthy artifact would incriminate itself. `Test-DegradedOutput.ps1` now extracts
+every `###` banner from the shipped script and asserts none match the pattern.

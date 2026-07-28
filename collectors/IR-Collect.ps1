@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     IR-Collect - Self-healing incident-response collector for Windows (two-stage: rapid volatile + menu).
 
@@ -335,6 +335,35 @@ function Get-Backoff { param([string]$Cls,[int]$Attempt)
 }
 $script:RemTried = @{}
 $script:EmptySteps = @()
+# A step can also "succeed" while writing nothing but a refusal. Measured on range-WS02 as a
+# standard user (2026-07-28): drivers.txt 115096 B -> 155 B, netstat_anob.txt 8140 B -> 45 B,
+# sessions.txt 597 B -> 10 B - each an "Access is denied" stub. Every byte count was above the
+# `-le 2` empty threshold, so empty_outputs was 0 and the bundle sealed COMPLETE. An analyst
+# would read "no unusual drivers" off a driver list that was never obtainable. Degraded output
+# is therefore tracked separately from empty output, and both bear on the verdict.
+$script:DegradedSteps = @()
+$script:DenialPattern = 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation'
+function Test-DegradedOutput {
+    <#  True when a step's output is dominated by an access refusal rather than by data.
+        Two independent signals, either sufficient - a tiny file that mentions a denial, or a
+        file where denials outnumber real content lines. Reads at most 8 KB so a large healthy
+        artifact that merely quotes the word "denied" once is never misjudged. #>
+    param([string]$Path, [long]$Bytes)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    if ($Bytes -gt 65536) { return $null }
+    $txt = try {
+        $fs = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        try { $buf = New-Object byte[] ([Math]::Min(8192, $fs.Length)); [void]$fs.Read($buf,0,$buf.Length); [Text.Encoding]::UTF8.GetString($buf) } finally { $fs.Dispose() }
+    } catch { return $null }
+    if ($txt -notmatch $script:DenialPattern) { return $null }
+    $lines   = @($txt -split "`r?`n" | Where-Object { $_.Trim() })
+    $denials = @($lines | Where-Object { $_ -match $script:DenialPattern }).Count
+    if ($denials -eq 0) { return $null }
+    if ($Bytes -lt 4096 -or ($denials / [Math]::Max(1,$lines.Count)) -ge 0.5) {
+        return (@($lines | Where-Object { $_ -match $script:DenialPattern })[0]).Trim()
+    }
+    return $null
+}
 # Steps whose emptiness means the collection FAILED at its core purpose, not merely that a query
 # had no results. A host genuinely has processes, network endpoints, services, and local users -
 # if these come back empty the data was not collected, whatever the exit code says. Everything
@@ -635,6 +664,11 @@ function Invoke-Step {
                     $script:EmptySteps += [pscustomobject]@{ id=$id; name=$Name; phase=$phase; file=$OutFile }
                     Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines; empty=$true }
                     Write-Audit "STEP $id OK-EMPTY | $Name | produced no output -> $OutFile"
+                } elseif ($OutFile -and ($why = Test-DegradedOutput -Path $target -Bytes $bytes)) {
+                    # wrote something, but that something is a refusal - not evidence
+                    $script:DegradedSteps += [pscustomobject]@{ id=$id; name=$Name; phase=$phase; file=$OutFile; reason=$why; bytes=$bytes }
+                    Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines; degraded=$true; error_class='not_elevated'; error_msg=$why }
+                    Write-Audit "STEP $id OK-DEGRADED | $Name | output is an access refusal, not data ($bytes B): $why"
                 } else {
                     Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines }
                 }
@@ -732,7 +766,8 @@ THIS COLLECTION DID NOT FINISH.
 If this file is still here, the collector was interrupted - killed by an EDR/live-response
 timeout, a reboot, or the console being closed. A hard kill cannot run the seal step, so this
 tree has no SUMMARY.md, no run_state.json and no manifest. That does NOT mean the evidence is
-lost: every completed step is recorded in 99_logsun_state.jsonl, and resuming re-runs only
+lost: every completed step is recorded in 99_logs
+un_state.jsonl, and resuming re-runs only
 what is missing.
 
 Resume with:
@@ -989,15 +1024,30 @@ Unlock, confirm the filesystem mounts read-only, and check the volume GUID again
     Collect 'tasklist-svc'   { $r = try { tasklist /svc 2>$null } catch { $null }
                                if ($r) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'; '--- sc query (service->state) ---'; sc.exe query type= service state= all 2>$null } } 'tasklist_services.txt' $V
     Collect 'drivers'        { $r = try { Get-CimInstance Win32_SystemDriver -EA Stop | Select-Object Name,State,StartMode,PathName | Sort-Object Name | Format-Table -AutoSize | Out-String -Width 300 } catch { $null }
-                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
-                                 $q = try { sc.exe query type= driver state= all 2>$null } catch { $null }
-                                 if ($q) { $q } else { Get-ChildItem "$env:WINDIR\System32\drivers\*.sys" -EA SilentlyContinue | Select-Object Name,Length,LastWriteTimeUtc | Format-Table -AutoSize | Out-String -Width 300 } } } 'drivers.txt' $V
+                               # a refusal is not data: sc.exe query needs privilege, driverquery does not
+                               if ($r -and $r.Trim() -and $r -notmatch 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation' -and $r.Trim().Length -gt 400) { $r } else {
+                                 '### Win32_SystemDriver unavailable or refused - collected via fallback chain ###'
+                                 $q = try { $t = sc.exe query type= driver state= all 2>&1 | Out-String; if ($t -and $t -notmatch 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation' -and $t.Trim().Length -gt 400) { $t } else { $null } } catch { $null }
+                                 if ($q) { '--- sc.exe query type= driver ---'; $q } else {
+                                   $dq = try { $t = driverquery.exe /v /fo table 2>&1 | Out-String; if ($t -and $t -notmatch 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation' -and $t.Trim().Length -gt 200) { $t } else { $null } } catch { $null }
+                                   if ($dq) { '--- driverquery /v (unprivileged; loaded drivers + start mode) ---'; $dq } else {
+                                     '--- on-disk driver inventory only (no loaded-driver state available) ---'
+                                     Get-ChildItem "$env:WINDIR\System32\drivers\*.sys" -EA SilentlyContinue | Select-Object Name,Length,LastWriteTimeUtc | Format-Table -AutoSize | Out-String -Width 300 } } } } 'drivers.txt' $V
     if ($TOOL.handle)   { Collect 'sys-handle'  ([scriptblock]::Create("& '$($TOOL.handle)' -accepteula -a -nobanner")) 'handles.txt' $V -Timeout 120 }
     if ($TOOL.listdlls) { Collect 'sys-listdlls' ([scriptblock]::Create("& '$($TOOL.listdlls)' -accepteula")) 'listdlls.txt' $V -Timeout 120 }
 
     # --- sessions / logged-on ---
     Collect 'whoami-all'     { whoami /all } 'whoami_all.txt' $V
-    Collect 'sessions'       { query user; '---'; query session; '---'; net session } 'sessions.txt' $V
+    # `net session` and `query session` need privilege; Win32_LogonSession + explorer.exe owners
+    # still establish who is logged on, so the session picture degrades rather than disappearing.
+    Collect 'sessions'       { $r = try { @(query user 2>&1; '---'; query session 2>&1; '---'; net session 2>&1) | Out-String } catch { '' }
+                               if ($r -and $r -notmatch 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation' -and $r.Trim().Length -gt 120) { $r } else {
+                                 '### session enumeration partly refused - unprivileged fallback ###'
+                                 '--- query user (best effort) ---'; try { query user 2>&1 } catch {}
+                                 '--- Win32_LogonSession (interactive) ---'
+                                 try { Get-CimInstance Win32_LogonSession -Filter 'LogonType=2 OR LogonType=10 OR LogonType=11' -EA Stop | Select-Object LogonId,LogonType,StartTime | Format-Table -AutoSize | Out-String } catch { '(unavailable)' }
+                                 '--- shell owners (who has a desktop) ---'
+                                 try { Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -EA Stop | ForEach-Object { $o=try{(Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User}catch{'?'}; "$($_.ProcessId)`t$o" } } catch { '(unavailable)' } } } 'sessions.txt' $V
     Collect 'klist'          { klist; '=== TGT ==='; klist tgt } 'kerberos_tickets.txt' $V
     Collect 'local-users'    { $r = try { Get-CimInstance Win32_UserAccount -Filter "LocalAccount=true" -EA Stop | Format-Table Name,SID,Disabled,Lockout -AutoSize | Out-String } catch { $null }
                                if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
@@ -1008,7 +1058,16 @@ Unlock, confirm the filesystem mounts read-only, and check the volume GUID again
     if ($TOOL.psloggedon) { Collect 'sys-psloggedon' ([scriptblock]::Create("& '$($TOOL.psloggedon)' -accepteula")) 'psloggedon.txt' $V }
 
     # --- network state (routing/arp/dns before disk) ---
-    Collect 'netstat'        { netstat -anob } 'netstat_anob.txt' $N
+    # -b (owning executable) needs an Administrator token; unelevated it returns a 45-byte refusal.
+    # -ano needs no privilege and still yields every endpoint + owning PID, so the connection map
+    # survives; only the EXE-name column is lost, and Get-Process recovers most of that.
+    Collect 'netstat'        { $r = try { netstat -anob 2>&1 | Out-String } catch { '' }
+                               if ($r -and $r -notmatch 'Access is denied|Requested registry access is not allowed|UnauthorizedAccess|requires elevation|Administrator privilege|SeSecurityPrivilege|PermissionDenied|perform an unauthorized operation' -and $r.Trim().Length -gt 200) { $r } else {
+                                 '### netstat -anob needs an Administrator token - collected via unprivileged fallback ###'
+                                 '### -ano gives every endpoint and owning PID; the owning EXE-NAME column is unobtainable ###'
+                                 netstat -ano 2>$null
+                                 '--- owning process names resolved via Get-Process (best effort) ---'
+                                 try { Get-NetTCPConnection -EA Stop | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -EA SilentlyContinue).ProcessName}} | Sort-Object State,LocalPort | Format-Table -AutoSize | Out-String -Width 300 } catch { '(Get-NetTCPConnection unavailable)' } } } 'netstat_anob.txt' $N
     Collect 'tcp-conns'      { $r = try { Get-NetTCPConnection -EA Stop | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object State,LocalPort | Format-Table -AutoSize | Out-String -Width 300 } catch { $null }
                                if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'; '--- netstat -ano (TCP) ---'; netstat -ano -p TCP 2>$null } } 'tcp_connections.txt' $N
     Collect 'udp-endpoints'  { $r = try { Get-NetUDPEndpoint -EA Stop | Select-Object LocalAddress,LocalPort,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object LocalPort | Format-Table -AutoSize | Out-String -Width 300 } catch { $null }
@@ -1468,6 +1527,15 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     if ($script:DiskFull) { $incomplete += 'destination-full' }
     $criticalEmpty = @($script:EmptySteps | Where-Object { $script:CriticalSteps -contains $_.name } | ForEach-Object { $_.name } | Sort-Object -Unique)
     if ($criticalEmpty.Count) { $incomplete += "core-volatile-empty($($criticalEmpty -join '/'))" }
+    # output that is an access refusal rather than data is missing evidence, whatever its byte count
+    $degradedNames = @($script:DegradedSteps | ForEach-Object { $_.name } | Sort-Object -Unique)
+    if ($degradedNames.Count) { $incomplete += "access-denied($($degradedNames -join '/'))" }
+    # An unelevated live-response triage CANNOT be complete: RAM, registry hives, the Security
+    # event log, the full driver list and per-connection process ownership all require an
+    # Administrator token. Saying COMPLETE here would tell an analyst the absence of a finding
+    # is meaningful when the query was never permitted to run. Verified on range-WS02 as a
+    # standard user, 2026-07-28: ok=33 fail=0 skip=0, verdict COMPLETE, with drivers.txt at 155 B.
+    if (-not $isAdmin) { $incomplete += 'unelevated(privileged artifacts unobtainable without Administrator)' }
     $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$CaseId; host=$hostName; output_dir=$OutDir
@@ -1476,7 +1544,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
         memory_verified=[bool]$script:MemOk
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
-        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; empty_outputs=@($script:EmptySteps | ForEach-Object { $_.name }); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
+        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; empty_outputs=@($script:EmptySteps | ForEach-Object { $_.name }); degraded_outputs=@($script:DegradedSteps | ForEach-Object { [ordered]@{ name=$_.name; bytes=$_.bytes; reason=$_.reason } }); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
     $rsPath = Join-Path $Dirs.logs 'run_state.json'
     $rsJson = $rs | ConvertTo-Json -Depth 5
@@ -1497,7 +1565,22 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     }
     $comp = "`n## Completeness - $verdict`n- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)`n"
     if ($incomplete.Count -gt 0) { $comp += "- incomplete: $($incomplete -join ', ')`n" }
-    $comp += "- resume: .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'`n"
+    $comp += "- resume: .\collectors\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'`n"
+    if (-not $isAdmin) {
+        $comp += "`n## UNELEVATED COLLECTION - READ BEFORE DRAWING CONCLUSIONS`n"
+        $comp += "This ran as ``$env:USERNAME`` WITHOUT an Administrator token. The absence of a finding in`n"
+        $comp += "the artifacts below is NOT evidence of absence - the query was never permitted to run.`n"
+        $comp += "- physical memory: not acquirable (no driver load right)`n- registry hives (SAM/SYSTEM/SECURITY) and the Security event log: not readable`n"
+        $comp += "- full driver list, per-connection process ownership (netstat -b), other users' sessions and handles: refused`n"
+        if ($script:DegradedSteps.Count) {
+            $comp += "`nSteps whose output was an access refusal rather than data:`n"
+            foreach ($d in $script:DegradedSteps) { $comp += "- ``$($d.name)`` -> $($d.file) ($($d.bytes) B): $($d.reason)`n" }
+        }
+        $comp += "`nRe-run elevated to obtain these.`n"
+    } elseif ($script:DegradedSteps.Count) {
+        $comp += "`n## Access-denied artifacts`n"
+        foreach ($d in $script:DegradedSteps) { $comp += "- ``$($d.name)`` -> $($d.file) ($($d.bytes) B): $($d.reason)`n" }
+    }
     if (($script:DiagClass.Count -gt 0) -or (-not $script:JobsOk) -or ($script:HashBackend -ne 'Get-FileHash')) {
         $comp += "`n## Diagnostics (self-diagnosis)`n- exec mode: $(if($script:JobsOk){'background-job'}else{'in-process fallback (job subsystem unavailable)'})`n"
         $comp += "- hash backend: $script:HashBackend$(if($script:HashBackend -ne 'Get-FileHash'){' (Get-FileHash unavailable on this host - .NET fallback in use)'})`n"

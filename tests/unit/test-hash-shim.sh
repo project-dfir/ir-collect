@@ -53,7 +53,15 @@ for b in sha256sum shasum sha256 openssl digest python3; do
         sha256)    command -v sha256    >/dev/null 2>&1 || continue ;;
         openssl)   command -v openssl   >/dev/null 2>&1 || continue ;;
         digest)    command -v digest    >/dev/null 2>&1 || continue ;;
-        python3)   command -v python3   >/dev/null 2>&1 || continue ;;
+        # `command -v python3` succeeds for a non-functional stub (the Windows Store alias
+        # prints nothing and exits nonzero). Presence is not capability - probe it for real,
+        # and SKIP rather than FAIL when the interpreter cannot actually hash. Measured
+        # 2026-07-28 on a Windows test host, where this produced a false failure.
+        python3)   command -v python3   >/dev/null 2>&1 || continue
+                   if ! python3 -c 'import hashlib' >/dev/null 2>&1; then
+                       printf 'SKIP  backend %s present but non-functional here (not a collector defect)
+' "$b"; continue
+                   fi ;;
     esac
     HASH_BACKEND="$b"
     g="$(irhash "$F")"
@@ -73,6 +81,36 @@ HASH_BACKEND="$(command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo s
 SP="$TMP/a file with spaces.bin"
 printf 'ir-collect hash shim test vector' > "$SP"
 [ "$(irhash "$SP")" = "$TRUTH" ]; check $? "hashes a path containing spaces"
+
+
+# --- the digest SHAPE check -------------------------------------------------------------
+# irhash funnels every backend through a shape check so a present-but-broken helper cannot put
+# a bogus value into MANIFEST-SHA256.csv. A manifest is a custody claim: a wrong digest is worse
+# than a recorded ERR, because it looks verified. Drive the check by stubbing the raw layer.
+_ir_saved_raw="$(declare -f _irhash_raw)"
+shape_case() {  # shape_case <what-the-backend-prints> <expect ok|reject> <label>
+    eval "_irhash_raw() { printf '%s' \"$1\"; }"
+    local got rc
+    got="$(irhash /dev/null 2>/dev/null)"; rc=$?
+    if [ "$2" = ok ]; then
+        if [ "$rc" = 0 ] && [ -n "$got" ]; then printf 'ok    %s
+' "$3"; else printf 'FAIL  %s (rc=%s got=%s)
+' "$3" "$rc" "$got"; FAIL=$((FAIL+1)); fi
+    else
+        if [ "$rc" != 0 ] && [ -z "$got" ]; then printf 'ok    %s
+' "$3"; else printf 'FAIL  %s (rc=%s got=%s)
+' "$3" "$rc" "$got"; FAIL=$((FAIL+1)); fi
+    fi
+}
+VALID64='9fce5e72d5371e842fbc8804567f94a323c07f468b0e3fa547819cc51ff9e304'
+shape_case "$VALID64"              ok     'a well-formed 64-hex digest is accepted'
+shape_case ""                      reject 'a backend that prints NOTHING is rejected  <-- the python3-stub case'
+shape_case "deadbeef"              reject 'a too-SHORT digest is rejected (truncated pipe)'
+shape_case "${VALID64}extra"       reject 'a too-LONG digest is rejected'
+shape_case "python3: command not found" reject 'a backend that prints an ERROR MESSAGE is rejected'
+shape_case "9fce5e72d5371e842fbc8804567f94a323c07f468b0e3fa547819cc51ff9e3zz" reject 'a 64-char NON-HEX value is rejected'
+eval "$_ir_saved_raw"
+
 
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi

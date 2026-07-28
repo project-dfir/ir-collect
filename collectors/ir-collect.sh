@@ -106,7 +106,21 @@ elif command -v openssl >/dev/null 2>&1; then MD5_BACKEND=openssl
 elif command -v python3 >/dev/null 2>&1; then MD5_BACKEND=python3
 fi
 # irhash <file> -> bare lowercase hex digest on stdout (empty + rc1 if nothing works)
+# Every backend is funnelled through a shape check. A backend that is present but non-functional
+# (a Windows Store python3 stub, a truncated pipe, an SELinux-denied helper) can exit 0 having
+# printed nothing or printed a warning. Returning that as a digest would put a bogus value in
+# MANIFEST-SHA256.csv, which is worse than no digest at all - a manifest is a custody claim.
+# Fail loudly instead so the caller records ERR. Measured 2026-07-28: python3 present but
+# emitting nothing on a Windows test host.
 irhash() {
+  local d; d="$(_irhash_raw "$1")" || return 1
+  case "$d" in
+    *[!0-9a-fA-F]*|'') return 1 ;;
+  esac
+  [ "${#d}" = 64 ] || return 1
+  printf '%s' "$d"
+}
+_irhash_raw() {
   local f="$1"
   case "$HASH_BACKEND" in
     sha256sum) sha256sum    -- "$f" 2>/dev/null | cut -d' ' -f1 ;;
@@ -481,6 +495,33 @@ step_satisfied() { # name target
   return 0
 }
 
+# A step can exit 0 while writing nothing but a refusal. Measured on the Windows twin as a
+# standard user (range-WS02, 2026-07-28): drivers 115096 B -> 155 B, netstat 8140 B -> 45 B -
+# each an "Access is denied" stub that cleared every emptiness check and sealed as COMPLETE.
+# The same shape occurs on Linux without root: /proc/*/exe, ss -p, dmesg, and the audit log all
+# refuse rather than fail. Detect refusal-as-output so the verdict can tell the truth.
+# Two independent signals, either sufficient: a small file mentioning a denial, or a file where
+# denials outnumber content. Files over 64 KB are never stubs, so they are skipped outright -
+# that also keeps a large healthy artifact quoting "Permission denied" from being misjudged.
+DENIAL_RE='Permission denied|Operation not permitted|Access is denied|must be root|are you root|requires root|Insufficient privileges|not permitted'
+DEGRADED_STEPS=""
+test_degraded_output() {
+  local path="$1" bytes="$2"
+  [ -n "$path" ] && [ "$path" != "/dev/null" ] && [ -f "$path" ] || return 0
+  [ "${bytes:-0}" -gt 0 ] 2>/dev/null || return 0
+  [ "${bytes:-0}" -le 65536 ] 2>/dev/null || return 0
+  local head_txt; head_txt="$(head -c 8192 "$path" 2>/dev/null)" || return 0
+  printf '%s' "$head_txt" | grep -Eq "$DENIAL_RE" || return 0
+  local total denials
+  total="$(printf '%s\n' "$head_txt" | grep -c '[^[:space:]]' 2>/dev/null)"; [ -n "$total" ] || total=1
+  [ "$total" -gt 0 ] 2>/dev/null || total=1
+  denials="$(printf '%s\n' "$head_txt" | grep -Ec "$DENIAL_RE" 2>/dev/null)"; [ -n "$denials" ] || denials=0
+  if [ "$bytes" -lt 4096 ] || [ $(( denials * 2 )) -ge "$total" ]; then
+    printf '%s' "$(printf '%s\n' "$head_txt" | grep -Em1 "$DENIAL_RE" | cut -c1-160)"
+  fi
+  return 0
+}
+
 run_step() {
   local name="$1" outfile="$2" dir="$3" tmo="$4" retries="$5"; shift 5
   STEP_NUM=$((STEP_NUM+1)); local id; id="$(printf '%03d' "$STEP_NUM")"
@@ -528,8 +569,16 @@ run_step() {
     local dur=$(( $(date +%s) - start ))
     if [ "$rc" = "0" ]; then
       local bytes=0; [ "$target" != "/dev/null" ] && [ -f "$target" ] && bytes="$(fsize "$target")"
-      ledger "$id" "$name" "$phase" ok "attempt=$attempt" "duration_s=$dur" "out_file=$outfile" "out_bytes=${bytes:-0}"
-      audit "STEP $id OK   | $name | ${dur}s | try $attempt${outfile:+ -> $outfile}"
+      local degr=""; degr="$(test_degraded_output "$target" "${bytes:-0}")"
+      if [ -n "$degr" ]; then
+        # exited 0 but wrote a refusal rather than data - not a success worth reporting as one
+        DEGRADED_STEPS="$DEGRADED_STEPS $name"
+        ledger "$id" "$name" "$phase" ok "attempt=$attempt" "duration_s=$dur" "out_file=$outfile" "out_bytes=${bytes:-0}" "degraded=true" "error_class=not_elevated"
+        audit "STEP $id OK-DEGRADED | $name | output is an access refusal, not data (${bytes}B): $degr"
+      else
+        ledger "$id" "$name" "$phase" ok "attempt=$attempt" "duration_s=$dur" "out_file=$outfile" "out_bytes=${bytes:-0}"
+        audit "STEP $id OK   | $name | ${dur}s | try $attempt${outfile:+ -> $outfile}"
+      fi
       STEPS_OK=$((STEPS_OK+1)); rm -f "$etmp"; return 0
     fi
     # classify + bounded self-troubleshoot (each fix logged as a custody action)
@@ -1077,6 +1126,17 @@ EOF
   local failed_names; failed_names=$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
   [ -n "$failed_names" ] && incomplete="$(echo "$incomplete $failed_names" | sed 's/^ //; s/ $//')"
   incomplete="$(printf %s "$incomplete" | tr -cd '[:alnum:] ._():/-' | sed 's/  */ /g; s/^ //; s/ $//')"
+  # output that is an access refusal rather than data is missing evidence, whatever its byte count
+  if [ -n "${DEGRADED_STEPS// /}" ]; then
+    local degr_u; degr_u="$(printf '%s\n' $DEGRADED_STEPS | sort -u | tr '\n' '/' | sed 's|/$||')"
+    incomplete="$(printf '%s access-denied(%s)' "$incomplete" "$degr_u" | sed 's/^ //')"
+  fi
+  # An unprivileged live-response triage CANNOT be complete: RAM, other users' /proc entries,
+  # the audit log, shadow, and socket-to-process mapping all require root. Saying COMPLETE here
+  # would tell an analyst that the absence of a finding is meaningful when the query was never
+  # permitted to run. Parity with the Windows twin, which was measured sealing COMPLETE as a
+  # standard user with a 155-byte driver list (2026-07-28).
+  [ "$IS_ROOT" != 1 ] && incomplete="$(printf '%s unprivileged(privileged-artifacts-unobtainable-without-root)' "$incomplete" | sed 's/^ //')"
   local verdict=COMPLETE; [ -n "$incomplete" ] && verdict=INCOMPLETE
 
   # --- self-diagnosis rollup (parity with the Windows collector's diagnostics{}) -------------
