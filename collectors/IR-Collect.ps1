@@ -721,7 +721,12 @@ if ($freeNow -ge 0 -and $freeNow -lt $minFree) {
 Write-Audit ("PREFLIGHT destination: {0:N1} GB free" -f ($freeNow/1GB))
 
 $script:ResumeNote = Join-Path $OutDir 'RUN-INTERRUPTED-READ-ME.txt'
-try { [IO.File]::WriteAllText($script:ResumeNote, @"
+# WRITE-THROUGH, deliberately. Measured on range WS02 under a hard power event (qm reset):
+# run_state.jsonl and audit.log survived because they are appended to continuously, which keeps
+# forcing metadata flushes - but this file, written once at t=0 and never touched again, sat in
+# the NTFS cache and was LOST. A breadcrumb that only exists to explain an interrupted run is
+# useless if it cannot survive the interruption. Flush it to disk immediately.
+try { $script:ResumeNoteText = @"
 THIS COLLECTION DID NOT FINISH.
 
 If this file is still here, the collector was interrupted - killed by an EDR/live-response
@@ -736,7 +741,10 @@ Resume with:
 
 Resuming also performs the seal, after which this file is deleted automatically.
 Do not treat an unsealed tree as a failed collection until you have tried the above.
-"@, (New-Object Text.UTF8Encoding($false))) } catch {}
+"@, (New-Object Text.UTF8Encoding($false))
+      $fsn = New-Object IO.FileStream($script:ResumeNote,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
+      try { $bytes = [Text.Encoding]::UTF8.GetBytes($script:ResumeNoteText); $fsn.Write($bytes,0,$bytes.Length); $fsn.Flush($true) } finally { $fsn.Dispose() }
+    } catch {}
 Write-Audit "===== IR-Collect START ====="
 Write-Audit "Case=$CaseId Host=$hostName Output=$OutDir Elevated=$isAdmin DomainJoined=$domainJoined PS=$($PSVersionTable.PSVersion)"
 if ($NetworkDest) { Write-Audit "Destination is NETWORK: staging locally, shipping to $NetworkDest at seal." } else { Write-Audit "Destination is local/drive: $Dest" }
