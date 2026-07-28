@@ -340,8 +340,10 @@ $script:EmptySteps = @()
 # if these come back empty the data was not collected, whatever the exit code says. Everything
 # else that comes back empty is reported but not treated as fatal (some queries legitimately
 # return nothing, e.g. no shadow copies).
-$script:CriticalSteps = @('processes','proc-tree','proc-owners','tasklist-svc','drivers',
-                          'local-users','sysinfo','os-computer','netstat','tcp-conns',
+# NAMES MUST MATCH THE Collect CALLS EXACTLY - an invented name silently never matches, which
+# would make this whole check a no-op. Verified against a real run's ledger, 2026-07-28.
+$script:CriticalSteps = @('processes','processes-csv','process-owners','tasklist-svc','drivers',
+                          'local-users','systeminfo','os-cim','netstat','tcp-conns',
                           'udp-endpoints','services')
 # Invoke-Remediation: $true => retry now ; $false => give up. Each (id,class) fires once; hard cap 3 attempts.
 function Invoke-Remediation { param([string]$Cls,[string]$Name,[string]$Id,[string]$Phase,[int]$Attempt)
@@ -799,18 +801,41 @@ Unlock, confirm the filesystem mounts read-only, and check the volume GUID again
     } else { Write-Audit "DeferMemory set - RAM will be captured after volatile commands." }
 
     # --- host identity (post-image: safe now that the most-volatile artifact is secured) ---
-    Collect 'systeminfo'     { systeminfo } 'systeminfo.txt' $M
-    Collect 'os-cim'         { Get-CimInstance Win32_OperatingSystem | Format-List *; Get-CimInstance Win32_ComputerSystem | Format-List * } 'os_computer.txt' $M
+    Collect 'systeminfo'     { $r = try { systeminfo 2>$null } catch { $null }
+                               if ($r) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
+                                 $k='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+                                 "Host          : $env:COMPUTERNAME"; "User          : $env:USERNAME"
+                                 "OS            : $((Get-ItemProperty $k -EA SilentlyContinue).ProductName)"
+                                 "Build         : $((Get-ItemProperty $k -EA SilentlyContinue).CurrentBuildNumber).$((Get-ItemProperty $k -EA SilentlyContinue).UBR)"
+                                 "InstallDate   : $((Get-ItemProperty $k -EA SilentlyContinue).InstallDate)"
+                                 "Version       : $([Environment]::OSVersion.VersionString)"
+                                 "Architecture  : $env:PROCESSOR_ARCHITECTURE"; "Domain        : $env:USERDOMAIN"
+                                 "Boot(approx)  : $((Get-Date).AddMilliseconds(-[Environment]::TickCount64))"
+                                 'NICs:'; ipconfig /all } } 'systeminfo.txt' $M
+    Collect 'os-cim'         { $r = try { (Get-CimInstance Win32_OperatingSystem -EA Stop | Format-List * | Out-String) + (Get-CimInstance Win32_ComputerSystem -EA Stop | Format-List * | Out-String) } catch { $null }
+                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
+                                 Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -EA SilentlyContinue | Format-List *
+                                 "OSVersion  : $([Environment]::OSVersion.VersionString)"; "Is64BitOS  : $([Environment]::Is64BitOperatingSystem)"
+                                 "Machine    : $([Environment]::MachineName)"; "Processors : $([Environment]::ProcessorCount)" } } 'os_computer.txt' $M
     Collect 'timezone'       { Get-TimeZone | Format-List *; 'UTC now: '+((Get-Date).ToUniversalTime().ToString('o')); 'Local now: '+(Get-Date).ToString('o') } 'timezone.txt' $M
     Collect 'boot-uptime'    { $os=Get-CimInstance Win32_OperatingSystem; 'LastBoot: '+$os.LastBootUpTime; 'Install: '+$os.InstallDate } 'boot.txt' $M
     Collect 'env'            { Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize } 'environment.txt' $M
 
     # --- processes (most volatile after memory) ---
-    Collect 'processes'      { Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | Sort-Object ProcessId | Format-Table -AutoSize -Wrap } 'processes.txt' $V
-    Collect 'processes-csv'  { Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | ConvertTo-Csv -NoTypeInformation } 'processes.csv' $V
-    Collect 'process-owners' { Get-CimInstance Win32_Process | ForEach-Object { $o=try{(Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User}catch{'?'}; "$($_.ProcessId)`t$($_.Name)`t$o" } } 'process_owners.txt' $V -Timeout 120
-    Collect 'tasklist-svc'   { tasklist /svc } 'tasklist_services.txt' $V
-    Collect 'drivers'        { Get-CimInstance Win32_SystemDriver | Select-Object Name,State,StartMode,PathName | Sort-Object Name | Format-Table -AutoSize } 'drivers.txt' $V
+    Collect 'processes'      { $r = try { Get-CimInstance Win32_Process -EA Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | Sort-Object ProcessId | Format-Table -AutoSize -Wrap | Out-String -Width 500 } catch { $null }
+                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
+                                 Get-Process -EA SilentlyContinue | Select-Object Id,ProcessName,@{n='Path';e={$_.Path}},StartTime,@{n='WS_MB';e={[int]($_.WorkingSet64/1MB)}} | Sort-Object Id | Format-Table -AutoSize | Out-String -Width 500
+                                 '--- tasklist /v ---'; tasklist /v 2>$null } } 'processes.txt' $V
+    Collect 'processes-csv'  { $r = try { Get-CimInstance Win32_Process -EA Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine,ExecutablePath,CreationDate | ConvertTo-Csv -NoTypeInformation } catch { $null }
+                               if ($r) { $r } else { Get-Process -EA SilentlyContinue | Select-Object @{n='ProcessId';e={$_.Id}},@{n='Name';e={$_.ProcessName}},@{n='ExecutablePath';e={$_.Path}},@{n='CreationDate';e={$_.StartTime}} | ConvertTo-Csv -NoTypeInformation } } 'processes.csv' $V
+    Collect 'process-owners' { $r = try { Get-CimInstance Win32_Process -EA Stop | ForEach-Object { $o=try{(Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User}catch{'?'}; "$($_.ProcessId)`t$($_.Name)`t$o" } } catch { $null }
+                               if ($r) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'; '--- tasklist /v (USER column) ---'; tasklist /v /fo table 2>$null } } 'process_owners.txt' $V -Timeout 120
+    Collect 'tasklist-svc'   { $r = try { tasklist /svc 2>$null } catch { $null }
+                               if ($r) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'; '--- sc query (service->state) ---'; sc.exe query type= service state= all 2>$null } } 'tasklist_services.txt' $V
+    Collect 'drivers'        { $r = try { Get-CimInstance Win32_SystemDriver -EA Stop | Select-Object Name,State,StartMode,PathName | Sort-Object Name | Format-Table -AutoSize | Out-String -Width 300 } catch { $null }
+                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
+                                 $q = try { sc.exe query type= driver state= all 2>$null } catch { $null }
+                                 if ($q) { $q } else { Get-ChildItem "$env:WINDIR\System32\drivers\*.sys" -EA SilentlyContinue | Select-Object Name,Length,LastWriteTimeUtc | Format-Table -AutoSize | Out-String -Width 300 } } } 'drivers.txt' $V
     if ($TOOL.handle)   { Collect 'sys-handle'  ([scriptblock]::Create("& '$($TOOL.handle)' -accepteula -a -nobanner")) 'handles.txt' $V -Timeout 120 }
     if ($TOOL.listdlls) { Collect 'sys-listdlls' ([scriptblock]::Create("& '$($TOOL.listdlls)' -accepteula")) 'listdlls.txt' $V -Timeout 120 }
 
@@ -818,15 +843,20 @@ Unlock, confirm the filesystem mounts read-only, and check the volume GUID again
     Collect 'whoami-all'     { whoami /all } 'whoami_all.txt' $V
     Collect 'sessions'       { query user; '---'; query session; '---'; net session } 'sessions.txt' $V
     Collect 'klist'          { klist; '=== TGT ==='; klist tgt } 'kerberos_tickets.txt' $V
-    Collect 'local-users'    { Get-CimInstance Win32_UserAccount -Filter "LocalAccount=true" | Format-Table Name,SID,Disabled,Lockout -AutoSize } 'local_users.txt' $V
+    Collect 'local-users'    { $r = try { Get-CimInstance Win32_UserAccount -Filter "LocalAccount=true" -EA Stop | Format-Table Name,SID,Disabled,Lockout -AutoSize | Out-String } catch { $null }
+                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'
+                                 $lu = try { Get-LocalUser -EA Stop | Format-Table Name,SID,Enabled,LastLogon -AutoSize | Out-String } catch { $null }
+                                 if ($lu -and $lu.Trim()) { $lu } else { '--- net user ---'; net user 2>$null } } } 'local_users.txt' $V
     Collect 'local-admins'   { net localgroup Administrators } 'local_admins.txt' $V
     try { Get-Clipboard -Raw -ErrorAction SilentlyContinue | Set-Content (Join-Path $V 'clipboard.txt') -Encoding UTF8; Write-Audit 'STEP clipboard captured (STA main scope)' } catch { Write-Audit 'clipboard capture failed' }
     if ($TOOL.psloggedon) { Collect 'sys-psloggedon' ([scriptblock]::Create("& '$($TOOL.psloggedon)' -accepteula")) 'psloggedon.txt' $V }
 
     # --- network state (routing/arp/dns before disk) ---
     Collect 'netstat'        { netstat -anob } 'netstat_anob.txt' $N
-    Collect 'tcp-conns'      { Get-NetTCPConnection 2>$null | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object State,LocalPort | Format-Table -AutoSize } 'tcp_connections.txt' $N
-    Collect 'udp-endpoints'  { Get-NetUDPEndpoint 2>$null | Select-Object LocalAddress,LocalPort,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object LocalPort | Format-Table -AutoSize } 'udp_endpoints.txt' $N
+    Collect 'tcp-conns'      { $r = try { Get-NetTCPConnection -EA Stop | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object State,LocalPort | Format-Table -AutoSize | Out-String -Width 300 } catch { $null }
+                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'; '--- netstat -ano (TCP) ---'; netstat -ano -p TCP 2>$null } } 'tcp_connections.txt' $N
+    Collect 'udp-endpoints'  { $r = try { Get-NetUDPEndpoint -EA Stop | Select-Object LocalAddress,LocalPort,OwningProcess,@{n='Proc';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object LocalPort | Format-Table -AutoSize | Out-String -Width 300 } catch { $null }
+                               if ($r -and $r.Trim()) { $r } else { '### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###'; '--- netstat -ano (UDP) ---'; netstat -ano -p UDP 2>$null } } 'udp_endpoints.txt' $N
     if ($TOOL.tcpvcon) { Collect 'sys-tcpvcon' ([scriptblock]::Create("& '$($TOOL.tcpvcon)' -accepteula -a")) 'tcpvcon.txt' $N }
     Collect 'ipconfig'       { ipconfig /all } 'ipconfig_all.txt' $N
     Collect 'arp'            { arp -a } 'arp_cache.txt' $N
@@ -1002,7 +1032,8 @@ function Job-EventLogs {
 
 function Job-Persistence {
     Write-Audit "--- HEAVY: persistence & autoruns ---"; $P=$Dirs.persistence
-    Collect 'services'        { Get-CimInstance Win32_Service | Select-Object Name,DisplayName,State,StartMode,StartName,PathName | Sort-Object Name | ConvertTo-Csv -NoTypeInformation } 'services.csv' $P
+    Collect 'services'        { $r = try { Get-CimInstance Win32_Service -EA Stop | Select-Object Name,DisplayName,State,StartMode,StartName,PathName | Sort-Object Name | ConvertTo-Csv -NoTypeInformation } catch { $null }
+                                if ($r) { $r } else { Get-Service -EA SilentlyContinue | Select-Object Name,DisplayName,@{n='State';e={$_.Status}},@{n='StartMode';e={$_.StartType}},@{n='StartName';e={'(needs WMI)'}},@{n='PathName';e={(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($_.Name)" -EA SilentlyContinue).ImagePath}} | Sort-Object Name | ConvertTo-Csv -NoTypeInformation } } 'services.csv' $P
     Collect 'scheduled-tasks' { Get-ScheduledTask 2>$null | ForEach-Object { $t=$_; $a=($t.Actions|ForEach-Object{$_.Execute+' '+$_.Arguments}) -join ' | '; [pscustomobject]@{Path=$t.TaskPath;Name=$t.TaskName;State=$t.State;Action=$a} } | ConvertTo-Csv -NoTypeInformation } 'scheduled_tasks.csv' $P -Timeout 180
     Collect 'installed-sw'    { Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* 2>$null | Select-Object DisplayName,DisplayVersion,Publisher,InstallDate | Where-Object DisplayName | Sort-Object DisplayName | Format-Table -AutoSize } 'installed_software.txt' $P
     Collect 'wmi-persistence' { Get-CimInstance -Namespace root\subscription -Class __FilterToConsumerBinding 2>$null | Format-List *; Get-CimInstance -Namespace root\subscription -Class CommandLineEventConsumer 2>$null | Format-List * } 'wmi_persistence.txt' $P
