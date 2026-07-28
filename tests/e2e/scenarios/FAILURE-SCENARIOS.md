@@ -22,7 +22,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | A3 | **Not elevated** | run as a standard user | Degrade, log what is unobtainable, do not claim completeness | ✅ CLOSED 2026-07-28 - found + fixed a false-COMPLETE, see below |
 | A4 | **`Get-FileHash` unavailable** | inherit a `PSModulePath` that loads pwsh 7's Utility into 5.1 | .NET fallback, `hash_backend` says which | ✅ |
 | A5 | **AV/EDR quarantines a carried tool** | drop EICAR beside `winpmem.exe`, or let Defender flag it | Tool marked missing, run continues, `tool_missing` classified — never a silent skip | ✅ CLOSED 2026-07-28 - found + fixed a false-COMPLETE, see below |
-| A6 | **Execution policy / unsigned script blocked** | `Set-ExecutionPolicy AllSigned` (machine) | Clear failure at launch, not a half-run | ⬜ |
+| A6 | **Execution policy / unsigned script blocked** | `Set-ExecutionPolicy AllSigned` (machine) | Clear failure at launch, not a half-run | ✅ CLOSED 2026-07-29 - see below (enforced by the host, not by collector code) |
 
 ## B. Destination
 
@@ -553,3 +553,27 @@ not there, and it names the real cause rather than guessing - see the B3 and B6 
 **Residual, stated plainly:** the fallback rollup lands in `%TEMP%` on the subject host and is not
 cleaned up. That is a small, deliberate footprint - kilobytes of metadata, no evidence content -
 and the console names the path when it happens.
+
+## A6 - execution policy AllSigned (CLOSED 2026-07-29)
+
+**Setup.** The collector is unsigned (`Get-AuthenticodeSignature` -> `NotSigned`, asserted first -
+a signed collector would make the scenario meaningless). Launched via a child with
+`-ExecutionPolicy AllSigned`.
+
+**Attempt 1 was INVALID and the reason is instructive.** It set `AllSigned` at *LocalMachine*
+scope and asserted `Get-ExecutionPolicy -Scope LocalMachine` - which was true and irrelevant. The
+child inherited **Process-scope Bypass** from the harness, so the *effective* policy was Bypass
+and the collector ran normally, producing 49 files under a policy that was supposedly blocking it.
+Checking the scope you set instead of the value that governs is the same mistake as reading a
+return code instead of the result. The gate now asserts the **effective** policy inside a child
+launched the same way as the one under test.
+
+**Result.** Exit **1**, nothing on stdout, and PowerShell's own refusal on stderr: *"File
+C:\ir\IR-Collect.ps1 cannot be loaded. The file ... is not digitally signed."* **0 bundles**
+created, nothing leaked to `C:\ir_evidence`, machine policy left at `RemoteSigned`. Positive
+control with `-ExecutionPolicy Bypass`: exit 0, 1 bundle, 49 files.
+
+**Stated plainly:** this is enforced by the PowerShell host, not by collector code - the script
+never starts, so there is no half-run tree to clean up and nothing for the tool to detect. The
+scenario's bar ("clear failure at launch, not a half-run") is met, but no collector logic is
+responsible for it, and none should be added: refusing to run an unsigned script is the host's job.
