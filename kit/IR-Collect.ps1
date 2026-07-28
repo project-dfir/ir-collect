@@ -115,11 +115,22 @@ function Get-Inv { param([string]$Class,[string]$Filter='',[string]$NS='root\cim
 $script:HashShimText = @'
 function Get-IRHashNet { param([string]$Path,[string]$Alg)
     # .NET fallback. FileShare ReadWrite so an open/locked evidence file still hashes.
+    # Bounded retry on a SHARING VIOLATION: antivirus/EDR real-time scanning routinely holds a
+    # just-written file open for a moment, and on a live IR host that is the normal case, not an
+    # edge case. Without this a transient lock turns into a permanent 'ERR' row in the manifest.
     $a = [Security.Cryptography.HashAlgorithm]::Create($Alg)
     if (-not $a) { throw "no provider for $Alg" }
     try {
-        $fs = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
-        try { (($a.ComputeHash($fs)) | ForEach-Object { $_.ToString('X2') }) -join '' } finally { $fs.Dispose() }
+        for ($try = 1; $try -le 3; $try++) {
+            try {
+                $fs = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+                try { return (($a.ComputeHash($fs)) | ForEach-Object { $_.ToString('X2') }) -join '' }
+                finally { $fs.Dispose() }
+            } catch [IO.IOException] {
+                if ($try -eq 3) { throw }
+                Start-Sleep -Milliseconds (150 * $try)
+            }
+        }
     } finally { $a.Dispose() }
 }
 function Get-IRSha256 { param([string]$Path)
@@ -249,9 +260,16 @@ function Test-DestHasSpace {
         [IO.File]::WriteAllText($probe, '0123456789')
         return $true
     } catch [IO.IOException] {
-        # IOException covers ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL; anything else (ACL, locked
-        # path) is not a space problem and must not masquerade as one.
-        return $false
+        # IOException is an UMBRELLA: PathTooLongException, DirectoryNotFoundException and
+        # FileNotFoundException all derive from it, so catching the type alone would report
+        # "disk full" for a vanished directory or an over-long path. Match the actual condition:
+        #   Win32 ERROR_HANDLE_DISK_FULL = 39 (0x27), ERROR_DISK_FULL = 112 (0x70); .NET packs the
+        #   Win32 code into the low word of HResult (0x8007xxxx). On Unix-hosted pwsh the errno
+        #   ENOSPC (28) can appear instead. Fall back to the message only if HResult is unhelpful.
+        $code = try { $_.Exception.HResult -band 0xFFFF } catch { 0 }
+        if ($code -in 39, 112, 28) { return $false }
+        if ($_.Exception.Message -match 'not enough space|disk is full|No space left') { return $false }
+        return $true   # some other I/O problem - not a space problem, do not masquerade as one
     } catch { return $true }
     finally { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
 }

@@ -39,3 +39,7 @@ mobile/tools/
 
 # --- graphify knowledge-graph output (local analysis artifact, not project source) ---
 graphify-out/
+
+# --- Python bytecode cache ---
+__pycache__/
+*.py[cod]
