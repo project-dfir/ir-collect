@@ -320,8 +320,18 @@ function Get-ErrorClass { param([string]$Kind,[string]$Text)
     switch -Regex ($Text) {
         'Access is denied|UnauthorizedAccess|requires elevation|not elevated|Administrator privilege|SeSecurityPrivilege' { return 'not_elevated' }
         'is not recognized|CommandNotFoundException|cannot find the path|Could not find|No such file' { return 'tool_missing' }
+        # a refused kernel driver is NOT the same failure as a refused file: retrying the same
+        # imager cannot succeed, so it gets its own class and its own ladder (try an imager that
+        # uses a different mechanism). Kept ahead of the generic matches because these messages
+        # often also contain "Access is denied", which would otherwise mis-file it as not_elevated.
+        'Secure Boot|Code Integrity|HVCI|not digitally signed|driver .*(load|signature)|(load|start).* driver|0xC0000428|CreateService failed|OpenSCManager' { return 'driver_blocked' }
         'not enough space|There is not enough space|disk is full' { return 'no_space' }
         'being used by another process|because it is being used|cannot access the file|volume .* in use' { return 'file_locked' }
+        # name resolution failing is a DIFFERENT fix from the route being down: waiting helps a
+        # flaky resolver, whereas an unreachable host needs the operator. Both ladders existed;
+        # neither class could be produced until now (found 2026-07-28 by Test-FixLadders).
+        'DNS name does not exist|No such host is known|DNS_ERROR|server failed to resolve|Temporary failure in name resolution|Resolve-DnsName' { return 'dns_blocked' }
+        'too many requests|rate limit|HTTP 429|throttl|server is too busy|The request was throttled' { return 'rate_limit' }
         'RPC server is unavailable|network path was not found|is unreachable|actively refused|A connection attempt failed' { return 'net_unreachable' }
         'ConstrainedLanguage|not allowed in ConstrainedLanguage|LanguageMode|blocked by .* policy|AppLocker' { return 'clm_blocked' }
         'Invalid namespace|provider load failure|WMI|CIM|WinRM cannot' { return 'wmi_failure' }
@@ -393,10 +403,24 @@ $script:FixLadders = @{
     'not_elevated'    = @('native-source','skip')
     'job_subsystem'   = @('force-inproc','skip')
     'path_too_long'   = @('shortpath-retry','skip')
+    'driver_blocked'  = @('try-alt-imager','native-source','skip')
     'clm_blocked'     = @('skip')
 }
 $script:RemRung   = @{}   # (id|class) -> how many rungs already tried
 $script:TmoBoost  = @{}   # step id -> timeout multiplier granted by extend-timeout
+$script:LongPathIds = @{} # step id -> use an extended-length (\\?\) destination, granted by shortpath-retry
+function ConvertTo-ExtendedPath {
+    <#  Rewrite an absolute path into its extended-length form so the Win32 file APIs stop
+        enforcing MAX_PATH (260). Local paths take \\?\, UNC paths take \\?\UNC\. A path that is
+        already extended, or is relative (nothing to anchor), is returned untouched - prefixing
+        a relative path produces something the APIs reject outright. #>
+    param([string]$Path)
+    if (-not $Path -or $Path.StartsWith('\\?\')) { return $Path }
+    $full = try { [IO.Path]::GetFullPath($Path) } catch { return $Path }
+    if ($full.StartsWith('\\')) { return '\\?\UNC\' + $full.Substring(2) }
+    if ($full -match '^[A-Za-z]:\\')  { return '\\?\' + $full }
+    return $Path
+}
 
 # Invoke-FixRung: perform one rung. Returns $true if the run should retry the step afterwards.
 # Each rung reports what it ACTUALLY achieved; a rung that could not act says so rather than
@@ -458,7 +482,39 @@ function Invoke-FixRung { param([string]$Rung,[string]$Name,[string]$Id)
             return ($n -gt 0)
         }
         'force-inproc'   { $script:JobsOk = $false; Write-Audit '  FIX force-inproc: switching to in-process execution for the remainder'; return $true }
-        'shortpath-retry'{ Write-Audit '  FIX shortpath-retry: retrying with the shortened destination path'; return $true }
+        'shortpath-retry'{
+            # grant THIS step an extended-length destination on the retry, and prove the prefix
+            # actually resolves before claiming the fix - a rung that only logs is worse than none,
+            # because the ledger then records a remediation that never occurred
+            $probe = ConvertTo-ExtendedPath $script:OutDir
+            $ok = ($probe -ne $script:OutDir) -and (Test-Path -LiteralPath $probe)
+            if ($ok) { $script:LongPathIds[$Id] = $true }
+            Write-Audit "  FIX shortpath-retry: extended-length destination $(if($ok){"enabled for step $Id ($probe)"}else{'unavailable - path is relative or unresolvable'})"
+            return $ok
+        }
+        'retry-in-place' {
+            # last resort before giving up on space: the earlier rungs may have freed enough, or
+            # another process may have released its hold. Re-probe for real rather than assuming.
+            # Was DECLARED in the no_space ladder but never implemented, so it fell through to
+            # `default { return $false }` - which reads as "tried, did not help" and terminated the
+            # ladder one rung early, making `skip` unreachable. Found 2026-07-28 by Test-FixLadders.
+            Start-Sleep -Seconds 2
+            $ok = (Test-DestHasSpace)
+            Write-Audit "  FIX retry-in-place: re-probed the original destination; writable = $ok"
+            return $ok
+        }
+        'try-alt-imager' {
+            # the memory driver was refused (Secure Boot / HVCI / EDR). A different imager may use
+            # a different mechanism, so look for one we actually carry rather than retrying the
+            # same binary. Parity with the Linux ladder, which has had this rung since LiME->AVML.
+            $alts = @()
+            foreach ($n in @('winpmem','DumpIt','magnet_ram_capture','ramcapture','velociraptor')) {
+                try { $alts += @(Get-ChildItem $ToolDir -Recurse -File -Filter "*$n*.exe" -ErrorAction SilentlyContinue) } catch {}
+            }
+            $alts = @($alts | Sort-Object FullName -Unique)
+            Write-Audit "  FIX try-alt-imager: $($alts.Count) candidate imager(s) carried$(if($alts){': ' + (($alts | ForEach-Object { $_.Name }) -join ', ')})"
+            return ($alts.Count -gt 1)
+        }
         'backoff-retry'  { return $true }
         'native-source'  { Write-Audit '  FIX native-source: step-level non-WMI fallback will be used on retry'; return $true }
         'skip'           { return $false }
@@ -606,6 +662,12 @@ function Invoke-Step {
     $id = '{0:000}' -f $script:StepNum
     $phase = Get-Phase $Dir
     $target = if ($OutFile) { Join-Path $Dir $OutFile } else { $null }
+    # shortpath-retry granted this step an extended-length path. The \\?\ prefix lifts the 260-char
+    # MAX_PATH limit for the Win32 file APIs, which is the ONLY thing that actually makes a
+    # too-long destination writable - the rung used to just log that it had retried "with the
+    # shortened destination path" while changing nothing, so the retry failed identically and the
+    # custody log carried a false statement. Found by tests/unit/Test-FixLadders.ps1, 2026-07-28.
+    if ($target -and $script:LongPathIds.ContainsKey($id)) { $target = ConvertTo-ExtendedPath $target }
     # resume gate: skip a step already satisfied by a prior run (name known-ok + output present + non-empty)
     if (Test-StepSatisfied $Name $target) {
         Write-Ledger $id $Name $phase 'skipped' @{ reason='already-ok' }

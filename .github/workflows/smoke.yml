@@ -92,7 +92,7 @@ jobs:
       - name: Run collector (RapidOnly, scenario A)
         shell: pwsh
         run: |
-          .\kit\IR-Collect.ps1 -RapidOnly -Scenario A -HostRole workstation `
+          .\collectors\IR-Collect.ps1 -RapidOnly -Scenario A -HostRole workstation `
             -KnownBadIps 203.0.113.5 -KnownBadDomains evil.example `
             -CaseId CISMOKE -Dest .\out
           "collector exit=$LASTEXITCODE"

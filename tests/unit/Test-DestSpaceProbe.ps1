@@ -35,7 +35,7 @@ $fail = 0
 function Check($cond,$msg){ if($cond){Write-Host "ok    $msg" -ForegroundColor Green}else{Write-Host "FAIL  $msg" -ForegroundColor Red;$script:fail++} }
 
 # 1. healthy dir -> has space
-$Dirs = @{ logs = (New-Item -ItemType Directory -Force (Join-Path $env:TEMP ("dh_"+[guid]::NewGuid().ToString('N').Substring(0,6)))).FullName }
+$Dirs = @{ logs = (New-Item -ItemType Directory -Force (Join-Path ([IO.Path]::GetTempPath()) ("dh_"+[guid]::NewGuid().ToString('N').Substring(0,6)))).FullName }
 Check (Test-DestHasSpace) "healthy writable dir reports space available"
 
 # 2. dir does not exist -> must FAIL SAFE (true), not claim disk-full
