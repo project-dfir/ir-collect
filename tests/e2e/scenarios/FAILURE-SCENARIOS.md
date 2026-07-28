@@ -30,7 +30,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | B1 | **Read-only media** | mount a loop image `-o ro` | Detect, redirect, log the redirect | ✅ |
 | B2 | **Destination full** | Linux: 3 MB loop fs. Windows: 40 MB VHD filled to <96 KB free — **assert a 512 KB write is refused before judging** | Refuse up front rather than dying mid-run with no diagnosis | ✅ **BOTH VERIFIED**. Linux field-tested. Windows: 4th attempt induced the condition (76 KB free, 512 KB write refused) and found the seal-time ENOSPC fallback cannot help — a destination full from the first write kills the run before `Invoke-Seal`, so no `run_state.json` and the fallback never fires. Fixed with a 64 MB destination preflight: **verified exit 40 with the refusal message**. The case folder does remain, containing only `audit.log` with the `PREFLIGHT REFUSED` line — that is deliberate, it is the custody record that a collection was attempted and declined |
-| B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; say the destination vanished; never claim a bundle that is not there | ✅ CLOSED 2026-07-28 (Linux) - see below; ⚠️ relocation of a part-written tree still not implemented |
+| B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; say the destination vanished; never claim a bundle that is not there | ✅ CLOSED 2026-07-28 (Linux) + 2026-07-29 (Windows) - see below; ⚠️ relocation of a part-written tree still not implemented on either platform |
 | B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ✅ CLOSED 2026-07-28 - see below |
 | B5 | **UNC auth failure** | wrong credentials to an SMB share | Warn at preflight, keep collecting (evidence is staged locally), never report a clean run when the evidence never arrived | ✅ CLOSED 2026-07-28 - see below |
 | B6 | **MAX_PATH exceeded** | long `-Dest`, or deep nested profile paths | Refuse up front with an actionable message; never report success for a tree that was never written | ✅ CLOSED 2026-07-28 - found the worst false-success yet, see below |
@@ -498,3 +498,26 @@ assertions that read the shipped source - existence guard present, guard *before
 statement, readback present - which hold on any engine. A first attempt at the ordering assertion
 matched the `New-Item` mentioned in the function's own docstring rather than the statement, and
 failed on correct code until it was anchored properly.
+
+### B3 half (a) - Windows destination yanked mid-run: CLOSED 2026-07-29
+
+**Setup.** A 300 MB VHD attached as `Z:`, gated on the destination genuinely holding evidence
+(21,661 bytes) **and** the collector still running, then `detach vdisk` out from under it. This
+scenario was blocked on the previous attempt because evidence was being silently redirected to
+`C:\ir_evidence` - fixing that made the gate reachable.
+
+**Result.** The B6-era guard holds on Windows: no hang (12 s to exit), `EXIT 15`, **no** false
+"Collection complete", `COLLECTION PRODUCED NO EVIDENCE` printed, `FINAL: no files present ... -
+reporting failure, not completion` in the audit log, and **zero** bundles leaked to
+`C:\ir_evidence` - so the redirect fix holds under this condition too.
+
+**One defect found and fixed.** The advice attached to that message was B6's: *"Re-run with a
+shorter -Dest on writable media"*. Path length has nothing to do with a volume being unplugged,
+and sending a responder to shorten their path while their evidence drive is missing is the same
+misdiagnosis the Linux twin made when it called a vanished destination "full". The message now
+distinguishes the two: a missing volume is named as removed or unmounted, with the honest note
+that anything collected before that point went with it; other causes still point at space,
+permissions and path length.
+
+**Re-verified after the fix** under the same live yank: `names the VANISHED volume: True`,
+`wrongly advises shorter dest: False`.

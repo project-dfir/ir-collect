@@ -2212,7 +2212,17 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
     Write-Host ""
     if ($bundleFiles -eq 0) {
         Write-Host "COLLECTION PRODUCED NO EVIDENCE. Nothing was written to: $OutDir" -ForegroundColor Red
-        Write-Host "The destination could not be written to. Re-run with a shorter -Dest on writable media." -ForegroundColor Yellow
+        # Name the cause that actually applies. "Use a shorter -Dest" is B6's advice (MAX_PATH) and
+        # is wrong - actively misleading - when the destination was unmounted or removed mid-run,
+        # which is the far more common way this branch is reached. Same misdiagnosis the Linux twin
+        # made by calling a vanished destination "full" (scenario B3).
+        $destGone = -not (Test-Path -LiteralPath (Split-Path $OutDir -Qualifier) -ErrorAction SilentlyContinue)
+        if ($destGone) {
+            Write-Host "The destination volume is NO LONGER PRESENT - it was removed or unmounted during the run." -ForegroundColor Yellow
+            Write-Host "Anything collected before that point went with it. Re-run against media that stays attached." -ForegroundColor Yellow
+        } else {
+            Write-Host "The destination could not be written to. Check free space, permissions, and that -Dest is not too long a path." -ForegroundColor Yellow
+        }
         try { Write-Audit "FINAL: no files present under $OutDir - reporting failure, not completion." } catch {}
     } else {
         $verdictWord = if ($script:RunIncomplete) { 'Collection INCOMPLETE' } else { 'Collection complete' }
