@@ -311,6 +311,19 @@ ledger() { # ledger id name phase ev [k=v ...]
   local extra=""; for kv in "$@"; do extra="$extra,\"${kv%%=*}\":\"$(jesc "${kv#*=}")\""; done
   printf '{"t":"%s","id":"%s","name":"%s","phase":"%s","ev":"%s"%s}\n' "$(now_utc)" "$id" "$(jesc "$name")" "$phase" "$ev" "$extra" >> "$STATE_JSONL" 2>/dev/null
 }
+# repair_ledger_tail: an ENOSPC mid-append leaves a PARTIAL final record, so run_state.jsonl stops
+# being valid JSONL and strict parsers choke on the very file that explains the failure. Keep only
+# complete records. Must run BOTH before the rollup reads the ledger and again at the very end,
+# because seal's own steps (manifest, ship) append after the first pass and can truncate too.
+repair_ledger_tail() {
+  [ -s "${STATE_JSONL:-}" ] || return 0
+  tail -1 "$STATE_JSONL" 2>/dev/null | grep -q "}$" && return 0
+  local keep; keep="$(grep -c "}$" "$STATE_JSONL" 2>/dev/null)"
+  if grep "}$" "$STATE_JSONL" > "$ERRTMP/ledger.fixed" 2>/dev/null && [ -s "$ERRTMP/ledger.fixed" ]; then
+    cat "$ERRTMP/ledger.fixed" > "$STATE_JSONL" 2>/dev/null
+    audit "LEDGER REPAIR: dropped a truncated final record from run_state.jsonl (kept ${keep:-0} complete records; destination likely filled)."
+  fi
+}
 phase_of() { case "$1" in *00_metadata) echo metadata;; *01_volatile) echo volatile;; *02_network) echo network;; *03_memory) echo memory;; *04_persistence) echo persistence;; *05_artifacts) echo artifacts;; *06_activedirectory) echo ad;; *07_diskimage) echo diskimage;; *) echo other;; esac; }
 classify_error() { # name rc errfile -> class
   local name="$1" rc="$2" e="$3"; local S=""; [ -f "$e" ] && S="$(tr -d '\0' <"$e" 2>/dev/null)"
@@ -327,6 +340,18 @@ classify_error() { # name rc errfile -> class
     *) echo unknown;;
   esac
 }
+# Scratch for per-step stderr, deliberately NOT on the evidence filesystem (see run_step).
+ERRTMP="$(mktemp -d 2>/dev/null || echo /tmp)"
+# dest_has_space: can we still write to the evidence tree? Returns 1 when the destination is full.
+# A write probe is authoritative where `df` can lie (quotas, reserved blocks, full inode table).
+dest_has_space() {
+  local probe="${D_LOG:-$OUTDIR}/.spaceprobe.$$"
+  if ( : > "$probe" ) 2>/dev/null && printf '0123456789' >> "$probe" 2>/dev/null; then
+    rm -f "$probe" 2>/dev/null; return 0
+  fi
+  rm -f "$probe" 2>/dev/null; return 1
+}
+
 declare -A REM_TRIED 2>/dev/null || true
 redirect_dest() { for c in ${LAB_VOL:+"$LAB_VOL/ir_evidence"} /var/tmp/ir_evidence; do if mkdir -p "$c" 2>/dev/null && ( : > "$c/.w" ) 2>/dev/null; then rm -f "$c/.w"; echo "redirect:$c"; return; fi; done; echo none; }
 backoff() { case "$1" in timeout|net_unreachable|rate_limit) echo $(( $2 * $2 ));; file_locked) echo 2;; *) echo 0;; esac; }
@@ -339,7 +364,13 @@ remediate() {
   case "$cls" in
     timeout|net_unreachable|dns_blocked|rate_limit) action="backoff-retry"; [ "$attempt" -lt 2 ] && retry=0;;
     file_locked) action="retry-after-settle"; retry=0;;
-    no_space)    action="$(redirect_dest)"; [ "$action" != none ] && retry=0;;
+    # HONESTY: this used to report action="redirect:<path>" while nothing was ever redirected -
+    # $OUTDIR is fixed once the run starts, so the retry goes straight back at the SAME full
+    # filesystem. Relocating a part-written evidence tree mid-run is not safe to do silently, so
+    # report what actually happens (a retry) and flag the run so the verdict cannot come back
+    # COMPLETE on a disk that filled up.
+    no_space)    action="retry-in-place-DISK-FULL"; DISK_FULL=1; [ "$attempt" -lt 2 ] && retry=0
+                 audit "DISK FULL during '$name'. Evidence tree stays at $OUTDIR (relocation mid-run is unsafe). Free space or re-run with -d pointing at larger media; a suitable fallback is $(redirect_dest).";;
     not_elevated) action="degraded-nonroot"; retry=1;;
     tool_missing) action="fallback-or-skip"; retry=1;;
     driver_blocked) action="pivot-flag"; retry=1;;
@@ -372,7 +403,10 @@ run_step() {
   if step_satisfied "$name" "$target"; then ledger "$id" "$name" "$phase" skipped reason=already-ok; audit "STEP $id SKIP | $name | already satisfied (resume)"; STEPS_OK=$((STEPS_OK+1)); return 0; fi
   ledger "$id" "$name" "$phase" planned "timeout_s=$tmo"
   local attempt=0 rc=0 start cls=""; start="$(date +%s)"
-  local etmp="$D_LOG/.err.$id"; : > "$etmp" 2>/dev/null
+  # stderr scratch lives OFF the evidence filesystem on purpose: when the destination fills up,
+  # a scratch file stored there captures nothing, classify_error sees empty stderr, and every
+  # failure degrades to "unknown" - which is exactly when accurate classification matters most.
+  local etmp="$ERRTMP/.err.$id"; : > "$etmp" 2>/dev/null
   while [ "$attempt" -le "$retries" ]; do
     attempt=$((attempt+1))
     ledger "$id" "$name" "$phase" running "attempt=$attempt"
@@ -409,6 +443,11 @@ run_step() {
     fi
     # classify + bounded self-troubleshoot (each fix logged as a custody action)
     cls="$(classify_error "$name" "$rc" "$etmp")"
+    # Structural fallback: a full destination often produces a bare non-zero rc with NO stderr
+    # (the shell could not even write the redirect), so the text-matching classifier returns
+    # "unknown" and the no_space remediation - the one built for this - can never fire.
+    # Probe the destination directly instead of trusting the message.
+    if [ "$cls" = unknown ] && ! dest_has_space; then cls=no_space; fi
     if remediate "$cls" "$name" "$id" "$attempt" "$phase"; then retries=$attempt; sleep "$(backoff "$cls" "$attempt")"; continue; fi
     if [ "$rc" = "124" ] || [ "$rc" = "137" ] || [ "$rc" = "143" ]; then audit "STEP $id WARN | $name | TIMEOUT ${tmo}s cls=$cls | try $attempt"
     else audit "STEP $id ERR  | $name | rc=$rc cls=$cls | try $attempt"; fi
@@ -927,6 +966,11 @@ $( [ "${NO_KEYS:-0}" = "1" ] && printf '%s' "- **Encryption keys:** NOT captured
 > and record its custody. See 00_metadata/DECRYPTION-KEYS.md." )
 EOF
 
+  # (D) An ENOSPC mid-append leaves a PARTIAL final record, so run_state.jsonl stops being valid
+  # JSONL and strict parsers choke on the very file that explains the failure. Drop the partial
+  # line and say so in the audit trail - a truncated record is not evidence we can stand behind.
+  repair_ledger_tail
+
   # --- completion rollup + completeness verdict (reduce run_state.jsonl; no jq dependency) ---
   local nok nfail ntmo nskip nplan
   # grep -c prints "0" and exits 1 on no-match; capture then default (never use || echo which doubles)
@@ -937,6 +981,8 @@ EOF
   local incomplete=""
   # carry the specific reason so the verdict says what to fix, not just that RAM is missing
   [ "${MEM_OK:-0}" != 1 ] && [ "$RAPID_ONLY" != 1 ] && incomplete="memory(${MEM_FAIL_CODE:-not-attempted})"
+  # a destination that filled up means silent data loss somewhere - never seal that COMPLETE
+  [ "${DISK_FULL:-0}" = 1 ] && incomplete="$(printf '%s destination-full' "$incomplete" | sed 's/^ //')"
   local failed_names; failed_names=$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
   [ -n "$failed_names" ] && incomplete="$(echo "$incomplete $failed_names" | sed 's/^ //; s/ $//')"
   incomplete="$(printf %s "$incomplete" | tr -cd '[:alnum:] ._():/-' | sed 's/  */ /g; s/^ //; s/ $//')"
@@ -994,6 +1040,26 @@ RSEOF
       [ -n "$diag_rem_md" ] && echo "- self-heal actions:$diag_rem_md"
     } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
   fi
+  # (C) If the destination is full the heredoc above yields a ZERO-BYTE run_state.json - the one
+  # file an analyst opens to learn what went wrong is empty exactly when the run went wrong.
+  # Detect that and put the rollup somewhere off the failing medium, loudly.
+  if [ ! -s "$D_LOG/run_state.json" ]; then
+    _fb="${ERRTMP}/run_state.${CASE}.json"
+    cat > "$_fb" 2>/dev/null <<RSFB
+{ "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
+  "ended_utc":"$end","status":"partial","rollup_location":"fallback - evidence filesystem was not writable",
+  "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
+  "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
+  "completeness":{"verdict":"$verdict","incomplete":"$incomplete"},
+  "diagnostics":{"exec_mode":"$EXEC_MODE","hash_backend":"$HASH_BACKEND","by_error_class":{$diag_cls_json},"remediations":{$diag_rem_json}} }
+RSFB
+    for _alt in /var/tmp /tmp; do
+      if cp -a "$_fb" "$_alt/ir-collect_run_state_${CASE}_${STAMP}.json" 2>/dev/null; then
+        audit "ROLLUP FALLBACK: evidence filesystem unwritable - run_state.json written to $_alt/ir-collect_run_state_${CASE}_${STAMP}.json"
+        break
+      fi
+    done
+  fi
   RUN_INCOMPLETE=$( [ "$verdict" = COMPLETE ] && echo 0 || echo 1 )
 
   # Document the manifest's own gaps inside the bundle (parity with the Windows collector).
@@ -1019,6 +1085,7 @@ MREOF
   # manifest LAST so it covers SUMMARY.md
   run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' ! -path './99_logs/audit.frozen.log' -print | while IFS= read -r f; do printf '%s  %s\n' \"\$(irhash \"\$f\" 2>/dev/null || echo ERR)\" \"\$f\"; done"
   # freeze + hash the custody trail itself (excluded above because it is still being written)
+  repair_ledger_tail   # seal's own steps append after the first pass; re-check before freezing custody
   cp -a "$AUDIT" "$D_LOG/audit.frozen.log" 2>/dev/null && ( cd "$OUTDIR" && printf '%s  %s\n' "$(irhash 99_logs/audit.frozen.log)" 99_logs/audit.frozen.log ) > "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Custody trail frozen + hashed."
 
   # ship the sealed bundle: scp/rsync to a collection server, and/or HTTP(S) POST to a lab collector
