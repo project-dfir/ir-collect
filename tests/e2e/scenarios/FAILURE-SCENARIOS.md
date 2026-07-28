@@ -67,6 +67,22 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 
 ---
 
+## Verify the condition is actually in flight before acting
+
+Four scenario attempts in one session produced clean-looking results that tested **nothing**,
+all for the same reason: a `-RapidOnly` collection on these VMs finishes in **under 60 seconds**
+and writes only ~100 KB. So:
+
+- C1 (kill mid-run) x2 — the run had already sealed when the kill landed; a "perfect" bundle with
+  a full manifest is evidence of a *normal run*, not of surviving termination.
+- B2 (ENOSPC) x2 — 5 MB of free space is ample for a 100 KB bundle, so the disk never filled.
+
+**Rule: assert the condition is live before triggering it.** Confirm the process is still running,
+the image is still growing, or the disk is genuinely full — and if the assertion fails, mark the
+attempt INVALID rather than recording a pass. Use `-Auto` (Stage 2 runs 13–20 min) when a scenario
+needs the collector to still be working, and squeeze free space below ~256 KB when it needs the
+destination to fail.
+
 ## Testing hygiene — do not run this on your own workstation
 
 `-RapidOnly` still captures RAM (memory is the most volatile artifact, so it is Stage 1). With a
