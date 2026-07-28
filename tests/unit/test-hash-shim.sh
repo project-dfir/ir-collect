@@ -18,8 +18,20 @@ COLLECTOR="${1:-$HERE/../../collectors/ir-collect.sh}"
 [ -f "$COLLECTOR" ] || { echo "collector not found: $COLLECTOR"; exit 2; }
 
 # pull out the shim block: from the backend resolution to the export line
-SHIM="$(sed -n '/^# --- hashing shim/,/^export -f irhash irmd5/p' "$COLLECTOR")"
+# End the range on the export STATEMENT, not on one exact argument list: adding a function to
+# `export -f` used to break this anchor, the range then ran to EOF and swallowed the whole
+# collector, and the test died on an unrelated unbound variable (2026-07-28).
+SHIM="$(sed -n '/^# --- hashing shim/,/^export -f /p' "$COLLECTOR")"
 [ -n "$SHIM" ] || { echo "could not extract the hashing shim from $COLLECTOR"; exit 2; }
+# A silently unbounded range is how this test previously ingested the entire collector. Assert
+# the extracted shim is a plausible SIZE before evaluating it.
+SHIM_LINES=$(printf '%s
+' "$SHIM" | wc -l)
+if [ "$SHIM_LINES" -lt 5 ] || [ "$SHIM_LINES" -gt 80 ]; then
+    printf 'FAIL  hashing-shim extraction looks wrong (%s lines) - the sed range is not bounded
+' "$SHIM_LINES"
+    exit 2
+fi
 eval "$SHIM"
 
 FAIL=0
@@ -110,6 +122,7 @@ shape_case "${VALID64}extra"       reject 'a too-LONG digest is rejected'
 shape_case "python3: command not found" reject 'a backend that prints an ERROR MESSAGE is rejected'
 shape_case "9fce5e72d5371e842fbc8804567f94a323c07f468b0e3fa547819cc51ff9e3zz" reject 'a 64-char NON-HEX value is rejected'
 eval "$_ir_saved_raw"
+
 
 
 echo

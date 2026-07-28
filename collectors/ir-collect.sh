@@ -158,7 +158,12 @@ irhash_tree() { local base="$1"; shift
 # run_sh executes snippets in `bash -c` children, so the shim must cross that boundary:
 # export the functions AND the resolved backends they switch on.
 export HASH_BACKEND MD5_BACKEND
-export -f irhash irmd5 2>/dev/null || true
+# _irhash_raw MUST be exported alongside irhash: the manifest step runs via `bash -c`, which
+# inherits only EXPORTED functions. When irhash was split into a validating wrapper plus this
+# raw backend, exporting only the wrapper left it calling an undefined helper in the child, so
+# every digest came back ERR - 43 of 48 rows in a measured run (2026-07-28) - while the local
+# unit test passed because it evaluates both halves in one shell.
+export -f irhash _irhash_raw irmd5 2>/dev/null || true
 HOSTN="$(hostname 2>/dev/null || echo unknown)"
 STAMP="$(date -u +%Y%m%d_%H%M%SZ)"
 
@@ -224,6 +229,23 @@ else
     OUT_ROOT="$REDIR"; mkdir -p "$OUT_ROOT" 2>/dev/null
   else rm -f "$OUT_ROOT/.w_$STAMP" 2>/dev/null; fi
 fi
+# Reduce the operator-supplied case id to something safe to put in a path. -c/--case is typed
+# by a responder under time pressure and lands directly in the bundle directory name; an
+# apostrophe breaks the single-quoted command this script generates for its manifest, a slash
+# silently nests the bundle somewhere else, and glob characters break the Windows twin's
+# path resolution. The ORIGINAL is preserved (CASE_RAW) and recorded, because the case id is a
+# custody field that ties this bundle to the operator's paperwork - only the PATH form changes.
+CASE_RAW="$CASE"
+CASE="$(printf '%s' "$CASE" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)"
+# run_state.json is hand-built, so the RAW case id has to be JSON-escaped before it goes in - an
+# operator writing a quote in -c would otherwise emit invalid JSON in the one file a tool reads
+# to learn what happened. (The Windows twin builds its rollup with ConvertTo-Json, which escapes.)
+# Built with bash parameter expansion rather than sed: the escape sequences a sed script needs
+# here are exactly the ones that get mangled in transit, and a silently broken sed produced an
+# EMPTY value (measured 2026-07-28) - which would have written "case":"" into the rollup.
+CASE_RAW_J="${CASE_RAW//\\/\\\\}"
+CASE_RAW_J="${CASE_RAW_J//\"/\\\"}"
+[ -n "$CASE" ] || CASE="IR"
 OUTDIR="$OUT_ROOT/${CASE}_${HOSTN}_${STAMP}"
 [ -n "${RESUME_DIR:-}" ] && OUTDIR="$RESUME_DIR"   # --resume: finish an existing capture
 
@@ -615,6 +637,7 @@ run_sh() {
 IS_ROOT=0; [ "$(id -u)" = "0" ] && IS_ROOT=1
 audit "===== ir-collect START ====="
 audit "Case=$CASE Host=$HOSTN Output=$OUTDIR root=$IS_ROOT timeout=${STEP_TIMEOUT}s"
+[ "$CASE_RAW" != "$CASE" ] && audit "CASE ID normalised for the filesystem: '$CASE_RAW' -> '$CASE'. The original is preserved here and in the run metadata; only the directory name was changed."
 DET=""; for kv in "avml:$T_AVML" "lime:$T_LIME" "uac:$T_UAC" "ldapsearch:$T_LDAP" "bloodhound-python:$T_BHPY" "netexec:$T_NXC"; do
   [ -n "${kv#*:}" ] && DET="$DET ${kv%%:*}"; done
 audit "Pro tools detected:${DET:- (none - native only)}"
@@ -649,7 +672,7 @@ audit "FOOTPRINT: tools run from '$SCRIPT_DIR' (NOT installed on target); eviden
 
 # collection_info.json
 cat > "$D_META/collection_info.json" 2>/dev/null <<EOF
-{ "tool":"ir-collect.sh","version":"2.0","case":"$CASE","host":"$HOSTN",
+{ "tool":"ir-collect.sh","version":"2.0","case":"$CASE_RAW_J","case_path_token":"$CASE","host":"$HOSTN",
   "collector":"$(id -un 2>/dev/null)","root":$IS_ROOT,"startUtc":"$(now_utc)",
   "kernel":"$(uname -a 2>/dev/null | sed 's/"/ /g')","toolsDetected":"${DET# }",
   "exercise":${LAB:-0},"authorizer":"$AUTHORIZER","legalBasis":"$LEGAL_BASIS","scope":"$SCOPE_NOTE" }
@@ -1170,7 +1193,7 @@ $(grep '"ev":"remediation"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"action":"\
 EOF
   fi
   cat > "$D_LOG/run_state.json" 2>/dev/null <<RSEOF
-{ "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
+{ "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE_RAW_J","case_path_token":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
   "ended_utc":"$end","status":"$( [ "$verdict" = COMPLETE ] && echo complete || echo partial )","resumed":$( [ -n "${RESUME_DIR:-}" ] && echo true || echo false ),
   "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
   "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
@@ -1197,7 +1220,7 @@ RSEOF
   if [ ! -s "$D_LOG/run_state.json" ]; then
     _fb="${ERRTMP}/run_state.${CASE}.json"
     cat > "$_fb" 2>/dev/null <<RSFB
-{ "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
+{ "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE_RAW_J","case_path_token":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
   "ended_utc":"$end","status":"partial","rollup_location":"fallback - evidence filesystem was not writable",
   "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
   "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),

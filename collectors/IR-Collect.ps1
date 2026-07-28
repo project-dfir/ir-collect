@@ -246,7 +246,43 @@ if ($NetworkDest -or $HttpDest) {
         $OutputRoot = $redir; try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {}
     }
 }
-$OutDir = Join-Path $OutputRoot ("{0}_{1}_{2}" -f $CaseId, $hostName, $stamp)
+function ConvertTo-SafeToken {
+    <#  Reduce an operator-supplied identifier to something safe to put in a path.
+
+        -CaseId is typed by a responder under time pressure and lands directly in the bundle
+        directory name. Unsanitised it breaks the collection in ways that are hard to read:
+        [ ] ? and * make PowerShell's wildcard-interpreting -Path calls silently miss (see
+        tests/unit/Test-LiteralPathHygiene.ps1), an apostrophe breaks the single-quoted command
+        the Linux twin generates for its manifest, < > : " | / \ are outright illegal in a
+        Windows filename, and a trailing dot or space produces a directory Explorer cannot open.
+
+        The ORIGINAL string is never discarded - it is recorded in the metadata and the audit log,
+        because the case id is a custody field and the operator's own wording is what ties this
+        bundle to their paperwork. Only the PATH form is normalised. #>
+    param([string]$Value, [string]$Fallback = 'IR')
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Fallback }
+    # WHITELIST, not a blacklist of illegal characters. A whitelist is identical on both
+    # platforms, so the same -CaseId yields the same bundle name whether the responder ran the
+    # PowerShell or the shell collector - and it cannot be outflanked by a character that is
+    # merely awkward rather than illegal (spaces, quotes, semicolons, glob metacharacters).
+    $sb = New-Object Text.StringBuilder
+    foreach ($ch in $Value.ToCharArray()) {
+        if (($ch -ge 'a' -and $ch -le 'z') -or ($ch -ge 'A' -and $ch -le 'Z') -or
+            ($ch -ge '0' -and $ch -le '9') -or $ch -eq '.' -or $ch -eq '_' -or $ch -eq '-') {
+            [void]$sb.Append($ch)
+        } else { [void]$sb.Append('_') }
+    }
+    $t = $sb.ToString()
+    if ($t.Length -gt 64) { $t = $t.Substring(0, 64) }
+    if ([string]::IsNullOrWhiteSpace($t.Replace('_',''))) {
+        # nothing but separators left - a directory named "___" tells the analyst nothing
+        if ($t -notmatch '[A-Za-z0-9]') { return $Fallback }
+    }
+    return $t
+}
+$script:CaseIdRaw  = $CaseId
+$script:CaseIdSafe = ConvertTo-SafeToken $CaseId
+$OutDir = Join-Path $OutputRoot ("{0}_{1}_{2}" -f $script:CaseIdSafe, $hostName, $stamp)
 if ($Resume) { $OutDir = $Resume }
 
 function ConvertTo-ExtendedPath {
@@ -349,7 +385,7 @@ foreach ($d in $Dirs.Values) { try { New-Item -ItemType Directory -Force -Path $
 $AuditLog = Join-Path $Dirs.logs 'audit.log'
 $ErrLog   = Join-Path $Dirs.logs 'errors.log'
 $script:StateJsonl = Join-Path $Dirs.logs 'run_state.jsonl'
-try { if (-not (Test-Path $script:StateJsonl)) { New-Item -ItemType File -Path $script:StateJsonl -Force | Out-Null } } catch {}
+try { if (-not (Test-Path -LiteralPath $script:StateJsonl)) { New-Item -ItemType File -Path $script:StateJsonl -Force | Out-Null } } catch {}
 
 function Write-Audit {
     param([string]$Message)
@@ -655,8 +691,8 @@ function Test-StepSatisfied { param([string]$Name,[string]$Target)
     if (-not $Resume) { return $false }
     if (-not $script:Satisfied.ContainsKey($Name)) { return $false }
     if (-not $Target) { return $true }
-    if (-not (Test-Path $Target)) { return $false }
-    return ((Get-Item $Target).Length -gt 0)
+    if (-not (Test-Path -LiteralPath $Target)) { return $false }
+    return ((Get-Item -LiteralPath $Target).Length -gt 0)
 }
 
 # ---------------------------------------------------------------------------
@@ -799,7 +835,7 @@ function Invoke-Step {
                 # separate real data from non-terminating error records (job merges stderr via 2>&1)
                 $errRecs  = @($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
                 $hasData  = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }).Count -gt 0
-                if ($target -and $hasData) { try { [IO.File]::WriteAllText($target, (($out | Out-String -Width 4096)), (New-Object Text.UTF8Encoding($false))) } catch { try { $out | Out-File -FilePath $target -Encoding UTF8 -Width 4096 } catch {} } }
+                if ($target -and $hasData) { try { [IO.File]::WriteAllText($target, (($out | Out-String -Width 4096)), (New-Object Text.UTF8Encoding($false))) } catch { try { $out | Out-File -LiteralPath $target -Encoding UTF8 -Width 4096 } catch {} } }
                 $dur = [int]((Get-Date) - $start).TotalSeconds
                 # soft failure: the job ran but produced ONLY errors and no usable data
                 if (-not $hasData -and $errRecs.Count -gt 0) {
@@ -810,7 +846,11 @@ function Invoke-Step {
                     Write-Ledger $id $Name $phase 'failed' @{ rc='error'; error_class=$cls; error_msg=$errText.Substring(0,[Math]::Min(200,$errText.Length)) }
                     Add-Content -LiteralPath $ErrLog -Value "$(Now-Utc) [$id] $Name : $errText"; $script:StepsFail++; return $out
                 }
-                $bytes = if ($target -and (Test-Path $target)) { (Get-Item $target).Length } else { 0 }
+                # -LiteralPath: with -Path, a bundle path containing [ ] ? or * (a -CaseId like
+                # "IR-2026-[URGENT]" is enough) resolves to nothing, so bytes reads 0 and a step
+                # that wrote perfectly good evidence gets recorded as EMPTY - and a CORE step
+                # doing that drives the verdict to INCOMPLETE. Found in the B6 follow-up sweep.
+                $bytes = if ($target -and (Test-Path -LiteralPath $target)) { (Get-Item -LiteralPath $target).Length } else { 0 }
                 $lines = if ($out) { @($out).Count } else { 0 }
                 Write-Audit ("STEP $id OK   | $Name | ${dur}s | try $attempt | lines=$lines" + $(if($target){" -> $(Split-Path $target -Leaf)"}))
                 # A step that ran without error but produced NOTHING is not a success worth
@@ -906,9 +946,9 @@ if ($freeNow -ge 0 -and $freeNow -lt $minFree) {
     # reads as "it collected something" - remove it so the refusal is unambiguous. Only ever
     # removes a directory this run just created and never wrote evidence into.
     try {
-        $leftovers = @(Get-ChildItem $OutDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+        $leftovers = @(Get-ChildItem -LiteralPath $OutDir -Recurse -File -Force -ErrorAction SilentlyContinue |
                        Where-Object { $_.Name -notin 'audit.log','errors.log' })
-        if ($leftovers.Count -eq 0) { Remove-Item $OutDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($leftovers.Count -eq 0) { Remove-Item -LiteralPath $OutDir -Recurse -Force -ErrorAction SilentlyContinue }
     } catch {}
     exit 40
 }
@@ -976,7 +1016,7 @@ if (Test-Path $ToolDir) {
         } else {
             $lines += @($script:ToolInventory.Keys | Sort-Object | ForEach-Object { "{0}  {1}" -f $script:ToolInventory[$_], $_ })
         }
-        $lines | Out-File (Join-Path $Dirs.metadata 'carried_tools_sha256.txt') -Encoding ASCII
+        $lines | Out-File -LiteralPath (Join-Path $Dirs.metadata 'carried_tools_sha256.txt') -Encoding ASCII
     } catch {}
 } else {
     Write-Audit "DOCTRINE NOTE: no .\tools dir - relying on host binaries (may be tampered on a compromised host). Core collection uses CIM/.NET/ADSI (kernel-level) to reduce reliance on host userland exes."
@@ -996,7 +1036,7 @@ $info = [ordered]@{
 }
 if (-not $Authorizer) { Write-Audit "CUSTODY WARNING: no -Authorizer recorded. Pass -Authorizer/-LegalBasis/-ScopeNote for a defensible chain of custody." }
 try { [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
-try { if (-not (Test-Path (Join-Path $Dirs.metadata 'intake.json'))) { $di=[ordered]@{ case_id=$CaseId; scenario='U'; scenario_name='Unknown / broad triage'; host_role='unknown'; scope='single'; connectivity='connected'; exercise=[bool]$Lab; generated_by='IR-Collect.ps1 (non-guided)'; known_bad_ips=@(); known_bad_domains=@(); known_bad_hashes=@(); known_bad_accounts=@(); known_bad_paths=@(); attack_tags=@() }; [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($di | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } } catch {}
+try { if (-not (Test-Path -LiteralPath (Join-Path $Dirs.metadata 'intake.json'))) { $di=[ordered]@{ case_id=$CaseId; scenario='U'; scenario_name='Unknown / broad triage'; host_role='unknown'; scope='single'; connectivity='connected'; exercise=[bool]$Lab; generated_by='IR-Collect.ps1 (non-guided)'; known_bad_ips=@(); known_bad_domains=@(); known_bad_hashes=@(); known_bad_accounts=@(); known_bad_paths=@(); attack_tags=@() }; [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'intake.json'), ($di | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } } catch {}
 
 # --- guest / hypervisor detection: which host-side pull channel is available (training-lab) ---
 $script:Hypervisor='unknown'; $script:GuestTools=@()
@@ -1031,6 +1071,11 @@ try {
     } elseif ($vol) { Write-Audit "PREFLIGHT: destination filesystem = $($vol.FileSystem)" }
 } catch {}
 Write-Audit "PREFLIGHT: privilege=$(if($isAdmin){'full'}else{'PARTIAL - not elevated'}) langMode=$($ExecutionContext.SessionState.LanguageMode) 64bit=$([Environment]::Is64BitProcess)"
+# The case id is a CUSTODY field: if the path form had to be normalised, the operator's original
+# wording must still appear in the record that ties this bundle to their paperwork.
+if ($script:CaseIdRaw -ne $script:CaseIdSafe) {
+    Write-Audit "CASE ID normalised for the filesystem: '$($script:CaseIdRaw)' -> '$($script:CaseIdSafe)'. The original is preserved here and in the run metadata; only the directory name was changed."
+}
 Write-Audit "FOOTPRINT: tools run from '$PSScriptRoot' (NOT installed on target); evidence written only to destination; live-collection footprint is documented in this log. For non-volatile ground truth follow with a dead-box disk image."
 try {
     $pt = (Get-Inv Win32_OperatingSystem).ProductType  # 1 = workstation
@@ -1651,7 +1696,7 @@ Get-ChildItem '$Dir' -Recurse -File -Force -ErrorAction SilentlyContinue |
 # Called twice - before the rollup reads the ledger, and again after seal's own steps append.
 function Repair-LedgerTail {
     try {
-        if (-not (Test-Path $script:StateJsonl)) { return }
+        if (-not (Test-Path -LiteralPath $script:StateJsonl)) { return }
         $lines = [IO.File]::ReadAllLines($script:StateJsonl)
         if ($lines.Count -eq 0) { return }
         if ($lines[-1].TrimEnd().EndsWith('}')) { return }
@@ -1684,7 +1729,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
 > and record its custody. See 00_metadata\DECRYPTION-KEYS.md.
 '@})
 "@
-    try { $summary | Out-File (Join-Path $OutDir 'SUMMARY.md') -Encoding UTF8 } catch {}
+    try { $summary | Out-File -LiteralPath (Join-Path $OutDir 'SUMMARY.md') -Encoding UTF8 } catch {}
     try { $info.endUtc=$endUtc; $info.stepsOk=$script:StepsOk; $info.stepsFail=$script:StepsFail; $info.stepsTotal=$script:StepNum; $info.heavyJobs=$doneList
           [IO.File]::WriteAllText((Join-Path $Dirs.metadata 'collection_info.json'), ($info | ConvertTo-Json), (New-Object Text.UTF8Encoding($false))) } catch {}
     # --- completion rollup + completeness verdict (reduce run_state.jsonl) ---
@@ -1732,7 +1777,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
               "# tools at start: $($script:ToolInventory.Count)",
               "# vanished during run: $($script:ToolVanished.Count) $($script:ToolVanished -join ', ')",
               "# hash-changed during run: $($script:ToolChanged.Count) $($script:ToolChanged -join ', ')") |
-              Out-File (Join-Path $Dirs.metadata 'carried_tools_verify.txt') -Encoding ASCII
+              Out-File -LiteralPath (Join-Path $Dirs.metadata 'carried_tools_verify.txt') -Encoding ASCII
         } catch {}
     }
     if ($script:ToolVanished.Count -or $script:ToolChanged.Count) {
@@ -1751,7 +1796,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     if (-not $isAdmin) { $incomplete += 'unelevated(privileged artifacts unobtainable without Administrator)' }
     $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
     $rs = [ordered]@{
-        schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$CaseId; host=$hostName; output_dir=$OutDir
+        schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$script:CaseIdRaw; case_path_token=$script:CaseIdSafe; host=$hostName; output_dir=$OutDir
         ended_utc=$endUtc; status=$(if($verdict -eq 'COMPLETE'){'complete'}else{'partial'}); resumed=[bool]$Resume
         langMode="$($ExecutionContext.SessionState.LanguageMode)"; ps_version="$($PSVersionTable.PSVersion)"; elevated=[bool]$isAdmin
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
@@ -1800,7 +1845,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         foreach($k in $script:DiagClass.Keys){ $sm=$script:DiagClass[$k].sample; $comp += "- ${k}: $($script:DiagClass[$k].count) step(s)$(if($sm){" - e.g. $sm"})`n" }
         if ($script:DiagRem.Count -gt 0) { $comp += "- self-heal actions: " + (($script:DiagRem.GetEnumerator()|ForEach-Object{"$($_.Key) x$($_.Value)"}) -join ', ') + "`n" }
     }
-    try { Add-Content -Path (Join-Path $OutDir 'SUMMARY.md') -Value $comp -Encoding UTF8 } catch {}
+    try { Add-Content -LiteralPath (Join-Path $OutDir 'SUMMARY.md') -Value $comp -Encoding UTF8 } catch {}
     $script:RunIncomplete = ($verdict -eq 'INCOMPLETE')
     Write-Audit "COMPLETENESS $verdict | ok=$nok fail=$nfail timeout=$ntmo skip=$nskip planned=$nplan"
 
@@ -1833,7 +1878,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
             }
         }
         $destInfo = try {
-            $d = Get-Item $OutDir -ErrorAction Stop
+            $d = Get-Item -LiteralPath $OutDir -ErrorAction Stop
             $drv = Get-PSDrive -Name ($d.PSDrive.Name) -ErrorAction SilentlyContinue
             "$OutDir  (free: $([math]::Round(($drv.Free/1GB),1)) GB)"
         } catch { "$OutDir  (could not stat)" }
@@ -1931,7 +1976,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         [IO.File]::WriteAllText((Join-Path $L 'DIAGNOSTIC-REPORT.md'), $rep.ToString(), (New-Object Text.UTF8Encoding($false)))
         Write-Audit "Diagnostic report written: 99_logs\DIAGNOSTIC-REPORT.md (metadata only, safe to share)"
         # the run reached seal, so the interrupted-run breadcrumb no longer applies
-        try { if ($script:ResumeNote -and (Test-Path $script:ResumeNote)) { Remove-Item $script:ResumeNote -Force -ErrorAction SilentlyContinue } } catch {}
+        try { if ($script:ResumeNote -and (Test-Path -LiteralPath $script:ResumeNote)) { Remove-Item -LiteralPath $script:ResumeNote -Force -ErrorAction SilentlyContinue } } catch {}
     } catch { Write-Audit "Diagnostic report generation failed: $($_.Exception.Message)" }
     # Document the manifest's own gaps INSIDE the bundle. Four files cannot be in
     # MANIFEST-SHA256.csv (it is being written, or they are produced after it), and a verifier
@@ -1962,7 +2007,7 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
     # is still being written when the manifest runs; snapshot a frozen copy and hash THAT so the
     # timeline record has an integrity seal too.
     try {
-        Copy-Item $AuditLog (Join-Path $L 'audit.frozen.log') -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $AuditLog -Destination (Join-Path $L 'audit.frozen.log') -Force -ErrorAction SilentlyContinue
         Repair-LedgerTail   # seal's own steps append after pass 1; re-check before freezing custody
         $ah = Get-IRSha256 (Join-Path $L 'audit.frozen.log')
         [IO.File]::WriteAllText((Join-Path $OutDir 'MANIFEST-audit-log.sha256'), "$ah  99_logs/audit.frozen.log`n", (New-Object Text.UTF8Encoding($false)))
@@ -2048,7 +2093,7 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
 # ---------------------------------------------------------------------------
 function Show-VolatileGate {
     $n = 0
-    try { $n = (Get-ChildItem $Dirs.volatile,$Dirs.network -File -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count } catch {}
+    try { $n = (Get-ChildItem -LiteralPath $Dirs.volatile,$Dirs.network -File -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count } catch {}
     $memOk = [bool]$script:MemOk
     # is the disk encrypted but we have no verified RAM (where the key lives)?
     $encRisk = $false
