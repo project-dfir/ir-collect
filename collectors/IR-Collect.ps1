@@ -197,6 +197,34 @@ $hostName = $env:COMPUTERNAME
 $stamp    = (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmssZ')
 $ToolDir  = Join-Path $PSScriptRoot 'tools'
 
+function Test-PathWritable {
+    <#  Can evidence actually be written here?
+
+        The previous inline probe called `New-Item -ItemType Directory -Force` FIRST and treated
+        any failure as "not writable". A DRIVE ROOT cannot be created - `New-Item -Force 'X:'`
+        throws "The path is not of a legal form" - so every root-path destination was judged
+        unwritable and silently redirected onto the subject host's system drive. Measured on
+        range-WS02 2026-07-28: `-Dest X:\` on a proven-writable 300 MB volume produced its bundle
+        at C:\ir_evidence and reported success. `-Dest E:\` on a USB evidence drive - the most
+        ordinary destination there is - had the same fault.
+
+        So: create the directory only if it does not already exist, then answer the real question
+        by WRITING a probe file and READING IT BACK. An exit status alone does not prove a write
+        landed (the same lesson as the UNC probe in B5). #>
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -ItemType Directory -Force -Path $Path -ErrorAction Stop | Out-Null
+        }
+        $tf = Join-Path $Path ('.w_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        [IO.File]::WriteAllText($tf, 'x')
+        $back = try { [IO.File]::ReadAllText($tf) } catch { '' }
+        Remove-Item -LiteralPath $tf -Force -ErrorAction SilentlyContinue
+        return ($back -eq 'x')
+    } catch { return $false }
+}
+
 # --- Resolve destination: local drive / UNC share / bare IP -----------------
 # Network destinations are slow+fragile to write to live, so we STAGE locally
 # (next to the script / thumb drive) then ZIP + ship at seal time.
@@ -239,10 +267,19 @@ if ($NetworkDest -or $HttpDest) {
     # read-only-media / non-writable target: redirect to a writable evidence location so we can run at all.
     # NOTE: create the destination first - a valid local -Dest that does not exist yet must be CREATED,
     # not misjudged as read-only and redirected.
-    $probe = $false; try { New-Item -ItemType Directory -Force $OutputRoot -EA Stop | Out-Null; $tf = Join-Path $OutputRoot ('.w_' + $stamp); [IO.File]::WriteAllText($tf,'x'); Remove-Item $tf -Force -EA SilentlyContinue; $probe = $true } catch {}
+    $probe = Test-PathWritable $OutputRoot
     if (-not $probe) {
         $redir = if ($LabVol) { Join-Path $LabVol 'ir_evidence' } else { Join-Path $env:SystemDrive 'ir_evidence' }
-        Write-Host "Output '$OutputRoot' not writable (read-only media?). Redirecting evidence to $redir." -ForegroundColor Yellow
+        # Redirecting evidence onto the SUBJECT HOST is a contamination event and a custody fact.
+        # It used to be announced with Write-Host only, so the audit log - the record an analyst
+        # actually reads - said "Destination is local/drive: X:\" while the bundle sat on C:.
+        # Buffer it here (the trail is not open yet) and flush once it is.
+        $script:PendingRedirectNote = "DESTINATION REDIRECTED: '$OutputRoot' was not writable, so evidence was written to $redir instead. This is ON THE SUBJECT HOST - treat the collection as having modified the target, and prefer removable media on any re-run."
+        Write-Host ''
+        Write-Host "  !! '$OutputRoot' is not writable. Redirecting evidence to $redir" -ForegroundColor Red
+        Write-Host '  !! That location is ON THE SUBJECT HOST - this collection now writes to the machine under investigation.' -ForegroundColor Red
+        Write-Host '  !! Attach writable removable media and re-run if the destination was meant to be external.' -ForegroundColor Yellow
+        Write-Host ''
         $OutputRoot = $redir; try { New-Item -ItemType Directory -Force $OutputRoot | Out-Null } catch {}
     }
 }
@@ -1140,6 +1177,9 @@ try {
     } elseif ($vol) { Write-Audit "PREFLIGHT: destination filesystem = $($vol.FileSystem)" }
 } catch {}
 Write-Audit "PREFLIGHT: privilege=$(if($isAdmin){'full'}else{'PARTIAL - not elevated'}) langMode=$($ExecutionContext.SessionState.LanguageMode) 64bit=$([Environment]::Is64BitProcess)"
+# The redirect decision happens before the audit log exists, so it is buffered and flushed here -
+# same pattern the ship preflight needed, enforced by tests/unit/Test-AuditTrailOrder.ps1.
+if ($script:PendingRedirectNote) { Write-Audit $script:PendingRedirectNote }
 # The case id is a CUSTODY field: if the path form had to be normalised, the operator's original
 # wording must still appear in the record that ties this bundle to their paperwork.
 if ($script:CaseIdRaw -ne $script:CaseIdSafe) {

@@ -470,3 +470,31 @@ by some other test. The redirect target `C:\ir_evidence` is hardcoded fallback b
 **Priority for the next iteration**, ahead of finishing B3(a) itself: a writable destination must
 never be silently replaced, the free-space figure must describe the destination actually used, and
 any redirect must be stated loudly in both the console and the custody log.
+
+### Silent evidence redirect - FIXED 2026-07-29
+
+**Root cause.** The destination writability probe called `New-Item -ItemType Directory -Force`
+*first* and treated any failure as "not writable". **A drive root cannot be created** -
+`New-Item -Force 'X:\'` throws *"The path is not of a legal form"* - so every root-path
+destination was judged unwritable and silently redirected to `C:\ir_evidence` on the subject
+host. `-Dest E:\` on a USB evidence drive, the most ordinary destination in live response, hit
+this every time.
+
+**Fix.** `Test-PathWritable` creates the directory only when it does not already exist, then
+answers the real question by writing a probe file and **reading it back** - the same lesson as
+the UNC probe in B5, where an exception-free call proved nothing. The redirect, when it does
+happen, is now buffered and flushed into the **custody log** (it was `Write-Host` only) and names
+the consequence: the evidence is on the subject host and the collection has modified the target.
+
+**Verified on PS 5.1**, where the bug lives: `-Dest Y:\` on a 300 MB VHD put its bundle on `Y:`
+(48 files) with **zero** leaked to `C:\ir_evidence`, and the audit log now reads
+`PREFLIGHT destination: 0.3 GB free` / `Destination is local/drive: Y:\` - both previously false.
+
+**The unit test could not catch this on its own, and that is worth recording.** The bug is
+engine-dependent: `New-Item -Force 'C:\'` throws under Windows PowerShell 5.1 (what runs on a
+target) but **succeeds** under PowerShell 7 (what the tests and CI run on). Mutations that put
+the bug back therefore passed the behavioural assertions. `Test-PathWritable.ps1` adds structural
+assertions that read the shipped source - existence guard present, guard *before* the `New-Item`
+statement, readback present - which hold on any engine. A first attempt at the ordering assertion
+matched the `New-Item` mentioned in the function's own docstring rather than the statement, and
+failed on correct code until it was anchored properly.
