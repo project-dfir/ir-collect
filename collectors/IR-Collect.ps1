@@ -1318,7 +1318,41 @@ Unlock, confirm the filesystem mounts read-only, and check the volume GUID again
 '@
     try { [IO.File]::WriteAllText((Join-Path $M 'DECRYPTION-KEYS.md'), $keyGuide, (New-Object Text.UTF8Encoding($false))) } catch {}
     # host clock vs collection clock (timeline provenance / skew)
-    Collect 'clock-skew'     { 'Host local time : '+(Get-Date).ToString('o'); 'Host UTC time   : '+((Get-Date).ToUniversalTime().ToString('o')); 'NOTE: compare against a trusted external time source and record offset for timeline defensibility.' } 'clock_provenance.txt' $M
+    # Record the host clock AND measure it against a reference. The previous version wrote the
+    # host's own time plus a note telling the analyst to "compare against a trusted external time
+    # source" - which records nothing about whether the clock is WRONG, and leaves the one
+    # measurement that makes a timeline defensible as homework. Measured on range-WS02 2026-07-29
+    # with the clock deliberately advanced: the artifact changed (it holds the skewed time) but
+    # nothing in it let a reader tell the clock was off.
+    Collect 'clock-skew'     {
+        'Host local time : ' + (Get-Date).ToString('o')
+        'Host UTC time   : ' + ((Get-Date).ToUniversalTime().ToString('o'))
+        $src = try { (w32tm /query /source 2>$null | Select-Object -First 1) } catch { $null }
+        'Time source     : ' + $(if ($src) { "$src".Trim() } else { 'unknown' })
+        $off = $null; $peerUsed = $null
+        # the configured source first, then the logon server - a domain member always has one
+        foreach ($peer in @("$src".Trim(), ($env:LOGONSERVER -replace '^\\',''))) {
+            if (-not $peer) { continue }
+            if ($peer -match 'Local CMOS|Free-running|unknown') { continue }
+            $sc = try { w32tm /stripchart /computer:$peer /samples:1 /dataonly 2>&1 | Select-Object -Last 1 } catch { $null }
+            $m = [regex]::Match("$sc", '([+-]\d+[.,]\d+)s')
+            if ($m.Success) { $off = [double]($m.Groups[1].Value -replace ',', '.'); $peerUsed = $peer; break }
+        }
+        if ($null -ne $off) {
+            'Reference peer  : ' + $peerUsed
+            $dir = if ($off -lt 0) { 'this host is AHEAD of the reference by {0:0.000}s' -f [Math]::Abs($off) }
+                   elseif ($off -gt 0) { 'this host is BEHIND the reference by {0:0.000}s' -f [Math]::Abs($off) }
+                   else { 'this host agrees with the reference' }
+            'Measured offset : ' + ('{0:+0.000;-0.000;0.000}' -f $off) + 's  (w32tm convention: reference MINUS host)'
+            'Interpretation  : ' + $dir
+            if ([Math]::Abs($off) -gt 60) {
+                'WARNING: this host is more than 60s from its own time source. Timestamps in this bundle are NOT directly comparable with other hosts until the offset above is applied.'
+            }
+        } else {
+            'Reference peer  : NONE REACHABLE'
+            'Measured offset : UNAVAILABLE - no time source answered, so this bundle carries no independent evidence that the host clock is correct. Compare these timestamps against a trusted source before building a timeline.'
+        }
+    } 'clock_provenance.txt' $M
 
     # --- RAM IMAGE FIRST (RFC 3227: memory is the most volatile capturable artifact) ---
     # Every command below perturbs RAM, so image it before the volatile-command battery.

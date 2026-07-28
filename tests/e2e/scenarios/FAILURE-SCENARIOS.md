@@ -62,7 +62,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ✅ tested on WS02 — found the worst defect of the session (see below); `wmi_failure` still never fires because the steps do not error, they return nothing — emptiness detection is what catches it |
 | E2 | **No `sha256sum`** (stock macOS/BSD/busybox) | `HASH_BACKEND` forced per backend | shasum/sha256/openssl/digest/python3 fallback | ✅ unit-tested across 4 backends |
 | E3 | **Domain unreachable** for AD enumeration | block LDAP to the DC | Skip cleanly, mark incomplete, do not hang | ⬜ |
-| E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ captured, never validated under skew |
+| E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to |
 | E5 | **PS 2.0 / Server 2008R2** | old guest | `Get-Inv` WMI path; graceful degradation | ⬜ |
 
 ---
@@ -598,3 +598,36 @@ collection finished with **49 files**, verdict `COMPLETE`, `ok=33 failed=0`, man
 roughly 25 s for the same `-RapidOnly` collection interactively. Correctness is unaffected - every
 count matches - but a 10x slowdown under SYSTEM is unexplained and worth understanding before
 anyone builds timeouts around detached execution.
+
+## E4 - clock skew (CLOSED 2026-07-29)
+
+**Setup.** WS02's clock advanced by 4 minutes - deliberately inside Kerberos' 5-minute tolerance so
+the domain keeps working, while still being a skew any real measurement must catch. Restored with
+`w32tm /resync` and verified **by measurement** against the DC afterwards, not by the resync
+command's own say-so.
+
+**The gap.** The artifact was previously the host's own local and UTC time plus a note:
+*"compare against a trusted external time source and record offset for timeline defensibility."*
+Under a live skew the file changed - it faithfully recorded the wrong time - but nothing in it let
+a reader tell the clock was wrong. The one measurement that makes a timeline defensible was left
+as homework for the analyst, on a host they may never touch again.
+
+**Fix.** The step now measures the offset against the host's configured time source (falling back
+to the logon server), names the peer it used, and warns above 60 s. With no source reachable it
+says so explicitly rather than implying the clock is fine - the E3 case gets an honest
+`UNAVAILABLE` instead of silence.
+
+**A sign error caught before it shipped.** The first version labelled the value *"host clock
+relative to that reference"*. `w32tm /stripchart` reports **reference minus host**, so a host
+running fast yields a NEGATIVE number - the label inverted it, and an analyst correcting a
+timeline by that sign would have shifted every timestamp the wrong way. The artifact now states
+the convention and spells out the direction in words: *"this host is AHEAD of the reference by
+239.989s"*.
+
+**Verified live.** Correct clock: `+0.001s`, no warning. Advanced 4 minutes: `-239.989s`,
+`Interpretation: this host is AHEAD of the reference by 239.989s`, WARNING present, reference peer
+named `IR-DC01.lab.local`. Clock restored and confirmed at `+0.01s` vs the DC.
+
+**Harness note.** My own assertion expected a positive number and failed on correct output - which
+is how the inverted label was found. A failing assertion on working code is worth reading before
+"fixing" the assertion.
