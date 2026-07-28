@@ -21,7 +21,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | A2 | **Job subsystem blocked** | `IRCOLLECT_FORCE_INPROC=1` | Transparent in-process fallback, `exec_mode` reports it | ✅ |
 | A3 | **Not elevated** | run as a standard user | Degrade, log what is unobtainable, do not claim completeness | ✅ CLOSED 2026-07-28 - found + fixed a false-COMPLETE, see below |
 | A4 | **`Get-FileHash` unavailable** | inherit a `PSModulePath` that loads pwsh 7's Utility into 5.1 | .NET fallback, `hash_backend` says which | ✅ |
-| A5 | **AV/EDR quarantines a carried tool** | drop EICAR beside `winpmem.exe`, or let Defender flag it | Tool marked missing, run continues, `tool_missing` classified — never a silent skip | ⬜ (winpmem is *routinely* flagged in the field) |
+| A5 | **AV/EDR quarantines a carried tool** | drop EICAR beside `winpmem.exe`, or let Defender flag it | Tool marked missing, run continues, `tool_missing` classified — never a silent skip | ✅ CLOSED 2026-07-28 - found + fixed a false-COMPLETE, see below |
 | A6 | **Execution policy / unsigned script blocked** | `Set-ExecutionPolicy AllSigned` (machine) | Clear failure at launch, not a half-run | ⬜ |
 
 ## B. Destination
@@ -177,3 +177,46 @@ loudly rather than writing stubs, so its four refusals were classified as failur
 ###` - the collector's own prose matched the denial pattern, so on a quiet host a small but
 perfectly healthy artifact would incriminate itself. `Test-DegradedOutput.ps1` now extracts
 every `###` banner from the shipped script and asserts none match the pattern.
+
+## A5 - AV quarantines a carried tool (CLOSED 2026-07-28)
+
+**Setup.** Real-time protection is **off** on this range by design (it would eat the GHOSTS and
+Caldera agents that generate the traffic), so the quarantine was driven by an on-demand
+`Start-MpScan` scoped to `C:\ir\tools` — a genuine Defender quarantine with no global RTP toggle
+and no risk to the range. EICAR is assembled from fragments at runtime; a literal in the script
+would get the *script* quarantined in transit, which tests nothing.
+
+Validity gate: the bait must be removed **while the collector is still running**. The run is
+logged INVALID if the collector exits first — the point is a tool disappearing mid-collection,
+not a tool that was already absent.
+
+**What the collector did (the defect).** With a tool quarantined out from under it, the run
+sealed **COMPLETE, exit 0**, `failed=0`, no error class, no diagnostic. Three separate problems:
+
+1. `carried_tools_sha256.txt` — the record of *which binaries touched the evidence*, a
+   chain-of-custody artifact — was written **0 bytes**. "No tools were carried" was
+   indistinguishable from "the inventory failed to run".
+2. The audit log asserted `DOCTRINE: carried tools present in .\tools` whenever the **directory**
+   existed. It said this on a host whose toolkit was empty — a false statement in a custody log.
+3. Nothing ever re-checked. The inventory was a snapshot at startup, so a tool vanishing later
+   was invisible. Only a buried RAM line hinted at it.
+
+**Fix.** The toolkit is hashed at start (path → SHA-256) and re-verified at seal by
+`Compare-ToolInventory`. Anything vanished or hash-changed is classified `tool_missing`, written
+to `carried_tools_verify.txt`, named in the verdict, and stated plainly in the audit log:
+*"Most likely AV quarantine; on a compromised host, consider tampering. Any output from these
+tools is suspect."* A tool that is present but **unreadable** counts as changed, never as fine —
+an AV that locks rather than deletes leaves the path in place, and calling an unverifiable tool
+verified is the exact false assurance being guarded against. The inventory file now states
+`NONE` explicitly rather than being empty.
+
+**Result.** Bait quarantined at t+15s with the collector still running → verdict `INCOMPLETE`,
+exit 15, `toolkit-tampered(winpmem_x64.exe)`, `tool_missing` classified with a readable sample.
+The benign tool staged alongside it was **not** implicated. An intact toolkit still seals
+`COMPLETE`, exit 0, `TOOLKIT VERIFIED` — the check does not cry wolf.
+
+**Range note.** WS02's real `winpmem.exe` was present through 16:15Z and gone by 18:06Z, with
+**no** Defender quarantine event for it (the log shows only the EICAR baits and Caldera's
+`splunkd.exe`). The cause was not established — and `Remove-MpThreat` was run during cleanup,
+destroying the quarantine history that might have shown it. The imager has been restored from
+the rick-pve staging copy and re-verified. Lesson: do not clear AV state before reading it.

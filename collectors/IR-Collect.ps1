@@ -345,6 +345,28 @@ function Get-Backoff { param([string]$Cls,[int]$Attempt)
 }
 $script:RemTried = @{}
 $script:EmptySteps = @()
+# path -> SHA-256 of every carried tool, taken before collection and re-verified at seal.
+# Initialised here (not only inside the "tools dir exists" branch) so the seal-time check has a
+# defined value on a host with no toolkit at all.
+$script:ToolInventory = @{}
+$script:ToolVanished  = @()
+$script:ToolChanged   = @()
+function Compare-ToolInventory {
+    <#  Re-verify a toolkit snapshot (path -> SHA-256) against what is on disk NOW.
+        Returns .Vanished and .Changed as leaf names, for the verdict and the audit log.
+
+        A tool that is present but UNREADABLE counts as Changed, never as fine: an
+        AV product that locks a detected file rather than deleting it leaves the path in place,
+        and treating an unverifiable tool as verified is the whole failure mode this guards. #>
+    param([hashtable]$Inventory)
+    $vanished = @(); $changed = @()
+    foreach ($p in @($Inventory.Keys)) {
+        if (-not (Test-Path -LiteralPath $p)) { $vanished += (Split-Path $p -Leaf); continue }
+        $now = try { Get-IRSha256 $p } catch { $null }
+        if ($now -ne $Inventory[$p]) { $changed += (Split-Path $p -Leaf) }
+    }
+    [pscustomobject]@{ Vanished = @($vanished); Changed = @($changed) }
+}
 # A step can also "succeed" while writing nothing but a refusal. Measured on range-WS02 as a
 # standard user (2026-07-28): drivers.txt 115096 B -> 155 B, netstat_anob.txt 8140 B -> 45 B,
 # sessions.txt 597 B -> 10 B - each an "Access is denied" stub. Every byte count was above the
@@ -852,11 +874,33 @@ if (-not $isAdmin) { Write-Audit "WARNING: not elevated - some data (process own
 # DOCTRINE: host is assumed compromised. Prefer carried tools; use kernel-level
 # APIs (CIM/.NET/ADSI) over host userland exes; record hashes of any carried tool.
 if (Test-Path $ToolDir) {
-    Write-Audit "DOCTRINE: carried tools present in .\tools - preferred over host binaries."
+    # Snapshot the toolkit: path -> SHA-256. Kept in memory so the seal can re-verify it, because
+    # a carried tool can VANISH mid-run - AV quarantine is the ordinary cause (winpmem and
+    # Velociraptor are routinely flagged), and a compromised host tampering with the responder's
+    # own binaries is the alarming one. Either way the analyst must be told.
+    $script:ToolInventory = @{}
     try {
-        Get-ChildItem $ToolDir -Recurse -File -Include *.exe,*.ps1 -ErrorAction SilentlyContinue |
-          ForEach-Object { "{0}  {1}" -f (Get-IRSha256 $_.FullName), $_.FullName } |
-          Out-File (Join-Path $Dirs.metadata 'carried_tools_sha256.txt') -Encoding ASCII
+        foreach ($t in @(Get-ChildItem $ToolDir -Recurse -File -Include *.exe,*.ps1 -ErrorAction SilentlyContinue)) {
+            $script:ToolInventory[$t.FullName] = (Get-IRSha256 $t.FullName)
+        }
+    } catch {}
+    # The old line claimed "carried tools present" whenever the DIRECTORY existed - it said so on
+    # a host whose tools folder was empty, which is a false statement in a custody log.
+    if ($script:ToolInventory.Count -gt 0) {
+        Write-Audit "DOCTRINE: $($script:ToolInventory.Count) carried tool(s) present in .\tools - preferred over host binaries."
+    } else {
+        Write-Audit "DOCTRINE NOTE: .\tools exists but is EMPTY - no carried tools. Relying on host binaries and kernel-level APIs (CIM/.NET/ADSI). RAM capture is not possible without a staged imager."
+    }
+    try {
+        $lines = @("# carried tool inventory taken at $(Now-Utc)",
+                   "# count: $($script:ToolInventory.Count)")
+        if ($script:ToolInventory.Count -eq 0) {
+            # an EMPTY file cannot be told apart from an inventory that failed to run; say it
+            $lines += 'NONE - no carried tools were present in the toolkit at collection start.'
+        } else {
+            $lines += @($script:ToolInventory.Keys | Sort-Object | ForEach-Object { "{0}  {1}" -f $script:ToolInventory[$_], $_ })
+        }
+        $lines | Out-File (Join-Path $Dirs.metadata 'carried_tools_sha256.txt') -Encoding ASCII
     } catch {}
 } else {
     Write-Audit "DOCTRINE NOTE: no .\tools dir - relying on host binaries (may be tampered on a compromised host). Core collection uses CIM/.NET/ADSI (kernel-level) to reduce reliance on host userland exes."
@@ -1587,6 +1631,37 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     if (-not $script:MemOk -and -not $RapidOnly) { $incomplete += "memory($($script:MemFailCode))" }
     # a destination that filled up means silent data loss somewhere - never seal that COMPLETE
     if ($script:DiskFull) { $incomplete += 'destination-full' }
+    # --- toolkit re-verification: did a carried tool change or vanish during the run? ---
+    # AV quarantine is the ordinary cause and is EXPECTED in the field (winpmem and Velociraptor
+    # are routinely flagged); host tampering with the responder's binaries is the alarming one.
+    # Either way, a tool that is not the tool we hashed at the start invalidates any conclusion
+    # drawn from its output, so it belongs in the verdict and not in a buried audit line.
+    # Measured on range-WS02 2026-07-28 (scenario A5): Defender quarantined a file out of the
+    # toolkit mid-scenario and the run sealed COMPLETE, exit 0, with nothing recorded anywhere.
+    if ($script:ToolInventory -and $script:ToolInventory.Count -gt 0) {
+        $tv = Compare-ToolInventory $script:ToolInventory
+        $script:ToolVanished = @($tv.Vanished); $script:ToolChanged = @($tv.Changed)
+        if ($script:ToolVanished.Count -or $script:ToolChanged.Count) {
+            $msg = "TOOLKIT TAMPERED DURING RUN: $($script:ToolVanished.Count) vanished$(if($script:ToolVanished){" ($($script:ToolVanished -join ', '))"}), $($script:ToolChanged.Count) hash-changed$(if($script:ToolChanged){" ($($script:ToolChanged -join ', '))"}). Most likely AV quarantine; on a compromised host, consider tampering. Any output from these tools is suspect."
+            Write-Audit $msg
+            $ec = 'tool_missing'
+            if (-not $script:DiagClass.Contains($ec)) { $script:DiagClass[$ec] = [ordered]@{ count=0; sample='' } }
+            $script:DiagClass[$ec].count += ($script:ToolVanished.Count + $script:ToolChanged.Count)
+            if (-not $script:DiagClass[$ec].sample) { $script:DiagClass[$ec].sample = $msg.Substring(0, [Math]::Min(200, $msg.Length)) }
+        } else {
+            Write-Audit "TOOLKIT VERIFIED: all $($script:ToolInventory.Count) carried tool(s) unchanged since collection start."
+        }
+        try {
+            @("# toolkit re-verification at $(Now-Utc)",
+              "# tools at start: $($script:ToolInventory.Count)",
+              "# vanished during run: $($script:ToolVanished.Count) $($script:ToolVanished -join ', ')",
+              "# hash-changed during run: $($script:ToolChanged.Count) $($script:ToolChanged -join ', ')") |
+              Out-File (Join-Path $Dirs.metadata 'carried_tools_verify.txt') -Encoding ASCII
+        } catch {}
+    }
+    if ($script:ToolVanished.Count -or $script:ToolChanged.Count) {
+        $incomplete += "toolkit-tampered($((@($script:ToolVanished) + @($script:ToolChanged)) -join '/'))"
+    }
     $criticalEmpty = @($script:EmptySteps | Where-Object { $script:CriticalSteps -contains $_.name } | ForEach-Object { $_.name } | Sort-Object -Unique)
     if ($criticalEmpty.Count) { $incomplete += "core-volatile-empty($($criticalEmpty -join '/'))" }
     # output that is an access refusal rather than data is missing evidence, whatever its byte count
