@@ -685,6 +685,29 @@ try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.Windo
 $domainJoined = $false
 try { $domainJoined = (Get-Inv Win32_ComputerSystem).PartOfDomain } catch {}
 
+# Breadcrumb for an INTERRUPTED run. Measured on range WS02 (2026-07-28): a hard kill 90s into a
+# collection - what an EDR live-response harness does at its ~30 minute cap - skips PowerShell
+# finally blocks entirely, so the always-seal wrapper never runs. No SUMMARY.md, no run_state.json,
+# no manifest: the tree looks abandoned. It is not - the append-only ledger survives intact and
+# -Resume finishes the job (verified: ok=38 skipped=32 failed=0). Nothing told the operator that,
+# so leave a note that only exists while the run is unfinished. Invoke-Seal removes it.
+$script:ResumeNote = Join-Path $OutDir 'RUN-INTERRUPTED-READ-ME.txt'
+try { [IO.File]::WriteAllText($script:ResumeNote, @"
+THIS COLLECTION DID NOT FINISH.
+
+If this file is still here, the collector was interrupted - killed by an EDR/live-response
+timeout, a reboot, or the console being closed. A hard kill cannot run the seal step, so this
+tree has no SUMMARY.md, no run_state.json and no manifest. That does NOT mean the evidence is
+lost: every completed step is recorded in 99_logsun_state.jsonl, and resuming re-runs only
+what is missing.
+
+Resume with:
+
+    .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'
+
+Resuming also performs the seal, after which this file is deleted automatically.
+Do not treat an unsealed tree as a failed collection until you have tried the above.
+"@, (New-Object Text.UTF8Encoding($false))) } catch {}
 Write-Audit "===== IR-Collect START ====="
 Write-Audit "Case=$CaseId Host=$hostName Output=$OutDir Elevated=$isAdmin DomainJoined=$domainJoined PS=$($PSVersionTable.PSVersion)"
 if ($NetworkDest) { Write-Audit "Destination is NETWORK: staging locally, shipping to $NetworkDest at seal." } else { Write-Audit "Destination is local/drive: $Dest" }
@@ -1574,6 +1597,8 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         [void]$rep.AppendLine("_Generated $endUtc by IR-Collect._")
         [IO.File]::WriteAllText((Join-Path $L 'DIAGNOSTIC-REPORT.md'), $rep.ToString(), (New-Object Text.UTF8Encoding($false)))
         Write-Audit "Diagnostic report written: 99_logs\DIAGNOSTIC-REPORT.md (metadata only, safe to share)"
+        # the run reached seal, so the interrupted-run breadcrumb no longer applies
+        try { if ($script:ResumeNote -and (Test-Path $script:ResumeNote)) { Remove-Item $script:ResumeNote -Force -ErrorAction SilentlyContinue } } catch {}
     } catch { Write-Audit "Diagnostic report generation failed: $($_.Exception.Message)" }
     # Document the manifest's own gaps INSIDE the bundle. Four files cannot be in
     # MANIFEST-SHA256.csv (it is being written, or they are produced after it), and a verifier
