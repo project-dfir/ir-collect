@@ -93,7 +93,20 @@ Check ($scriptText -match 'function Get-IRSha256') 'generated script carries the
 Check ($covered.ContainsKey((Norm $plainRel))) "covers a normal file ($plainRel)"
 Check ($covered.ContainsKey((Norm $hiveRel)))  "covers a HIDDEN+SYSTEM per-user hive ($hiveRel)  <-- the regression"
 Check (-not $covered.ContainsKey((Norm $manRel)))   'excludes MANIFEST-SHA256.csv itself (it is being written)'
-Check (-not $covered.ContainsKey((Norm $auditRel))) 'excludes the live audit.log (frozen copy is hashed separately)'
+# The generator excludes the live audit.log with a regex containing a literal backslash
+# ('99_logs\\(audit|errors)\.log$'). That is CORRECT - IR-Collect.ps1 only ever runs on Windows,
+# where that is the separator. Asserting the runtime effect on a Linux CI runner tests the
+# runner, not the collector, so split it: the pattern's PRESENCE is checked everywhere (a
+# refactor that drops the exclusion fails on every platform), and its EFFECT only where the
+# separator matches. Weakening it to nothing would have been the easy wrong answer.
+Check ($scriptText -match "99_logs.*audit\|errors") 'generated script carries the audit/errors-log exclusion'
+if ($isWindows_) {
+    Check (-not $covered.ContainsKey((Norm $auditRel))) 'excludes the live audit.log (frozen copy is hashed separately)'
+} else {
+    # the accounting assertion below already lists $auditRel as deliberately excluded, so it
+    # stays honest without adjustment here
+    Write-Host 'SKIP  audit.log exclusion effect - backslash separator does not apply on this host' -ForegroundColor Yellow
+}
 if ($covered.ContainsKey((Norm $hiveRel))) {
     Check ($covered[(Norm $hiveRel)] -match '^[0-9A-Fa-f]{64}$') 'hive entry carries a real SHA-256, not ERR'
 }
