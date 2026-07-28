@@ -235,8 +235,30 @@ function Write-Ledger { param([string]$Id,[string]$Name,[string]$Phase,[string]$
     if ($Extra) { foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] } }
     try { Add-Content -Path $script:StateJsonl -Value ($o | ConvertTo-Json -Compress -Depth 4) -Encoding UTF8 } catch {}
 }
+# Test-DestHasSpace: can we still WRITE to the evidence tree? Text matching alone misses a full
+# destination whenever the message is localized, wrapped by a provider, or absent entirely - and a
+# free-space number can lie (quotas, reserved blocks). An actual write probe cannot.
+function Test-DestHasSpace {
+    # FAIL SAFE: only report "no space" when we actually attempted a write and it failed. If the
+    # log dir is not set up yet (early errors) we must assume space is fine - otherwise every
+    # unclassified error would be relabelled no_space and falsely flag the run destination-full.
+    $logDir = try { $Dirs.logs } catch { $null }
+    if ([string]::IsNullOrWhiteSpace($logDir) -or -not (Test-Path -LiteralPath $logDir)) { return $true }
+    $probe = Join-Path $logDir (".spaceprobe." + [Diagnostics.Process]::GetCurrentProcess().Id)
+    try {
+        [IO.File]::WriteAllText($probe, '0123456789')
+        return $true
+    } catch [IO.IOException] {
+        # IOException covers ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL; anything else (ACL, locked
+        # path) is not a space problem and must not masquerade as one.
+        return $false
+    } catch { return $true }
+    finally { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+}
 function Get-ErrorClass { param([string]$Kind,[string]$Text)
     if ($Kind -eq 'timeout') { return 'timeout' }
+    # structural check first: a full destination is a fact about the disk, not about the wording
+    if (-not (Test-DestHasSpace)) { return 'no_space' }
     switch -Regex ($Text) {
         'Access is denied|UnauthorizedAccess|requires elevation|not elevated|Administrator privilege|SeSecurityPrivilege' { return 'not_elevated' }
         'is not recognized|CommandNotFoundException|cannot find the path|Could not find|No such file' { return 'tool_missing' }
@@ -263,7 +285,8 @@ function Invoke-Remediation { param([string]$Cls,[string]$Name,[string]$Id,[stri
         'timeout'         { $action='backoff-retry';       $retry = ($Attempt -lt 2) }
         'net_unreachable' { $action='backoff-retry';       $retry = ($Attempt -lt 2) }
         'file_locked'     { $action='retry-after-settle';  $retry = $true }
-        'no_space'        { $action='insufficient-space';  $retry = $false }
+        'no_space'        { $action='insufficient-space';  $retry = $false; $script:DiskFull = $true
+                            Write-Audit "DISK FULL during '$Name'. Evidence tree stays at $OutDir (relocating a part-written tree mid-run is unsafe). Free space or re-run with -Dest on larger media." }
         'not_elevated'    { $action='degrade-nonadmin';    $retry = $false }
         'tool_missing'    { $action='fallback-or-skip';    $retry = $false }
         'clm_blocked'     { $action='clm-degrade';         $retry = $false }
@@ -1115,6 +1138,20 @@ Get-ChildItem '$Dir' -Recurse -File -Force -ErrorAction SilentlyContinue |
 "@
 }
 
+# An ENOSPC mid-append leaves a PARTIAL final record, so run_state.jsonl stops being valid JSONL
+# and strict parsers choke on the very file that explains the failure. Keep only whole records.
+# Called twice - before the rollup reads the ledger, and again after seal's own steps append.
+function Repair-LedgerTail {
+    try {
+        if (-not (Test-Path $script:StateJsonl)) { return }
+        $lines = [IO.File]::ReadAllLines($script:StateJsonl)
+        if ($lines.Count -eq 0) { return }
+        if ($lines[-1].TrimEnd().EndsWith('}')) { return }
+        $keep = @($lines | Where-Object { $_.TrimEnd().EndsWith('}') })
+        [IO.File]::WriteAllLines($script:StateJsonl, $keep)
+        Write-Audit "LEDGER REPAIR: dropped a truncated final record from run_state.jsonl (kept $($keep.Count) complete records; destination likely filled)."
+    } catch {}
+}
 function Invoke-Seal {
     Write-Audit "--- SEAL: manifest + report ---"; $L=$Dirs.logs
     $endUtc=Now-Utc
@@ -1145,6 +1182,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     # --- completion rollup + completeness verdict (reduce run_state.jsonl) ---
     $rsj = $script:StateJsonl; $nok=0; $nfail=0; $ntmo=0; $nskip=0; $nplan=0; $failedNames=@()
     $script:DiagClass=[ordered]@{}; $script:DiagRem=[ordered]@{}
+    Repair-LedgerTail   # a truncated final record would break the reduction below
     if (Test-Path $rsj) {
         foreach ($ln in [IO.File]::ReadAllLines($rsj)) {
             if     ($ln -match '"ev":"ok"')      { $nok++ }
@@ -1159,6 +1197,8 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     $incomplete = @($failedNames | Sort-Object -Unique)
     # carry the specific reason so the verdict tells the analyst what to fix, not just that RAM is missing
     if (-not $script:MemOk -and -not $RapidOnly) { $incomplete += "memory($($script:MemFailCode))" }
+    # a destination that filled up means silent data loss somewhere - never seal that COMPLETE
+    if ($script:DiskFull) { $incomplete += 'destination-full' }
     $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$CaseId; host=$hostName; output_dir=$OutDir
@@ -1169,7 +1209,23 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
         diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); hash_backend=$script:HashBackend; by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
-    try { [IO.File]::WriteAllText((Join-Path $Dirs.logs 'run_state.json'), ($rs | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } catch {}
+    $rsPath = Join-Path $Dirs.logs 'run_state.json'
+    $rsJson = $rs | ConvertTo-Json -Depth 5
+    try { [IO.File]::WriteAllText($rsPath, $rsJson, (New-Object Text.UTF8Encoding($false))) } catch {}
+    # If the destination is full that write silently produced nothing (or a 0-byte file) - the one
+    # file an analyst opens to learn what went wrong, empty exactly when the run went wrong.
+    # Put the rollup somewhere off the failing medium, loudly.
+    if (-not (Test-Path $rsPath) -or ((Get-Item $rsPath -ErrorAction SilentlyContinue).Length -eq 0)) {
+        foreach ($alt in @($env:TEMP, 'C:\Windows\Temp')) {
+            if (-not $alt) { continue }
+            try {
+                $fb = Join-Path $alt ("ir-collect_run_state_{0}_{1}.json" -f $CaseId, $stamp)
+                [IO.File]::WriteAllText($fb, $rsJson, (New-Object Text.UTF8Encoding($false)))
+                Write-Audit "ROLLUP FALLBACK: evidence filesystem unwritable - run_state.json written to $fb"
+                break
+            } catch {}
+        }
+    }
     $comp = "`n## Completeness - $verdict`n- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)`n"
     if ($incomplete.Count -gt 0) { $comp += "- incomplete: $($incomplete -join ', ')`n" }
     $comp += "- resume: .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'`n"
@@ -1212,6 +1268,7 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
     # timeline record has an integrity seal too.
     try {
         Copy-Item $AuditLog (Join-Path $L 'audit.frozen.log') -Force -ErrorAction SilentlyContinue
+        Repair-LedgerTail   # seal's own steps append after pass 1; re-check before freezing custody
         $ah = Get-IRSha256 (Join-Path $L 'audit.frozen.log')
         [IO.File]::WriteAllText((Join-Path $OutDir 'MANIFEST-audit-log.sha256'), "$ah  99_logs/audit.frozen.log`n", (New-Object Text.UTF8Encoding($false)))
         Write-Audit "Custody trail frozen + hashed: $ah"
