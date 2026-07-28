@@ -61,7 +61,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ✅ tested on WS02 — found the worst defect of the session (see below); `wmi_failure` still never fires because the steps do not error, they return nothing — emptiness detection is what catches it |
 | E2 | **No `sha256sum`** (stock macOS/BSD/busybox) | `HASH_BACKEND` forced per backend | shasum/sha256/openssl/digest/python3 fallback | ✅ unit-tested across 4 backends |
-| E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ⚠️ DEFECT FOUND 2026-07-29 - skips cleanly and does not hang, but does NOT mark incomplete: 14 empty AD artifacts sealed as COMPLETE (see below) |
+| E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ✅ CLOSED 2026-07-29 - defect found AND fixed; both controls pass (see below) |
 | E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to |
 | E5 | **PS 2.0 / Server 2008R2** | old guest | `Get-Inv` WMI path; graceful degradation | ⬜ |
 
@@ -771,3 +771,38 @@ where CIM is broken (scenario E1).
 **Outstanding:** the positive control (DC reachable - the same steps must NOT force INCOMPLETE) was
 still running when this was recorded, and the negative control must be re-run with the corrected
 probe to confirm the note reads *"domain controller unreachable"*. Neither is claimed.
+
+### E3 - CLOSED 2026-07-29, both controls passing
+
+| control | DC | verdict | empty AD steps | `domain-evidence-missing` |
+|---|---|---|---|---|
+| **E3NEG** | blocked | **INCOMPLETE** | 13 | present, `(domain controller unreachable; 13 AD step(s) empty: ad-admincount/ad-asrep/ad-computers/ad-cons/ad-domain/ad-groups/ad-laps/ad-rbcd/ad-spn/ad-this-host/ad-trusts-ldap/ad-uncons/ad-users)` |
+| **E3POS** | reachable | **COMPLETE** | 4 | **absent** |
+
+E3POS is the one that matters. The same collector, on the same host, with four AD steps returning
+nothing - `ad-cons`, `ad-laps`, `ad-rbcd`, `ad-trusts-ldap`, because this domain genuinely has no
+constrained delegation, no LAPS and no extra trusts - seals **COMPLETE**. Empty is not treated as
+missing when the domain answered.
+
+**It took three attempts and the middle one nearly shipped a worse bug than the original.**
+
+1. Fix written, unit-tested 18/18, three mutations caught. Looked done.
+2. Live negative control: INCOMPLETE with all 13 steps named - but the note said *"reachability
+   unknown"* instead of naming the cause. The LDAP probe had never run: it keyed on
+   `$env:LOGONSERVER` / `$env:USERDNSDOMAIN`, and both are **empty under SYSTEM and for an
+   interactive administrator over SSH**. Measured, not assumed.
+3. Live **positive** control with the DC reachable: `domain-evidence-missing` **fired anyway**,
+   flagging four legitimately-empty steps. The fix, as written, would have marked healthy domain
+   collections INCOMPLETE - the exact cry-wolf failure it was designed to avoid. The negative
+   control passed at every stage and could never have revealed this.
+
+The probe now reads `Win32_ComputerSystem.Domain` (populated in both contexts), keeping the
+environment variables as a fallback for CIM-broken hosts (E1).
+
+**Why the wrong version was survivable:** `DomainReachable` is three-state (`$true`/`$false`/
+`$null`). An unrun probe therefore produced *"reachability unknown"* - visibly wrong - rather than
+defaulting to `$false` and asserting *"domain controller unreachable"* on evidence nobody had. A
+boolean would have shipped a confident false cause into an evidence bundle.
+
+Range restored to baseline: 0 firewall rules, DC reachable, 0 E3 bundles, 3 evidence dirs, tasks
+deleted.
