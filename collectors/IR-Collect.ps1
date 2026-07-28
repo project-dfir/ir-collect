@@ -473,6 +473,9 @@ $script:EmptySteps = @()
 # Initialised here (not only inside the "tools dir exists" branch) so the seal-time check has a
 # defined value on a host with no toolkit at all.
 $script:ToolInventory = @{}
+$script:ShipOk = $null
+$script:ShipError = $null
+$script:NetProbe = $null
 $script:ToolVanished  = @()
 $script:ToolChanged   = @()
 function Compare-ToolInventory {
@@ -982,7 +985,73 @@ Do not treat an unsealed tree as a failed collection until you have tried the ab
     } catch {}
 Write-Audit "===== IR-Collect START ====="
 Write-Audit "Case=$CaseId Host=$hostName Output=$OutDir Elevated=$isAdmin DomainJoined=$domainJoined PS=$($PSVersionTable.PSVersion)"
-if ($NetworkDest) { Write-Audit "Destination is NETWORK: staging locally, shipping to $NetworkDest at seal." } else { Write-Audit "Destination is local/drive: $Dest" }
+function Test-NetworkDestination {
+    <#  Prove the network destination is writable NOW, not at seal time.
+
+        Network destinations are staged locally and shipped at the end, which is the right design
+        - writing evidence across SMB during live response is slow and fragile. But nothing
+        validated the share up front, so an operator pointed at a share they cannot write to ran
+        the ENTIRE collection before finding out. Measured on range-WS02 2026-07-28 against
+        \<dc>\C$: 175 s for a RapidOnly run, and a full -Auto run is 20+ minutes.
+
+        This is a WARNING, never a refusal: the evidence is staged locally and is not at risk, so
+        stopping the collection would destroy volatile data over a credential problem. Telling the
+        operator at second 5 lets them fix it while the run proceeds.
+
+        An unreachable host is slow to fail (31 s measured), so the probe is bounded - waiting
+        longer than the operator would tolerate defeats the point of probing early. #>
+    param([string]$Unc, [int]$TimeoutSec = 20)
+    $res = [ordered]@{ target = $Unc; ok = $false; reason = ''; seconds = 0 }
+    $t0 = Get-Date
+    $probeDir = $null
+    try {
+        $probeDir = [IO.Path]::Combine($Unc, ".irprobe_$([guid]::NewGuid().ToString('N').Substring(0,8))")
+        $job = Start-Job -ScriptBlock {
+            param($d)
+            try {
+                [void][IO.Directory]::CreateDirectory($d)
+                $f = [IO.Path]::Combine($d, 'p.txt')
+                [IO.File]::WriteAllText($f, 'x')
+                $back = [IO.File]::ReadAllText($f)
+                [IO.File]::Delete($f); [IO.Directory]::Delete($d)
+                if ($back -ne 'x') { return 'probe file did not read back' }
+                return 'OK'
+            } catch { return ($_.Exception.Message -split "`r?`n")[0] }
+        } -ArgumentList $probeDir
+        if (Wait-Job $job -Timeout $TimeoutSec) {
+            $r = Receive-Job $job
+            if ("$r" -eq 'OK') { $res.ok = $true } else { $res.reason = "$r" }
+        } else {
+            $res.reason = "no response within ${TimeoutSec}s (host unreachable or SMB hung)"
+        }
+        Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue
+    } catch {
+        # Start-Job can be unavailable (job subsystem blocked); fall back to a direct probe rather
+        # than reporting a healthy destination we never actually tested
+        try {
+            [void][IO.Directory]::CreateDirectory($probeDir)
+            $f = [IO.Path]::Combine($probeDir, 'p.txt'); [IO.File]::WriteAllText($f, 'x')
+            $res.ok = ([IO.File]::ReadAllText($f) -eq 'x')
+            [IO.File]::Delete($f); [IO.Directory]::Delete($probeDir)
+        } catch { $res.reason = ($_.Exception.Message -split "`r?`n")[0] }
+    }
+    $res.seconds = [int]((Get-Date) - $t0).TotalSeconds
+    [pscustomobject]$res
+}
+if ($NetworkDest) {
+    Write-Audit "Destination is NETWORK: staging locally, shipping to $NetworkDest at seal."
+    $script:NetProbe = Test-NetworkDestination $NetworkDest
+    if ($script:NetProbe.ok) {
+        Write-Audit "PREFLIGHT ship target: $NetworkDest is writable ($($script:NetProbe.seconds)s)."
+    } else {
+        Write-Audit "PREFLIGHT SHIP TARGET UNWRITABLE: $NetworkDest - $($script:NetProbe.reason). Collection CONTINUES and the bundle will be retained locally; fix credentials/share now if you want it shipped."
+        Write-Host ''
+        Write-Host "  !! Ship target $NetworkDest is NOT writable: $($script:NetProbe.reason)" -ForegroundColor Yellow
+        Write-Host '  !! Collecting anyway - evidence is staged locally and will be retained there.' -ForegroundColor Yellow
+        Write-Host '  !! Fix the share or credentials now and the seal-time ship will succeed.' -ForegroundColor Yellow
+        Write-Host ''
+    }
+} else { Write-Audit "Destination is local/drive: $Dest" }
 $detected = ($TOOL.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key }) -join ', '
 Write-Audit "Pro tools detected: $(if($detected){$detected}else{'(none - native fallbacks only)'})"
 if (-not $isAdmin) { Write-Audit "WARNING: not elevated - some data (process owners, RAM, hives, netstat -b) will be incomplete." }
@@ -1802,6 +1871,11 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
         memory_verified=[bool]$script:MemOk
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
+        # The ship happens AFTER this file is written and hashed into the manifest - recording the
+        # outcome here would either be a null claiming nothing, or a post-seal rewrite that
+        # invalidates the custody digest. So state what IS known at seal time, and point at the
+        # file written beside the bundle once the transfer has actually been attempted.
+        ship=[ordered]@{ target=$NetworkDest; attempted=[bool]$NetworkDest; preflight_ok=$(if($script:NetProbe){[bool]$script:NetProbe.ok}else{$null}); preflight_reason=$(if($script:NetProbe){$script:NetProbe.reason}else{$null}); result_file=$(if($NetworkDest){'<bundle>.ship.json (written after the seal)'}else{$null}) }
         diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; empty_outputs=@($script:EmptySteps | ForEach-Object { $_.name }); degraded_outputs=@($script:DegradedSteps | ForEach-Object { [ordered]@{ name=$_.name; bytes=$_.bytes; reason=$_.reason } }); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
     $rsPath = Join-Path $Dirs.logs 'run_state.json'
@@ -2034,11 +2108,31 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
                 if ($Cred) { New-PSDrive -Name IRDEST -PSProvider FileSystem -Root $NetworkDest -Credential $Cred -ErrorAction Stop | Out-Null; $tgt='IRDEST:\' }
                 else       { $tgt = $NetworkDest }
                 Copy-Item "$zip","$zip.sha256" $tgt -Force -ErrorAction Stop
+                $script:ShipOk = $true
                 Write-Audit "Ship OK -> $NetworkDest"; Write-Host "Shipped $(Split-Path $zip -Leaf) to $NetworkDest" -ForegroundColor Green
             } catch {
+                # A run whose evidence never reached the destination exited 0, so nothing
+                # automating this could tell. The bundle is intact locally, so this is not a
+                # failed COLLECTION - but it is not a clean run either.
+                $script:ShipOk = $false
+                $script:ShipError = ($_.Exception.Message -split "`r?`n")[0]
                 Write-Audit "Ship FAILED: $($_.Exception.Message). Evidence retained locally at $zip"
                 Write-Host "Network ship failed - evidence kept locally: $zip" -ForegroundColor Yellow
+                Write-Host "  The COLLECTION is intact; only the transfer failed. Copy the bundle by hand or re-run the ship." -ForegroundColor Yellow
             } finally { try { Remove-PSDrive IRDEST -ErrorAction SilentlyContinue } catch {} }
+            # Written BESIDE the bundle, never inside it: the bundle is already sealed and hashed,
+            # and an evidence container that changes after its manifest is worthless. This file is
+            # the machine-readable answer to "did the evidence actually reach the destination?"
+            try {
+                $shipRec = [ordered]@{
+                    schema='ir-collect/ship-result@1'; case=$script:CaseIdRaw; bundle=(Split-Path $zip -Leaf)
+                    target=$NetworkDest; ok=[bool]$script:ShipOk; error=$script:ShipError
+                    preflight_ok=$(if($script:NetProbe){[bool]$script:NetProbe.ok}else{$null})
+                    local_copy=$zip; utc=(Now-Utc)
+                }
+                [IO.File]::WriteAllText("$zip.ship.json", ($shipRec | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+                Write-Audit "Ship result recorded: $zip.ship.json (ok=$([bool]$script:ShipOk))"
+            } catch {}
         }
         if ($HttpDest -and (Test-Path $zip)) {
             # POST/PUT the bundle to a lab collector (e.g. an uploadserver / range results endpoint)
@@ -2313,7 +2407,12 @@ $exitCode = 0
 # ascending severity - the LAST condition that holds wins, so 20 (no RAM) is not masked by 15.
 # (It was: no-verified-RAM also sets RunIncomplete, so exit 20 could never be observed.)
 if ($script:StepsFail -gt 0) { $exitCode = 10 }
+# The evidence never reached the destination the operator named. The COLLECTION is intact (the
+# bundle is retained locally and says so), so this is not exit 15 - but a run that could not
+# deliver its output must not report clean either, or automation shipping to a share nobody can
+# write to reports success forever. Measured 2026-07-28: exit was 0.
+if ($script:ShipOk -eq $false) { if ($exitCode -lt 10) { $exitCode = 10 } }
 if ($script:RunIncomplete) { $exitCode = 15 }
 if (-not $script:MemOk -and -not $RapidOnly) { $exitCode = 20 }
-Write-Audit "EXIT $exitCode (0=clean 10=skips 15=incomplete-critical 20=no-RAM 40=fatal)"
+Write-Audit "EXIT $exitCode (0=clean 10=skips/ship-failed 15=incomplete-critical 20=no-RAM 40=fatal)"
 exit $exitCode

@@ -27,7 +27,7 @@ SHIM="$(sed -n '/^# --- hashing shim/,/^export -f /p' "$COLLECTOR")"
 # the extracted shim is a plausible SIZE before evaluating it.
 SHIM_LINES=$(printf '%s
 ' "$SHIM" | wc -l)
-if [ "$SHIM_LINES" -lt 5 ] || [ "$SHIM_LINES" -gt 80 ]; then
+if [ "$SHIM_LINES" -lt 5 ] || [ "$SHIM_LINES" -gt 200 ]; then
     printf 'FAIL  hashing-shim extraction looks wrong (%s lines) - the sed range is not bounded
 ' "$SHIM_LINES"
     exit 2
@@ -124,6 +124,43 @@ shape_case "9fce5e72d5371e842fbc8804567f94a323c07f468b0e3fa547819cc51ff9e3zz" re
 eval "$_ir_saved_raw"
 
 
+
+
+# --- EXPORT COVERAGE ----------------------------------------------------------------------
+# The manifest step hashes every file through `bash -c`, and a bash -c child inherits ONLY
+# exported functions. When irhash was split into a validating wrapper plus a raw backend, the
+# collector exported the wrapper alone, so in the child it called an undefined helper and every
+# digest came back ERR - 43 of 48 manifest rows in a measured run (2026-07-28). This test file
+# evaluates the whole shim in ONE shell, so it can never reproduce that by execution; the export
+# list has to be asserted directly.
+#
+# Derived, not hardcoded: take every function the collector defines, see which ones irhash's body
+# actually calls, and require each to be exported. A future split under any name is covered.
+EXPORT_LINE="$(grep -E '^export -f ' "$COLLECTOR" | head -1)"
+if [ -z "$EXPORT_LINE" ]; then
+    printf 'FAIL  the collector has no `export -f` line - the manifest child gets no hashing functions
+'
+    FAIL=$((FAIL+1))
+else
+    IRHASH_BODY="$(sed -n '/^irhash() {/,/^}/p' "$COLLECTOR")"
+    ALL_FUNCS="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*\(\)' "$COLLECTOR" | tr -d '()' | sort -u)"
+    DEPS=''
+    for f in $ALL_FUNCS; do
+        [ "$f" = irhash ] && continue
+        case "$IRHASH_BODY" in *"$f"*) DEPS="$DEPS $f";; esac
+    done
+    printf 'ok    irhash dependencies discovered from source:%s
+' "${DEPS:- (none)}"
+    for dep in irhash $DEPS; do
+        case " $EXPORT_LINE " in
+            *" $dep "*) printf 'ok    %s is exported to bash -c children
+' "$dep";;
+            *) printf 'FAIL  %s is called by the manifest but NOT in `export -f` - every digest becomes ERR
+' "$dep"
+               FAIL=$((FAIL+1));;
+        esac
+    done
+fi
 
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi

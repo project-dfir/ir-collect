@@ -32,7 +32,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | B2 | **Destination full** | Linux: 3 MB loop fs. Windows: 40 MB VHD filled to <96 KB free — **assert a 512 KB write is refused before judging** | Refuse up front rather than dying mid-run with no diagnosis | ✅ **BOTH VERIFIED**. Linux field-tested. Windows: 4th attempt induced the condition (76 KB free, 512 KB write refused) and found the seal-time ENOSPC fallback cannot help — a destination full from the first write kills the run before `Invoke-Seal`, so no `run_state.json` and the fallback never fires. Fixed with a 64 MB destination preflight: **verified exit 40 with the refusal message**. The case folder does remain, containing only `audit.log` with the `PREFLIGHT REFUSED` line — that is deliberate, it is the custody record that a collection was attempted and declined |
 | B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; seal what exists somewhere writable; say the destination vanished | ⬜ **high value, untested** |
 | B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ⬜ |
-| B5 | **UNC auth failure** | wrong credentials to an SMB share | Fail at preflight, not after an hour of collecting | ⬜ |
+| B5 | **UNC auth failure** | wrong credentials to an SMB share | Warn at preflight, keep collecting (evidence is staged locally), never report a clean run when the evidence never arrived | ✅ CLOSED 2026-07-28 - see below |
 | B6 | **MAX_PATH exceeded** | long `-Dest`, or deep nested profile paths | Refuse up front with an actionable message; never report success for a tree that was never written | ✅ CLOSED 2026-07-28 - found the worst false-success yet, see below |
 
 ## C. Process lifetime
@@ -266,3 +266,40 @@ every path-derived operation in the script; until that is done, the collector re
 **Result.** 229-char dest → exit 40, refusal naming the limit and the length, nothing left
 behind. Normal dest → exit 0, COMPLETE, 49 files. Three mutations of the new probe caught in
 both directions.
+
+## B5 - UNC auth failure (CLOSED 2026-07-28)
+
+**Setup.** `-Dest \<dc>\C$` from range-WS02, where the write is genuinely denied. Establishing
+that condition took three attempts, all of them harness bugs worth recording: `New-Item` on a
+nonexistent share reported success (the probe trusted the absence of an exception instead of
+reading the file back), and the UNC literal lost a backslash in transit **twice**, so the paths
+were relative and resolved to local directories - which is why five impossible destinations,
+including a host that does not exist, all "passed". The final probe builds the prefix from
+`[char]92` and asserts `([uri]$p).IsUnc` before testing anything.
+
+**What the collector did.** Network destinations are staged locally and shipped at seal - the
+right design, since writing evidence across SMB during live response is slow and fragile. But
+nothing validated the share up front. `PREFLIGHT destination: 45.3 GB free` refers to the *local
+staging root*, not the target. So the operator ran the **entire collection** before learning the
+share was denied: 175 s for RapidOnly, 20+ minutes for `-Auto`. The end-state handling was
+already good - the bundle is retained locally and says so - but the run **exited 0**, so nothing
+automating it could tell the evidence never arrived.
+
+**Fixes.**
+1. `Test-NetworkDestination` probes the share at startup by creating, writing, reading back and
+   deleting a probe file. Bounded at 20 s in a background job, because an unreachable host takes
+   ~31 s to fail and waiting longer defeats the point of probing early. Falls back to a direct
+   probe if the job subsystem is blocked, rather than reporting a destination it never tested.
+2. It **warns, never refuses**. The evidence is staged locally and is not at risk, so aborting
+   would destroy volatile data over a credential problem. The operator is told at second 5 and
+   can fix the share while the run proceeds - the seal-time ship then succeeds.
+3. A failed ship sets exit **10**, not 0. The collection is intact, so this is not exit 15, but a
+   run that could not deliver its output must not report clean.
+4. The outcome is written to `<bundle>.zip.ship.json` **beside** the bundle, never inside it: the
+   bundle is already sealed and hashed, and an evidence container that changes after its manifest
+   is worthless. `run_state.json` records only what is knowable at seal time (target, whether the
+   preflight passed, and why not) plus a pointer to that file.
+
+**Result.** Warned at **0.3 s** instead of 197 s; exit **10**; `ship.json` carries
+`ok=false, error="Access is denied"`; manifest still 45 rows / 0 ERR, so the seal is untouched.
+A local destination still exits 0 with `attempted=false`.
