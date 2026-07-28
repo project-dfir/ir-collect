@@ -334,6 +334,15 @@ function Get-Backoff { param([string]$Cls,[int]$Attempt)
     switch ($Cls) { 'timeout' { return ($Attempt*$Attempt*1000) } 'net_unreachable' { return ($Attempt*$Attempt*1000) } 'file_locked' { return 2000 } default { return 400 } }
 }
 $script:RemTried = @{}
+$script:EmptySteps = @()
+# Steps whose emptiness means the collection FAILED at its core purpose, not merely that a query
+# had no results. A host genuinely has processes, network endpoints, services, and local users -
+# if these come back empty the data was not collected, whatever the exit code says. Everything
+# else that comes back empty is reported but not treated as fatal (some queries legitimately
+# return nothing, e.g. no shadow copies).
+$script:CriticalSteps = @('processes','proc-tree','proc-owners','tasklist-svc','drivers',
+                          'local-users','sysinfo','os-computer','netstat','tcp-conns',
+                          'udp-endpoints','services')
 # Invoke-Remediation: $true => retry now ; $false => give up. Each (id,class) fires once; hard cap 3 attempts.
 function Invoke-Remediation { param([string]$Cls,[string]$Name,[string]$Id,[string]$Phase,[int]$Attempt)
     if ($Attempt -ge 3) { return $false }
@@ -517,7 +526,20 @@ function Invoke-Step {
                 $bytes = if ($target -and (Test-Path $target)) { (Get-Item $target).Length } else { 0 }
                 $lines = if ($out) { @($out).Count } else { 0 }
                 Write-Audit ("STEP $id OK   | $Name | ${dur}s | try $attempt | lines=$lines" + $(if($target){" -> $(Split-Path $target -Leaf)"}))
-                Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines }
+                # A step that ran without error but produced NOTHING is not a success worth
+                # reporting as one. Measured on a range VM with WMI stopped: 10 core volatile
+                # artifacts (processes, process owners, TCP/UDP connections, services-by-task,
+                # drivers, local users, systeminfo, os/computer) silently vanished while the run
+                # reported verdict=COMPLETE, ok=33, failed=0 - identical to a healthy run. An
+                # analyst would read "no suspicious processes" from evidence that captured no
+                # processes at all. Record emptiness so the verdict can tell the truth.
+                if ($OutFile -and $bytes -le 2) {
+                    $script:EmptySteps += [pscustomobject]@{ id=$id; name=$Name; phase=$phase; file=$OutFile }
+                    Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines; empty=$true }
+                    Write-Audit "STEP $id OK-EMPTY | $Name | produced no output -> $OutFile"
+                } else {
+                    Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines }
+                }
                 $script:StepsOk++; return $out
             } else {
                 # timed out (either transport). The job (if any) is already stopped above. Kill any NATIVE
@@ -1257,6 +1279,8 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     if (-not $script:MemOk -and -not $RapidOnly) { $incomplete += "memory($($script:MemFailCode))" }
     # a destination that filled up means silent data loss somewhere - never seal that COMPLETE
     if ($script:DiskFull) { $incomplete += 'destination-full' }
+    $criticalEmpty = @($script:EmptySteps | Where-Object { $script:CriticalSteps -contains $_.name } | ForEach-Object { $_.name } | Sort-Object -Unique)
+    if ($criticalEmpty.Count) { $incomplete += "core-volatile-empty($($criticalEmpty -join '/'))" }
     $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$CaseId; host=$hostName; output_dir=$OutDir
@@ -1265,7 +1289,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
         memory_verified=[bool]$script:MemOk
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
-        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; by_error_class=$script:DiagClass; remediations=$script:DiagRem }
+        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; empty_outputs=@($script:EmptySteps | ForEach-Object { $_.name }); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
     $rsPath = Join-Path $Dirs.logs 'run_state.json'
     $rsJson = $rs | ConvertTo-Json -Depth 5
@@ -1371,6 +1395,22 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
                 $m = "$($f.msg)" -replace '\|','\|'
                 if ($m.Length -gt 120) { $m = $m.Substring(0,120) + '...' }
                 [void]$rep.AppendLine("| $($f.id) | $($f.name) | $($f.phase) | $($f.ev) | ``$($f.cls)`` | $m |")
+            }
+        }
+        [void]$rep.AppendLine("")
+        [void]$rep.AppendLine("## Steps that ran but produced NOTHING")
+        [void]$rep.AppendLine("")
+        if ($script:EmptySteps.Count -eq 0) { [void]$rep.AppendLine("None - every step that ran wrote output.") }
+        else {
+            [void]$rep.AppendLine("These exited without error but wrote an empty file. Ones marked CORE mean the")
+            [void]$rep.AppendLine("collection missed its primary purpose - a host always has processes, connections,")
+            [void]$rep.AppendLine("services and users, so empty here means the data was not captured.")
+            [void]$rep.AppendLine("")
+            [void]$rep.AppendLine("| step | name | phase | file | |")
+            [void]$rep.AppendLine("|---|---|---|---|---|")
+            foreach ($e in $script:EmptySteps) {
+                $crit = if ($script:CriticalSteps -contains $e.name) { '**CORE**' } else { '' }
+                [void]$rep.AppendLine("| $($e.id) | $($e.name) | $($e.phase) | $($e.file) | $crit |")
             }
         }
         [void]$rep.AppendLine("")
