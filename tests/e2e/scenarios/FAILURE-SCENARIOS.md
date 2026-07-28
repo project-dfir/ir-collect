@@ -418,3 +418,25 @@ somewhere writable* when the destination vanishes. It does not do that - the evi
 before the yank is lost with the mount. The run now reports that truthfully instead of claiming
 success, which is the more important half, but relocation of a part-written tree remains
 unimplemented on both platforms.
+
+## Audit-trail-order sweep (2026-07-28)
+
+`Write-Audit` / `audit()` both echo to the console **and** append to the audit log, and both
+swallow the file error. A call made before the log exists therefore *looks* like it worked - the
+operator sees the line on screen - while the custody record never receives it.
+
+This had already bitten twice: the Windows destination-probe note, and the Linux ship-target
+preflight verdict. The second was the worse one - **zero** bundles on disk contained the line, its
+absence was dismissed during review as "it goes to the audit log", and the missing field is
+exactly what distinguishes B4 from B5, so that scenario was untestable until it surfaced.
+
+`tests/unit/Test-AuditTrailOrder.ps1` now enforces the rule on both collectors: no top-level
+audit call before the log is opened, and where a message must be buffered, the buffer is set
+before the open and flushed after it. Only top-level calls count - a call inside a function
+defined early but invoked later is fine, so the Windows side walks the AST.
+
+**The first version of this test was blind and a mutation proved it.** The Linux half tracked
+function bodies by counting brace characters; every `${var}` expansion contributes braces, so the
+depth never returned to zero, the whole file read as "inside a function", and the check inspected
+nothing. Reintroducing the real B4 bug did **not** fail the test. It now anchors on a closing
+brace at column 0, and that same mutation fails as it should.
