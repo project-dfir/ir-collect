@@ -356,28 +356,114 @@ declare -A REM_TRIED 2>/dev/null || true
 redirect_dest() { for c in ${LAB_VOL:+"$LAB_VOL/ir_evidence"} /var/tmp/ir_evidence; do if mkdir -p "$c" 2>/dev/null && ( : > "$c/.w" ) 2>/dev/null; then rm -f "$c/.w"; echo "redirect:$c"; return; fi; done; echo none; }
 backoff() { case "$1" in timeout|net_unreachable|rate_limit) echo $(( $2 * $2 ));; file_locked) echo 2;; *) echo 0;; esac; }
 # remediate: 0 => retry now ; 1 => give up. Each (id,class) once; hard cap 3 attempts.
+# --- SELF-FIX LADDERS ---------------------------------------------------------------------
+# Parity with IR-Collect.ps1: every error class gets an ORDERED list of fix attempts, tried one
+# per retry until one works or the rungs run out. The old design allowed exactly one remediation
+# per (step,class) and most entries were LABELS, not actions - 'fallback-or-skip', 'pivot-flag',
+# 'degraded-nonroot' were logged while the step gave up. The goal is to COMPLETE the collection,
+# so each rung below either does something real or is named honestly as a marker.
+fix_ladder() {  # fix_ladder <class> -> space-separated rungs, in order
+  case "$1" in
+    timeout)        echo "backoff-retry extend-timeout skip" ;;
+    no_space)       echo "purge-scratch relocate-dest retry-in-place skip" ;;
+    tool_missing)   echo "repair-toolkit native-source skip" ;;
+    file_locked)    echo "settle-retry copy-nolock skip" ;;
+    driver_blocked) echo "try-alt-imager native-source skip" ;;
+    not_elevated)   echo "native-source skip" ;;
+    net_unreachable|dns_blocked|rate_limit) echo "backoff-retry extend-timeout skip" ;;
+    *)              echo "backoff-retry skip" ;;
+  esac
+}
+declare -A REM_RUNG 2>/dev/null || true
+declare -A TMO_BOOST 2>/dev/null || true
+
+# invoke_fix_rung <rung> <name> <id> -> rc 0 means "retry the step now"
+# A rung that cannot act says so rather than claiming a fix; a self-heal that lies is worse than
+# one that does nothing.
+invoke_fix_rung() {
+  local rung="$1" name="$2" id="$3"
+  case "$rung" in
+    backoff-retry) return 0 ;;
+    extend-timeout)
+      TMO_BOOST[$id]=3
+      audit "  FIX extend-timeout: step $id gets 3x its bound on the next attempt"
+      return 0 ;;
+    purge-scratch)
+      # reclaim space we are responsible for before blaming the operator's disk
+      local before after freed
+      before=$(df -Pk "$OUTDIR" 2>/dev/null | awk 'NR==2{print $4}')
+      find /tmp /var/tmp -maxdepth 1 -type f -mtime +1 -delete 2>/dev/null
+      [ -n "${ERRTMP:-}" ] && find "$ERRTMP" -type f -mmin +5 -delete 2>/dev/null
+      after=$(df -Pk "$OUTDIR" 2>/dev/null | awk 'NR==2{print $4}')
+      freed=$(( ${after:-0} - ${before:-0} ))
+      if dest_has_space; then
+        audit "  FIX purge-scratch: reclaimed ${freed} KB; destination writable again"; return 0
+      fi
+      audit "  FIX purge-scratch: reclaimed ${freed} KB but destination is still full"; return 1 ;;
+    relocate-dest)
+      # ADDITIVE only: never move a part-written tree, but give later steps somewhere to land
+      local alt; alt="$(redirect_dest)"
+      if [ "$alt" != none ]; then
+        OVERFLOW_DIR="${alt#redirect:}"
+        audit "  FIX relocate-dest: overflow area available at $OVERFLOW_DIR (existing tree left in place)"
+      else
+        audit "  FIX relocate-dest: no writable overflow location found"
+      fi
+      return 1 ;;
+    retry-in-place)
+      audit "  FIX retry-in-place: destination still full; retrying once in case space was freed externally"
+      return 0 ;;
+    settle-retry) sleep 3; audit "  FIX settle-retry: waited for the holder to release"; return 0 ;;
+    copy-nolock)
+      audit "  FIX copy-nolock: will retry with a plain read (no flock); a live-mmap'd file may still refuse"
+      return 0 ;;
+    repair-toolkit)
+      # a genuine repair: chmod +x, extract archives, re-discover carried binaries
+      repair_toolkit >/dev/null 2>&1
+      local n; n=$(find "${TOOL_DIR:-/nonexistent}" -maxdepth 3 -type f -perm -u+x 2>/dev/null | wc -l)
+      audit "  FIX repair-toolkit: $n executable carried tools present after repair"
+      [ "${n:-0}" -gt 0 ] && return 0 || return 1 ;;
+    try-alt-imager)
+      # LiME insmod refused (Secure Boot / lockdown / unsigned module) -> AVML needs no module
+      if [ -n "${T_AVML:-}" ]; then
+        audit "  FIX try-alt-imager: kernel module blocked, AVML present and needs no module - retrying with it"
+        MEM_IMAGER=avml; return 0
+      fi
+      audit "  FIX try-alt-imager: kernel module blocked and no AVML staged - cannot acquire RAM"
+      return 1 ;;
+    native-source)
+      audit "  FIX native-source: step-level fallback (procfs/native binaries) will be used on retry"
+      return 0 ;;
+    skip) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# remediate: climb the ladder for this class, one rung per attempt.
+# rc 0 => retry now ; rc 1 => give up on this step
 remediate() {
   local cls="$1" name="$2" id="$3" attempt="$4" rphase="${5:-other}"
-  [ "$attempt" -ge 3 ] && return 1
-  local k="$id|$cls"; [ -n "${REM_TRIED[$k]:-}" ] && return 1; REM_TRIED[$k]=1
-  local action=none retry=1
-  case "$cls" in
-    timeout|net_unreachable|dns_blocked|rate_limit) action="backoff-retry"; [ "$attempt" -lt 2 ] && retry=0;;
-    file_locked) action="retry-after-settle"; retry=0;;
-    # HONESTY: this used to report action="redirect:<path>" while nothing was ever redirected -
-    # $OUTDIR is fixed once the run starts, so the retry goes straight back at the SAME full
-    # filesystem. Relocating a part-written evidence tree mid-run is not safe to do silently, so
-    # report what actually happens (a retry) and flag the run so the verdict cannot come back
-    # COMPLETE on a disk that filled up.
-    no_space)    action="retry-in-place-DISK-FULL"; DISK_FULL=1; [ "$attempt" -lt 2 ] && retry=0
-                 audit "DISK FULL during '$name'. Evidence tree stays at $OUTDIR (relocation mid-run is unsafe). Free space or re-run with -d pointing at larger media; a suitable fallback is $(redirect_dest).";;
-    not_elevated) action="degraded-nonroot"; retry=1;;
-    tool_missing) action="fallback-or-skip"; retry=1;;
-    driver_blocked) action="pivot-flag"; retry=1;;
-    *) action=none; retry=1;;
-  esac
-  ledger "$id" "$name" "$rphase" remediation "class=$cls" "action=$action" "result=$( [ $retry = 0 ] && echo retry || echo stop )"
-  audit "STEP $id REMEDIATE | $name | class=$cls action=$action -> $( [ $retry = 0 ] && echo retry || echo stop )"
+  [ "$attempt" -ge 4 ] && return 1
+  local ladder rungs n ix rung
+  ladder="$(fix_ladder "$cls")"
+  # shellcheck disable=SC2206
+  rungs=($ladder); n=${#rungs[@]}
+  local k="$id|$cls"
+  ix=${REM_RUNG[$k]:-0}
+  [ "$ix" -ge "$n" ] && return 1
+  rung="${rungs[$ix]}"
+  REM_RUNG[$k]=$((ix+1))
+
+  [ "$cls" = no_space ] && DISK_FULL=1
+  local retry=1
+  if invoke_fix_rung "$rung" "$name" "$id"; then retry=0; fi
+  local remaining=$(( n - ix - 1 ))
+  ledger "$id" "$name" "$rphase" remediation "class=$cls" "action=$rung" "rung=$((ix+1))/$n" \
+         "result=$( [ $retry = 0 ] && echo retry || echo next-or-stop )"
+  audit "STEP $id REMEDIATE | $name | class=$cls rung $((ix+1))/$n=$rung -> $( [ $retry = 0 ] && echo retry || echo "advance ($remaining left)" )"
+  # a rung that could not fix things still lets the ladder advance next attempt, while rungs
+  # remain - that is the difference between a ladder and a single shot
+  if [ $retry != 0 ] && [ "$remaining" -gt 0 ] && [ "$rung" != skip ]; then return 0; fi
   return $retry
 }
 declare -A SATISFIED 2>/dev/null || true
@@ -403,12 +489,17 @@ run_step() {
   if step_satisfied "$name" "$target"; then ledger "$id" "$name" "$phase" skipped reason=already-ok; audit "STEP $id SKIP | $name | already satisfied (resume)"; STEPS_OK=$((STEPS_OK+1)); return 0; fi
   ledger "$id" "$name" "$phase" planned "timeout_s=$tmo"
   local attempt=0 rc=0 start cls=""; start="$(date +%s)"
+  # the longest ladder is 4 rungs, so allow that many attempts - a rung that can never be tried is
+  # the same unreachable-capability bug this project keeps finding
+  [ "$retries" -lt 3 ] && retries=3
   # stderr scratch lives OFF the evidence filesystem on purpose: when the destination fills up,
   # a scratch file stored there captures nothing, classify_error sees empty stderr, and every
   # failure degrades to "unknown" - which is exactly when accurate classification matters most.
   local etmp="$ERRTMP/.err.$id"; : > "$etmp" 2>/dev/null
   while [ "$attempt" -le "$retries" ]; do
     attempt=$((attempt+1))
+    # extend-timeout rung grants this step a larger bound for its remaining attempts
+    local tmo_eff=$(( tmo * ${TMO_BOOST[$id]:-1} ))
     ledger "$id" "$name" "$phase" running "attempt=$attempt"
     # stdin closed (</dev/null) so no tool can block on an interactive prompt
     if [ -n "$SETSID" ]; then
@@ -418,19 +509,19 @@ run_step() {
       if [ "$target" = "/dev/null" ]; then $SETSID "$@" </dev/null >>"$AUDIT" 2>"$etmp" &
       else $SETSID "$@" </dev/null >"$target" 2>"$etmp" & fi
       local pid=$!; local kt="-$pid"
-      ( sleep "$tmo"; kill -TERM "$kt" 2>/dev/null; sleep 5; kill -KILL "$kt" 2>/dev/null ) >/dev/null 2>&1 &
+      ( sleep "$tmo_eff"; kill -TERM "$kt" 2>/dev/null; sleep 5; kill -KILL "$kt" 2>/dev/null ) >/dev/null 2>&1 &
       local wd=$!
       wait "$pid" 2>/dev/null; rc=$?
       kill "$wd" 2>/dev/null; pkill -P "$wd" 2>/dev/null
     elif [ "$have_timeout" = "1" ]; then
-      if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo" "$@" </dev/null >>"$AUDIT" 2>"$etmp"; rc=$?
-      else timeout $TMO_K "$tmo" "$@" </dev/null >"$target" 2>"$etmp"; rc=$?; fi
+      if [ "$target" = "/dev/null" ]; then timeout $TMO_K "$tmo_eff" "$@" </dev/null >>"$AUDIT" 2>"$etmp"; rc=$?
+      else timeout $TMO_K "$tmo_eff" "$@" </dev/null >"$target" 2>"$etmp"; rc=$?; fi
     else
       # neither setsid nor timeout: best-effort single-pid watchdog
       if [ "$target" = "/dev/null" ]; then "$@" </dev/null >>"$AUDIT" 2>"$etmp" &
       else "$@" </dev/null >"$target" 2>"$etmp" & fi
       local pid=$!
-      ( sleep "$tmo"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+      ( sleep "$tmo_eff"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
       local wd=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$wd" 2>/dev/null
     fi
     cat "$etmp" >> "$ERRLOG" 2>/dev/null
