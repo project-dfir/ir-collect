@@ -510,7 +510,14 @@ invoke_fix_rung() {
       if dest_has_space; then
         audit "  FIX purge-scratch: reclaimed ${freed} KB; destination writable again"; return 0
       fi
-      audit "  FIX purge-scratch: reclaimed ${freed} KB but destination is still full"; return 1 ;;
+      # "still full" is a claim about space. A destination that has been UNMOUNTED or removed is
+      # not full, it is GONE, and telling the operator to free space sends them the wrong way.
+      if [ ! -d "$OUTDIR" ]; then
+        audit "  FIX purge-scratch: destination $OUTDIR NO LONGER EXISTS (unmounted or removed mid-run) - this is not a space problem"
+      else
+        audit "  FIX purge-scratch: reclaimed ${freed} KB but destination is still full"
+      fi
+      return 1 ;;
     relocate-dest)
       # ADDITIVE only: never move a part-written tree, but give later steps somewhere to land
       local alt; alt="$(redirect_dest)"
@@ -1410,8 +1417,24 @@ MREOF
     audit "LAB host-pull hint ($HYPERVISOR): $hint"
   fi
   audit "===== ir-collect DONE | OK=$STEPS_OK FAIL=$STEPS_FAIL TOTAL=$STEP_NUM ====="
-  echo; echo "Collection complete. Output: $OUTDIR"
-  echo "Summary: $OUTDIR/SUMMARY.md  |  Audit: $AUDIT"
+  # Never announce a completed collection without confirming the evidence is actually THERE.
+  # Measured 2026-07-28 (scenario B3): the destination was unmounted mid-run, all 32 steps failed,
+  # and this still printed "Collection complete. Output: <path>" for a directory that no longer
+  # existed - the operator walks away believing they have a bundle. The Windows twin gained this
+  # guard during B6; this is the parity fix.
+  _bundle_files=$(find "$OUTDIR" -type f 2>/dev/null | wc -l)
+  echo
+  if [ "${_bundle_files:-0}" -eq 0 ]; then
+    echo "COLLECTION PRODUCED NO EVIDENCE. Nothing was written to: $OUTDIR"
+    echo "The destination became unwritable or disappeared during the run. Re-run against writable media."
+  elif [ "${RUN_INCOMPLETE:-0}" = "1" ]; then
+    echo "Collection INCOMPLETE (${_bundle_files} files). Output: $OUTDIR"
+  else
+    echo "Collection complete (${_bundle_files} files). Output: $OUTDIR"
+  fi
+  # Only point at the summary and audit log when they exist. Printing paths into a destination
+  # that vanished sends the operator to look for files that were never written.
+  [ "${_bundle_files:-0}" -gt 0 ] && echo "Summary: $OUTDIR/SUMMARY.md  |  Audit: $AUDIT"
 }
 
 # ---------------------------------------------------------------------------

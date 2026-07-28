@@ -30,7 +30,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | B1 | **Read-only media** | mount a loop image `-o ro` | Detect, redirect, log the redirect | ✅ |
 | B2 | **Destination full** | Linux: 3 MB loop fs. Windows: 40 MB VHD filled to <96 KB free — **assert a 512 KB write is refused before judging** | Refuse up front rather than dying mid-run with no diagnosis | ✅ **BOTH VERIFIED**. Linux field-tested. Windows: 4th attempt induced the condition (76 KB free, 512 KB write refused) and found the seal-time ENOSPC fallback cannot help — a destination full from the first write kills the run before `Invoke-Seal`, so no `run_state.json` and the fallback never fires. Fixed with a 64 MB destination preflight: **verified exit 40 with the refusal message**. The case folder does remain, containing only `audit.log` with the `PREFLIGHT REFUSED` line — that is deliberate, it is the custody record that a collection was attempted and declined |
-| B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; seal what exists somewhere writable; say the destination vanished | ⬜ **high value, untested** |
+| B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; say the destination vanished; never claim a bundle that is not there | ✅ CLOSED 2026-07-28 (Linux) - see below; ⚠️ relocation of a part-written tree still not implemented |
 | B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ✅ CLOSED 2026-07-28 - see below |
 | B5 | **UNC auth failure** | wrong credentials to an SMB share | Warn at preflight, keep collecting (evidence is staged locally), never report a clean run when the evidence never arrived | ✅ CLOSED 2026-07-28 - see below |
 | B6 | **MAX_PATH exceeded** | long `-Dest`, or deep nested profile paths | Refuse up front with an actionable message; never report success for a tree that was never written | ✅ CLOSED 2026-07-28 - found the worst false-success yet, see below |
@@ -379,3 +379,42 @@ pair is the assertion.
 local copy **retained** at 3,954,380 bytes; `ship.json` `preflight_ok: true, ok: false`; **0**
 files at the destination; the `net_unreachable` ladder ran backoff-retry -> extend-timeout ->
 skip; firewall rule removed.
+
+## B3 - destination yanked mid-run (CLOSED 2026-07-28, Linux)
+
+**Setup.** A 200 MB ext4 loop filesystem as `-d`, `umount -l` once the destination genuinely holds
+evidence (gated on >20 KB written **and** the collector still alive, not on a timer - a rapid run
+here finishes in ~6 s). An `EXIT` trap unmounts and removes the image whatever happens.
+
+**What the collector did (the defect).** All 32 steps failed, exit was correctly 15 and it did not
+hang - but it printed:
+
+```
+Collection complete. Output: /tmp/b3mnt/B3_rick-pve_20260728_153140Z
+Summary: .../SUMMARY.md  |  Audit: .../99_logs/audit.log
+```
+
+for a directory that no longer existed, then sent the operator to read two files that were never
+written. This is the **same false-success shape as B6**, which the Windows twin was fixed for -
+the shell collector never got that guard. It also misdiagnosed the cause: `FIX purge-scratch:
+reclaimed 0 KB but destination is still full`. The destination was not full, it was **gone**, and
+telling a responder to free space sends them the wrong way.
+
+**Fixes (parity with the Windows B6 work).**
+1. The closing line describes the tree on disk, not reaching the end of the script: zero files
+   prints `COLLECTION PRODUCED NO EVIDENCE` and names the likely cause; otherwise it reports the
+   real file count and whether the run was incomplete.
+2. The `Summary:`/`Audit:` paths are printed only when the bundle actually has files.
+3. `purge-scratch` distinguishes a destination that has **disappeared** from one that is full, and
+   says so.
+
+**Result.** Negative control: `COLLECTION PRODUCED NO EVIDENCE`, correct diagnosis
+(`NO LONGER EXISTS (unmounted or removed mid-run) - this is not a space problem`), exit 15, no
+hang (14 s), no phantom paths. Positive control: a normal destination still reports
+`Collection INCOMPLETE (48 files)` with the true count.
+
+**Still open, honestly.** The scenario's stated bar also asks the collector to *seal what it has
+somewhere writable* when the destination vanishes. It does not do that - the evidence written
+before the yank is lost with the mount. The run now reports that truthfully instead of claiming
+success, which is the more important half, but relocation of a part-written tree remains
+unimplemented on both platforms.
