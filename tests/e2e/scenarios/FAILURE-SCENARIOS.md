@@ -31,7 +31,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | B1 | **Read-only media** | mount a loop image `-o ro` | Detect, redirect, log the redirect | ✅ |
 | B2 | **Destination full** | Linux: 3 MB loop fs. Windows: 40 MB VHD filled to <96 KB free — **assert a 512 KB write is refused before judging** | Refuse up front rather than dying mid-run with no diagnosis | ✅ **BOTH VERIFIED**. Linux field-tested. Windows: 4th attempt induced the condition (76 KB free, 512 KB write refused) and found the seal-time ENOSPC fallback cannot help — a destination full from the first write kills the run before `Invoke-Seal`, so no `run_state.json` and the fallback never fires. Fixed with a 64 MB destination preflight: **verified exit 40 with the refusal message**. The case folder does remain, containing only `audit.log` with the `PREFLIGHT REFUSED` line — that is deliberate, it is the custody record that a collection was attempted and declined |
 | B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; seal what exists somewhere writable; say the destination vanished | ⬜ **high value, untested** |
-| B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ⬜ |
+| B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ✅ CLOSED 2026-07-28 - see below |
 | B5 | **UNC auth failure** | wrong credentials to an SMB share | Warn at preflight, keep collecting (evidence is staged locally), never report a clean run when the evidence never arrived | ✅ CLOSED 2026-07-28 - see below |
 | B6 | **MAX_PATH exceeded** | long `-Dest`, or deep nested profile paths | Refuse up front with an actionable message; never report success for a tree that was never written | ✅ CLOSED 2026-07-28 - found the worst false-success yet, see below |
 
@@ -350,3 +350,32 @@ Windows twin has refused since B2. Linux now performs the same preflight (creata
 Verified with both controls: a normal destination still collects (exit 15, bundle created); a
 3 MB loop filesystem is refused with exit 40, names the actual free space, and leaves **zero**
 files behind.
+
+## B4 - network destination dies mid-ship (CLOSED 2026-07-28)
+
+**Setup.** Ship to `root@127.0.0.1`, then `iptables -I OUTPUT -o lo -p tcp --dport 22 -j DROP`
+once the preflight has passed. Dropping loopback SSH only - the controlling session runs over the
+ethernet interface and is untouched - and the rule is removed by an `EXIT` trap that loops until
+`iptables -C` reports it gone.
+
+**The distinguishing signature.** B5 (destination bad from the start) and B4 (destination dies
+after validation) must not look alike in the record. B5 leaves `preflight_ok: false, ok: false`;
+B4 leaves **`preflight_ok: true, ok: false`** - the destination was verified, then died. That
+pair is the assertion.
+
+**Three attempts were refused before one counted**, and the refusals are the point:
+1. The run finished in 7 s before the route could be dropped - and the harness *scored it anyway*
+   because a fallback read the audit log without checking the process was still alive. A
+   **successful** ship was nearly recorded as B4. Gate fixed to require preflight-passed **and**
+   the collector still running.
+2. Grepping the console for the preflight verdict found nothing - it goes to the audit log.
+3. Polling the audit log found nothing either, which exposed a **real bug in the shell collector
+   shipped the previous iteration**: the ship preflight runs long before `$OUTDIR/99_logs` exists,
+   so its `audit` call wrote the verdict **nowhere**. Zero bundles on disk contained the line. The
+   console echo had made it look present. The verdict is now buffered and flushed as soon as the
+   custody trail opens.
+
+**Result.** Route dropped with the collector confirmed running and SSH confirmed dead: exit 15;
+local copy **retained** at 3,954,380 bytes; `ship.json` `preflight_ok: true, ok: false`; **0**
+files at the destination; the `net_unreachable` ladder ran backoff-retry -> extend-timeout ->
+skip; firewall rule removed.

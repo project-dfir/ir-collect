@@ -251,10 +251,14 @@ test_network_dest() {
 if [ -n "$NETWORK_DEST" ]; then
   if test_network_dest "$NETWORK_DEST"; then
     NET_PROBE_OK=1
-    audit "PREFLIGHT ship target: $NETWORK_DEST is writable."
+    # The audit log does not exist yet - this probe runs long before $OUTDIR/99_logs is created.
+    # Calling audit() here wrote the verdict NOWHERE: measured 2026-07-28, zero bundles contained
+    # the line. Buffer it and flush once the custody trail is open. (The console echo below is
+    # immediate either way, so the operator is never left waiting for it.)
+    PENDING_SHIP_AUDIT="PREFLIGHT ship target: $NETWORK_DEST is writable."
   else
     NET_PROBE_OK=0
-    audit "PREFLIGHT SHIP TARGET UNWRITABLE: $NETWORK_DEST - $NET_PROBE_REASON. Collection CONTINUES and the bundle will be retained locally; fix access now if you want it shipped."
+    PENDING_SHIP_AUDIT="PREFLIGHT SHIP TARGET UNWRITABLE: $NETWORK_DEST - $NET_PROBE_REASON. Collection CONTINUES and the bundle will be retained locally; fix access now if you want it shipped."
     echo ""
     echo "  !! Ship target $NETWORK_DEST is NOT writable: $NET_PROBE_REASON"
     echo "  !! Collecting anyway - evidence is staged locally and will be retained there."
@@ -708,6 +712,7 @@ run_sh() {
 IS_ROOT=0; [ "$(id -u)" = "0" ] && IS_ROOT=1
 audit "===== ir-collect START ====="
 audit "Case=$CASE Host=$HOSTN Output=$OUTDIR root=$IS_ROOT timeout=${STEP_TIMEOUT}s"
+[ -n "${PENDING_SHIP_AUDIT:-}" ] && audit "$PENDING_SHIP_AUDIT"
 [ "$CASE_RAW" != "$CASE" ] && audit "CASE ID normalised for the filesystem: '$CASE_RAW' -> '$CASE'. The original is preserved here and in the run metadata; only the directory name was changed."
 DET=""; for kv in "avml:$T_AVML" "lime:$T_LIME" "uac:$T_UAC" "ldapsearch:$T_LDAP" "bloodhound-python:$T_BHPY" "netexec:$T_NXC"; do
   [ -n "${kv#*:}" ] && DET="$DET ${kv%%:*}"; done
