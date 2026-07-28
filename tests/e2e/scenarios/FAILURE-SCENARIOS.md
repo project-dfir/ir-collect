@@ -61,7 +61,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ✅ tested on WS02 — found the worst defect of the session (see below); `wmi_failure` still never fires because the steps do not error, they return nothing — emptiness detection is what catches it |
 | E2 | **No `sha256sum`** (stock macOS/BSD/busybox) | `HASH_BACKEND` forced per backend | shasum/sha256/openssl/digest/python3 fallback | ✅ unit-tested across 4 backends |
-| E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ⚠️ PARTIAL 2026-07-29 - no-hang and the clock UNAVAILABLE path proven; AD steps NOT yet exercised (see below) |
+| E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ⚠️ DEFECT FOUND 2026-07-29 - skips cleanly and does not hang, but does NOT mark incomplete: 14 empty AD artifacts sealed as COMPLETE (see below) |
 | E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to |
 | E5 | **PS 2.0 / Server 2008R2** | old guest | `Get-Inv` WMI path; graceful degradation | ⬜ |
 
@@ -690,3 +690,48 @@ too, and a bounded wait inside the guest is not a substitute.
 teardown moves inside the guest script (block, run, evaluate, unblock, all in one process), or a
 watchdog scheduled task removes the rules at a fixed deadline regardless of what the orchestrator
 does.
+
+### E3 attempt 3 - the AD steps finally ran, and found a defect (2026-07-29)
+
+**What made it runnable.** The whole scenario in ONE guest script, launched detached as a
+scheduled task, writing progress to a status file this session polls; teardown in `finally`; a
+watchdog task removing the firewall rules at a hard deadline regardless. The orchestrator's
+~10-minute cap stopped mattering. Attempts 1 and 2 failed purely on orchestration.
+
+**Condition genuinely live throughout:** `after block: 445=False 389=False`, and the status log
+records `dcBlocked=True` at every checkpoint across the whole `-Auto` run.
+
+**Two halves of the bar are met.** Nothing hung - the run completed on its own - and every AD step
+finished rather than blocking on the dead DC. The clock step reported
+`Reference peer: NONE REACHABLE` / `Measured offset: UNAVAILABLE`, which is the E4 path behaving
+exactly as designed under a real outage.
+
+**The third half is not.** With the DC unreachable, **fourteen** AD steps produced no output at
+all - `ad-domain, ad-users, ad-groups, ad-computers, ad-spn, ad-asrep, ad-uncons, ad-cons,
+ad-rbcd, ad-admincount, ad-trusts-ldap, ad-laps, ad-this-host` (plus `copy-pshistory`,
+`web-root-timeline`). The collector **noticed** - they are all listed in
+`diagnostics.empty_outputs` - and then sealed the bundle anyway:
+
+```
+verdict    : COMPLETE
+counts     : ok=85 failed=0 timeout=0 skipped=0
+incomplete : (empty)
+errclass   : {}
+```
+
+An analyst receives a bundle stamped COMPLETE, from a **domain-joined** host, containing no domain
+data whatsoever, with nothing in the verdict to say the domain was never reached.
+
+**Root cause.** `$script:CriticalSteps` - the list whose emptiness drives the verdict - covers
+core volatile artifacts (processes, netstat, services, local users) and was never extended to the
+AD section. Emptiness detection works; it just does not apply here. This is the same shape as the
+E1/WMI defect, one section further along, and the same shape as A3: the tool sees the gap and does
+not let it reach the verdict.
+
+**Fix required (not yet implemented):** on a domain-joined host, empty AD enumeration must reach
+the verdict - ideally naming the cause, since "the DC was unreachable" is knowable at the time
+(the same probe the clock step already makes). Deliberately not rushed in at the end of an
+iteration: a verdict change needs its own live `-Auto` run to verify, and that is 20 minutes.
+
+**Range restored:** E3B bundle removed, `IRTEST-BlockDC*` rules 0, DC 445 reachable, E3Run and
+IRWatchdog tasks deleted, C:\evidence back to 3 directories.
