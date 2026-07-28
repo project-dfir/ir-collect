@@ -26,6 +26,13 @@
 .PARAMETER IncludeGroundTruth  With -Auto, also run the hours-long ground-truth jobs (7 full-FS hash, 8 disk image).
 .PARAMETER RapidOnly    Run only Stage 1 (volatile) and seal.
 .PARAMETER SkipAD       Never run the AD phase.
+.PARAMETER AllowConstrainedLanguage
+                        Proceed even though PowerShell is in ConstrainedLanguage. By default the
+                        collector REFUSES (exit 40): in that mode step construction and all hashing
+                        are blocked, so it cannot produce a manifest or custody digests, and the
+                        writable probe fails in a way that can redirect evidence onto the target's
+                        system drive. Prefer the native triage binaries in .	ools, or off-host
+                        acquisition. This switch collects partial, UNVERIFIABLE volatile data.
 .PARAMETER NoKeyCapture Skip BitLocker recovery-password / key-package capture. By default the
                         collector grabs them while the volume is unlocked, because a dead-box
                         image of an encrypted disk is unreadable without a key. Those outputs
@@ -53,6 +60,7 @@ param(
     [switch]$RapidOnly,
     [switch]$SkipAD,
     [switch]$NoKeyCapture, # skip BitLocker recovery-password / key-package capture (engagements where extracting key material is out of scope)
+    [switch]$AllowConstrainedLanguage, # proceed under ConstrainedLanguage; output is NOT verifiable evidence (no hashes/manifest)
     [switch]$IncludeGroundTruth,   # with -Auto: also run the hours-long ground-truth jobs (full-FS hash + disk image)
     [switch]$DeferMemory,  # capture RAM AFTER the volatile-command battery instead of before it
     [switch]$Lab,          # training/exercise mode: read-only-media launch, VM detection, HTTP egress, relaxed contamination
@@ -70,6 +78,38 @@ param(
 $ErrorActionPreference = 'Continue'   # self-heal: never let a single error stop the pipeline
 $ProgressPreference    = 'SilentlyContinue'  # speed + keep progress spinners out of captured output
 Set-StrictMode -Off
+
+# --- ConstrainedLanguage preflight: refuse to produce untrustworthy evidence -----------------
+# Measured on a real 5.1 host (2026-07-28): under ConstrainedLanguage the collector APPEARS to run
+# but is structurally broken - [scriptblock]::Create is blocked, which is how nearly every step is
+# built; the hashing shim never gets defined and Get-FileHash is unavailable, so NOTHING is hashed
+# (no manifest, no custody digests); Start-Job is refused; and the writable-probe throws, which the
+# destination logic reads as "read-only media" and silently REDIRECTS EVIDENCE ONTO THE SYSTEM
+# DRIVE of the machine under investigation - the inverse of what a collector must do.
+# A half-collection with no hashes, written to the target's C:, is worse than a clean refusal, so
+# stop here and say exactly why. -AllowConstrainedLanguage overrides for operators who want the
+# partial volatile data anyway and accept that it is NOT verifiable evidence.
+# Everything in this block must itself be CLM-safe: property reads, string compares, Write-Host only.
+$script:LangMode = "$($ExecutionContext.SessionState.LanguageMode)"
+if ($script:LangMode -ne 'FullLanguage') {
+    Write-Host ''
+    Write-Host "  !! PowerShell language mode is $($script:LangMode), not FullLanguage." -ForegroundColor Red
+    Write-Host '  !! IR-Collect cannot produce verifiable evidence in this mode:' -ForegroundColor Red
+    Write-Host '  !!   - step construction ([scriptblock]::Create) is blocked' -ForegroundColor Red
+    Write-Host '  !!   - no hashing is available, so there is no manifest and no custody digests' -ForegroundColor Red
+    Write-Host '  !!   - the writable probe fails, so evidence can be redirected onto the target C:' -ForegroundColor Red
+    Write-Host ''
+    Write-Host '  Usual cause: WDAC/AppLocker policy on a hardened endpoint.' -ForegroundColor Yellow
+    Write-Host '  Do instead: run from a signed/allow-listed path, use the Velociraptor or CyLR' -ForegroundColor Yellow
+    Write-Host '  triage binaries in .\tools (native executables, unaffected by language mode),' -ForegroundColor Yellow
+    Write-Host '  or acquire off-host (VM snapshot / disk image).' -ForegroundColor Yellow
+    Write-Host ''
+    if (-not $AllowConstrainedLanguage) {
+        Write-Host '  Refusing to run. Pass -AllowConstrainedLanguage to collect UNVERIFIABLE partial data anyway.' -ForegroundColor Red
+        exit 40
+    }
+    Write-Host '  -AllowConstrainedLanguage set: continuing. Output will NOT be verifiable evidence.' -ForegroundColor Yellow
+}
 try { [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture } catch {}  # deterministic CSV/number/date
 
 # --- 32-bit-on-64-bit relaunch: a 32-bit pwsh sees SysWOW64/WOW6432Node, silently
@@ -1225,7 +1265,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
         memory_verified=[bool]$script:MemOk
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
-        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); hash_backend=$script:HashBackend; by_error_class=$script:DiagClass; remediations=$script:DiagRem }
+        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
     $rsPath = Join-Path $Dirs.logs 'run_state.json'
     $rsJson = $rs | ConvertTo-Json -Depth 5
