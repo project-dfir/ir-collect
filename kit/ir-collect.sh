@@ -31,6 +31,7 @@ set -o pipefail 2>/dev/null || true
 DEST="$(cd "$(dirname "$0")" && pwd)"
 CASE="IR"
 STEP_TIMEOUT=120
+NO_KEYS=0            # --no-keys: skip volume-master-key / LUKS-header capture
 AUTO=0
 RAPID_ONLY=0
 SKIP_AD=0
@@ -45,6 +46,7 @@ while [ $# -gt 0 ]; do
     -d|--dest)        DEST="$2"; shift 2 ;;
     -c|--case)        CASE="$2"; shift 2 ;;
     -t|--timeout)     STEP_TIMEOUT="$2"; shift 2 ;;
+    --no-keys)        NO_KEYS=1; shift ;;
     --auto)           AUTO=1; shift ;;
     --rapid-only)     RAPID_ONLY=1; shift ;;
     --resume)         RESUME_DIR="$2"; shift 2 ;;
@@ -71,6 +73,68 @@ STAT_FLAVOR=gnu; stat -c %s /dev/null >/dev/null 2>&1 || { stat -f %z /dev/null 
 FIND_FLAVOR=gnu; find --version >/dev/null 2>&1 || FIND_FLAVOR=bsd
 ARCH="$(uname -m 2>/dev/null)"
 fsize()  { case "$STAT_FLAVOR" in bsd) stat -f %z "$1" 2>/dev/null;; *) stat -c %s "$1" 2>/dev/null;; esac; }
+
+# --- hashing shim: sha256sum is NOT universal --------------------------------
+# GNU coreutils has sha256sum; stock macOS has `shasum -a 256` (and `md5`, not md5sum);
+# FreeBSD has `sha256`/`md5`; illumos has `digest`; some busybox builds have neither.
+# This script explicitly supports macos/bsd/solaris (see OS_FAMILY above), and every hash
+# site previously called sha256sum directly - so on those platforms the evidence manifest
+# comes out EMPTY and the per-file hash walk writes 'ERR', silently, while the run seals.
+# The Windows collector hit the same class of bug (Get-FileHash absent); keep both honest.
+# Resolve ONCE at startup, and record it so the operator can see which backend was used.
+HASH_BACKEND=none; MD5_BACKEND=none
+if   command -v sha256sum >/dev/null 2>&1;                    then HASH_BACKEND=sha256sum
+elif command -v shasum    >/dev/null 2>&1;                    then HASH_BACKEND=shasum
+elif command -v sha256    >/dev/null 2>&1;                    then HASH_BACKEND=sha256
+elif command -v openssl   >/dev/null 2>&1;                    then HASH_BACKEND=openssl
+elif command -v digest    >/dev/null 2>&1;                    then HASH_BACKEND=digest
+elif command -v python3   >/dev/null 2>&1;                    then HASH_BACKEND=python3
+fi
+if   command -v md5sum >/dev/null 2>&1;  then MD5_BACKEND=md5sum
+elif command -v md5    >/dev/null 2>&1;  then MD5_BACKEND=md5
+elif command -v openssl >/dev/null 2>&1; then MD5_BACKEND=openssl
+elif command -v python3 >/dev/null 2>&1; then MD5_BACKEND=python3
+fi
+# irhash <file> -> bare lowercase hex digest on stdout (empty + rc1 if nothing works)
+irhash() {
+  local f="$1"
+  case "$HASH_BACKEND" in
+    sha256sum) sha256sum    -- "$f" 2>/dev/null | cut -d' ' -f1 ;;
+    shasum)    shasum -a 256 -- "$f" 2>/dev/null | cut -d' ' -f1 ;;
+    sha256)    sha256 -q     "$f" 2>/dev/null ;;
+    openssl)   openssl dgst -sha256 "$f" 2>/dev/null | sed 's/.*= *//' ;;
+    digest)    digest -a sha256 "$f" 2>/dev/null ;;
+    python3)   python3 -c 'import hashlib,sys;h=hashlib.sha256()
+f=open(sys.argv[1],"rb")
+[h.update(c) for c in iter(lambda:f.read(1<<20),b"")]
+print(h.hexdigest())' "$f" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+irmd5() {
+  local f="$1"
+  case "$MD5_BACKEND" in
+    md5sum)  md5sum -- "$f" 2>/dev/null | cut -d' ' -f1 ;;
+    md5)     md5 -q "$f" 2>/dev/null ;;
+    openssl) openssl dgst -md5 "$f" 2>/dev/null | sed 's/.*= *//' ;;
+    python3) python3 -c 'import hashlib,sys;h=hashlib.md5()
+f=open(sys.argv[1],"rb")
+[h.update(c) for c in iter(lambda:f.read(1<<20),b"")]
+print(h.hexdigest())' "$f" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+# hash a whole tree the way the manifest needs it: "<digest>  <path>" per line
+irhash_tree() { local base="$1"; shift
+  ( cd "$base" 2>/dev/null || return 1
+    find . -type f "$@" -print | while IFS= read -r f; do
+      printf '%s  %s\n' "$(irhash "$f" 2>/dev/null || echo ERR)" "$f"
+    done )
+}
+# run_sh executes snippets in `bash -c` children, so the shim must cross that boundary:
+# export the functions AND the resolved backends they switch on.
+export HASH_BACKEND MD5_BACKEND
+export -f irhash irmd5 2>/dev/null || true
 HOSTN="$(hostname 2>/dev/null || echo unknown)"
 STAMP="$(date -u +%Y%m%d_%H%M%SZ)"
 
@@ -212,9 +276,24 @@ if command -v timeout >/dev/null 2>&1; then
   timeout -k 1 1 true >/dev/null 2>&1 && TMO_K="-k 5"
 fi
 SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid"
+# EXEC MODE - the Linux twin of the Windows collector's background-job vs in-process report.
+# Which watchdog we get materially changes what a hung step does, so the operator must see it:
+#   setsid-pgroup  - preferred: kills the WHOLE process group, so `dd | gzip` dies as a unit
+#   timeout-cmd    - GNU timeout: signals only its direct child; pipeline grandchildren can orphan
+#   bare-watchdog  - neither available (busybox/minimal): single-PID best-effort only
+if   [ -n "$SETSID" ];        then EXEC_MODE="setsid-pgroup"
+elif [ "$have_timeout" = 1 ]; then EXEC_MODE="timeout-cmd"
+else                               EXEC_MODE="bare-watchdog"; fi
+# operator/test override, mirrors IRCOLLECT_FORCE_INPROC on the Windows side
+case "${IRCOLLECT_FORCE_EXEC:-}" in
+  timeout)  SETSID=""; EXEC_MODE="timeout-cmd" ;;
+  bare)     SETSID=""; have_timeout=0; EXEC_MODE="bare-watchdog" ;;
+esac
 NICE=""; command -v nice >/dev/null 2>&1 && NICE="nice -n 19"; command -v ionice >/dev/null 2>&1 && NICE="ionice -c3 $NICE"
 
 # ===== completion ledger + self-troubleshoot + resume =====
+NL=$'
+'   # real newline, for building multi-line diagnostics strings
 jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t'; }
 ledger() { # ledger id name phase ev [k=v ...]
   [ -n "${STATE_JSONL:-}" ] || return 0
@@ -243,7 +322,7 @@ redirect_dest() { for c in ${LAB_VOL:+"$LAB_VOL/ir_evidence"} /var/tmp/ir_eviden
 backoff() { case "$1" in timeout|net_unreachable|rate_limit) echo $(( $2 * $2 ));; file_locked) echo 2;; *) echo 0;; esac; }
 # remediate: 0 => retry now ; 1 => give up. Each (id,class) once; hard cap 3 attempts.
 remediate() {
-  local cls="$1" name="$2" id="$3" attempt="$4"
+  local cls="$1" name="$2" id="$3" attempt="$4" rphase="${5:-other}"
   [ "$attempt" -ge 3 ] && return 1
   local k="$id|$cls"; [ -n "${REM_TRIED[$k]:-}" ] && return 1; REM_TRIED[$k]=1
   local action=none retry=1
@@ -256,7 +335,7 @@ remediate() {
     driver_blocked) action="pivot-flag"; retry=1;;
     *) action=none; retry=1;;
   esac
-  ledger "$id" "$name" other remediation "class=$cls" "action=$action" "result=$( [ $retry = 0 ] && echo retry || echo stop )"
+  ledger "$id" "$name" "$rphase" remediation "class=$cls" "action=$action" "result=$( [ $retry = 0 ] && echo retry || echo stop )"
   audit "STEP $id REMEDIATE | $name | class=$cls action=$action -> $( [ $retry = 0 ] && echo retry || echo stop )"
   return $retry
 }
@@ -320,13 +399,18 @@ run_step() {
     fi
     # classify + bounded self-troubleshoot (each fix logged as a custody action)
     cls="$(classify_error "$name" "$rc" "$etmp")"
-    if remediate "$cls" "$name" "$id" "$attempt"; then retries=$attempt; sleep "$(backoff "$cls" "$attempt")"; continue; fi
+    if remediate "$cls" "$name" "$id" "$attempt" "$phase"; then retries=$attempt; sleep "$(backoff "$cls" "$attempt")"; continue; fi
     if [ "$rc" = "124" ] || [ "$rc" = "137" ] || [ "$rc" = "143" ]; then audit "STEP $id WARN | $name | TIMEOUT ${tmo}s cls=$cls | try $attempt"
     else audit "STEP $id ERR  | $name | rc=$rc cls=$cls | try $attempt"; fi
     [ "$attempt" -le "$retries" ] && sleep 0.4
   done
   case "$rc" in 124|137|143) term=timeout;; *) term=failed;; esac
-  ledger "$id" "$name" "$phase" "${term:-failed}" "attempt=$attempt" "exit_code=$rc" "error_class=${cls:-unknown}" "error_msg=$(head -c 200 "$etmp" 2>/dev/null | tr -d '\n\r')"
+  # a killed step usually leaves EMPTY stderr, which left the diagnostics rollup showing a blank
+  # sample for the timeout class (the Windows collector had the same gap) - synthesise a message
+  local emsg; emsg="$(head -c 200 "$etmp" 2>/dev/null | tr -d '\n\r')"
+  [ -z "$emsg" ] && [ "${term:-failed}" = timeout ] && emsg="exceeded ${tmo}s timeout"
+  [ -z "$emsg" ] && emsg="exit code $rc, no stderr"
+  ledger "$id" "$name" "$phase" "${term:-failed}" "attempt=$attempt" "exit_code=$rc" "error_class=${cls:-unknown}" "error_msg=$emsg"
   echo "$(now_utc) [$id] $name : ${term:-failed} rc=$rc cls=${cls:-?}" >> "$ERRLOG"
   STEPS_FAIL=$((STEPS_FAIL+1)); rm -f "$etmp"; return 0     # swallow: never abort
 }
@@ -353,7 +437,7 @@ audit "Pro tools detected:${DET:- (none - native only)}"
 # Record hashes of the binaries we are about to trust/use (integrity baseline)
 integrity_baseline() {
   { for b in bash ps ss ip ls cat find sha256sum lsof ldapsearch dd tar; do
-      p="$(command -v "$b" 2>/dev/null)"; [ -n "$p" ] && printf '%s  %s\n' "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)" "$p"
+      p="$(command -v "$b" 2>/dev/null)"; [ -n "$p" ] && printf '%s  %s\n' "$(irhash "$p" 2>/dev/null || echo ERR)" "$p"
     done; } > "$D_META/used_binaries_sha256.txt" 2>/dev/null
 }
 
@@ -427,6 +511,119 @@ rapid_volatile() {
   # without the key - capture encryption state (and note master keys live in RAM we are imaging).
   run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; if lsblk -o FSTYPE,TYPE 2>/dev/null | grep -qiE "crypto_LUKS|(^|[[:space:]])crypt([[:space:]]|$)"; then echo "ENCRYPTED=yes"; else echo "ENCRYPTED=no"; fi; echo "NOTE: if encrypted, the master key is in the RAM image; extract before shutdown."'
 
+  # --- VOLUME ENCRYPTION KEYS, while the volumes are still unlocked --------------------------
+  # The step above records that a disk is encrypted; that alone does not make a dead-box image
+  # readable. These do. Order of volatility applies to KEYS too: once the box is powered off the
+  # dm-crypt master key is gone from kernel memory and the image is unreadable without the user's
+  # passphrase, which an uncooperative or unavailable custodian may never provide.
+  #   * dmsetup table --showkeys : the live VOLUME MASTER KEY of every unlocked dm-crypt target,
+  #     in hex. This is the decisive artifact - it decrypts the image directly, no passphrase
+  #     needed (cryptsetup open --master-key-file / dmsetup create against the acquired image).
+  #   * luksHeaderBackup : without the LUKS header even a CORRECT passphrase cannot open the
+  #     image, and header destruction is a known ransomware / anti-forensic move. Cheap insurance.
+  #   * crypttab + keyfile inventory : how the volume is unlocked at boot, and whether a keyfile
+  #     on another (unencrypted) volume would do it.
+  # SENSITIVITY: these outputs ARE the keys to the evidence. Handle the bundle accordingly - see
+  # the generated 00_metadata/DECRYPTION-KEYS.md. Pass --no-keys to skip if the engagement's
+  # authority does not extend to extracting key material.
+  if [ "${NO_KEYS:-0}" = "1" ]; then
+    audit "KEY CAPTURE SKIPPED (--no-keys): volume master keys / LUKS headers NOT collected."
+    run_sh meta-keys-skipped ENCRYPTION_KEYS_SKIPPED.txt "$D_META" 10 0 'echo "Volume-encryption key capture was disabled with --no-keys. A dead-box image of an encrypted volume will NOT be readable without the custodian passphrase."'
+  else
+    run_sh meta-volkeys volume_master_keys.txt "$D_META" 60 1 '
+      echo "*** SENSITIVE: these are VOLUME MASTER KEYS - they decrypt the evidence. ***"
+      echo "=== dm-crypt targets (table --showkeys) ==="
+      if command -v dmsetup >/dev/null 2>&1; then
+        dmsetup ls --target crypt 2>/dev/null | grep -v "No devices found" | while read -r nm _; do
+          [ -z "$nm" ] && continue
+          echo "--- $nm ---"
+          dmsetup table --showkeys "$nm" 2>/dev/null
+          echo "    (fields: start len crypt <cipher> <MASTER-KEY-HEX> <iv-offset> <device> <offset> ...)"
+        done
+      else echo "dmsetup not present - cannot read live master keys"; fi
+      echo "=== cipher/keysize per active LUKS mapping ==="
+      if command -v cryptsetup >/dev/null 2>&1; then
+        dmsetup ls --target crypt 2>/dev/null | grep -v "No devices found" | while read -r nm _; do
+          [ -n "$nm" ] && { echo "--- $nm ---"; cryptsetup status "$nm" 2>/dev/null; }
+        done
+      fi
+      echo "=== /etc/crypttab ==="; cat /etc/crypttab 2>/dev/null || echo "(none)"
+      echo "=== keyfiles referenced by crypttab ==="
+      awk "!/^#/ && NF>=3 {print \$3}" /etc/crypttab 2>/dev/null | while read -r kf; do
+        case "$kf" in none|-|"") continue;; esac
+        if [ -f "$kf" ]; then echo "$kf : PRESENT ($(wc -c <"$kf" 2>/dev/null) bytes)"; else echo "$kf : missing"; fi
+      done
+      echo "=== kernel keyring (fscrypt/eCryptfs material) ==="
+      command -v keyctl >/dev/null 2>&1 && { keyctl show @u 2>/dev/null; keyctl show @s 2>/dev/null; } || echo "keyctl not present"
+      command -v fscryptctl >/dev/null 2>&1 && fscryptctl get_policy / 2>/dev/null
+      true'
+    # LUKS header backups - binary, one file per device, needed to use a passphrase against the image
+    run_sh meta-luksheaders luks_header_backup.log "$D_META" 120 0 '
+      command -v cryptsetup >/dev/null 2>&1 || { echo "cryptsetup absent - no header backups taken"; exit 0; }
+      lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}" | while read -r d; do
+        out="'"$D_META"'/luks_header_$(echo "$d" | tr "/" "_").img"
+        if cryptsetup luksHeaderBackup "$d" --header-backup-file "$out" 2>&1; then
+          echo "$d -> $(basename "$out") ($(wc -c <"$out" 2>/dev/null) bytes)"
+        else echo "$d -> header backup FAILED"; fi
+      done
+      true'
+  fi
+
+  # Captured key material is only useful if the next analyst knows how to apply it months later,
+  # so ship the procedure WITH the keys rather than assuming institutional knowledge.
+  cat > "$D_META/DECRYPTION-KEYS.md" 2>/dev/null <<'DKEOF'
+# Reading this evidence when the volumes are encrypted
+
+(If the run used `--no-keys`, the key files below were deliberately NOT collected -
+only the RAM-recovery route at the end of this document applies.)
+
+**These files are the keys to the evidence.** Anyone holding this bundle can decrypt the imaged
+volumes. Store and transfer it at the classification of the data it protects, and record its
+custody. If your authority did not extend to key extraction, the collector supports `--no-keys`.
+
+## What was captured (00_metadata/)
+| File | What it is |
+|---|---|
+| `volume_master_keys.txt` | Live dm-crypt **master keys** (hex) from `dmsetup table --showkeys`, plus cipher/keysize, `/etc/crypttab`, keyfile inventory, kernel keyring |
+| `luks_header_*.img` | Per-device LUKS header backups (`cryptsetup luksHeaderBackup`) |
+| `encryption.txt` | Which volumes are encrypted, `luksDump` metadata |
+| `../03_memory/` | RAM image - the master key is also recoverable from here if the above failed |
+
+## Using a master key against an acquired image (no passphrase needed)
+The `dmsetup table` line looks like:
+
+    0 1953125 crypt aes-xts-plain64 <MASTER-KEY-HEX> 0 8:2 32768
+
+Take `<MASTER-KEY-HEX>`, the cipher, and the final number (the **data offset in 512-byte
+sectors**, here 32768 = 16 MiB), then on the analysis box:
+
+    printf '%s' '<MASTER-KEY-HEX>' | xxd -r -p > /tmp/mk.bin      # hex -> raw key
+    losetup --find --show --read-only /evidence/disk.raw          # -> /dev/loopN
+    cryptsetup open --type luks --master-key-file /tmp/mk.bin \
+        --readonly /dev/loopN decrypted                            # LUKS w/ header intact
+    mount -o ro,noload /dev/mapper/decrypted /mnt/evidence
+
+If the LUKS header is missing or damaged, map the raw payload directly instead - note the offset
+is applied to the LOOP device, and `dmsetup` sizes are in 512-byte sectors:
+
+    SZ=$(blockdev --getsz /dev/loopN)
+    echo "0 $((SZ-32768)) crypt aes-xts-plain64 <MASTER-KEY-HEX> 0 /dev/loopN 32768" \
+      | dmsetup create decrypted --readonly
+
+Restore a header first if you have one and prefer the normal path:
+
+    cryptsetup luksHeaderRestore /dev/loopN --header-backup-file luks_header_dev_sda3.img
+
+## If no master key was captured
+Recover it from the RAM image instead - the key is resident while the volume is unlocked:
+`volatility3 -f memory.lime linux.luksscan` / `linux.pslist` + `bulk_extractor -e aes`, or
+`cryptsetup open --key-file` with a custodian-provided passphrase and the header backup.
+
+## Verify before you rely on it
+Decrypt, then confirm the filesystem mounts read-only and its UUID matches `encryption.txt`.
+Never mount the original evidence read-write; always work from a copy or a read-only loop device.
+DKEOF
+
   # --- RAM IMAGE FIRST (RFC 3227: memory is the most volatile capturable artifact) ---
   if [ "$DEFER_MEM" = "0" ]; then
     echo "Capturing physical memory first (order of volatility)..."
@@ -481,6 +678,29 @@ enough_space() {  # enough_space <need_kib> <what>
     audit "PREFLIGHT $what: ABORT - need $((need/1024)) MB, have $((avail/1024)) MB free"; return 1; fi
   audit "PREFLIGHT $what: OK - $((avail/1024)) MB free (need ~$((need/1024)) MB)"; return 0
 }
+# resolve_mem_verdict <bytes> <need> <have_image 0|1> <stable 0|1> <imager_present 0|1>
+#   -> "<code>|<reason>|<hint>"  on stdout
+# Pure (no I/O) so it is unit-testable - see tests/unit/test-mem-verdict.sh. Mirrors the Windows
+# collector's Resolve-MemVerdict, including the ORDERING RULE: absence of a tool, then absence of
+# a file, BEFORE the stability signal - stability is only meaningful once a file exists. Getting
+# that order wrong is what made the Windows side report "file still growing" and blame Secure Boot
+# on hosts where no imager had ever been staged.
+resolve_mem_verdict() {
+  local bytes="$1" need="$2" have="$3" stable="$4" imager="$5"
+  local blocked="Secure Boot / kernel lockdown / module signing may have blocked it."
+  if [ "$have" = 1 ] && [ "${bytes:-0}" -ge "${need:-0}" ] && [ "$stable" = 1 ]; then
+    printf 'verified||'; return 0
+  fi
+  if   [ "$imager" != 1 ]; then printf 'no-imager-staged|%s|%s' \
+        "no acquisition tool was staged (place 'avml' in ./tools/bin, or provide a LiME .ko)" \
+        "Stage an imager and re-run."
+  elif [ "$have" != 1 ];   then printf 'no-image-produced|%s|%s' "the imager ran but produced no image file" "$blocked"
+  elif [ "$stable" != 1 ]; then printf 'image-growing|%s|%s'     "file still growing (imager not finished)" "$blocked"
+  else printf 'image-too-small|image too small for its format (%s MB < %s MB)|%s' \
+        "$(( ${bytes:-0} / 1024 / 1024 ))" "$(( ${need:-0} / 1024 / 1024 ))" "$blocked"
+  fi
+}
+
 job_memory() {
   [ -n "${DONE[memory]}" ] && { audit "RAM already captured - skipping."; return; }
   audit "--- RAM image (volatile #1) ---"
@@ -491,24 +711,48 @@ job_memory() {
   if ! enough_space $(( memkb * 11 / 10 )) RAM-image; then
     run_sh mem-skip-space RAM_SKIPPED_NO_SPACE.txt "$D_MEM" 10 0 'echo "RAM image skipped: insufficient destination free space."'; DONE[memory]=1; return
   fi
+  MEM_IMAGER=""   # which acquisition tool actually ran (drives the verdict reason below)
   if [ -n "$T_AVML" ]; then
+    MEM_IMAGER=avml
     run_step mem-avml - "$D_MEM" 3600 0 "$T_AVML" "$D_MEM/memory.lime"
   elif [ -n "$T_LIME" ]; then
+    MEM_IMAGER=lime
     run_sh mem-lime - "$D_MEM" 3600 0 "insmod '$T_LIME' 'path=$D_MEM/memory.lime format=lime'"
   else
     audit "RAM: no AVML/LiME found (place 'avml' in ./tools/bin). Capturing /proc/kcore note only."
     run_sh mem-fallback RAM_NOT_CAPTURED.txt "$D_MEM" 30 0 'echo "No AVML/LiME. Recommended: microsoft/avml (single static binary, no kernel module needed)."; ls -l /proc/kcore 2>/dev/null; free -h'
   fi
-  # verify a REAL image exists (silent-fail: no AVML/LiME or blocked -> tiny/no file, seals GREEN)
-  MEM_BYTES=0
-  for f in "$D_MEM"/memory.lime "$D_MEM"/memory.raw; do [ -f "$f" ] && MEM_BYTES=$(( MEM_BYTES + $(stat -c %s "$f" 2>/dev/null || echo 0) )); done
+  # verify a REAL image exists (silent-fail: no AVML/LiME or blocked -> tiny/no file, seals GREEN).
+  # Parity with the Windows collector's Resolve-MemVerdict: the REASON drives what the analyst
+  # does next, so "no imager was staged" (fix in seconds) must not be reported as "blocked by the
+  # kernel" (a host-hardening problem). Same ordering rule: absence of a tool, then absence of a
+  # file, BEFORE stability - stability is only meaningful once a file exists.
+  MEM_BYTES=0; local img=""
+  for f in "$D_MEM"/memory.lime "$D_MEM"/memory.raw; do
+    if [ -f "$f" ]; then local b; b="$(fsize "$f")"; b="${b:-0}"
+       [ "$b" -gt "${MEM_BYTES:-0}" ] 2>/dev/null && { MEM_BYTES="$b"; img="$f"; }
+    fi
+  done
   local need=$(( ${memkb:-8388608} * 1024 * 4 / 10 ))   # 40% of physical RAM in bytes
-  if [ "$MEM_BYTES" -ge "$need" ]; then
-    MEM_OK=1; audit "RAM VERIFIED: $((MEM_BYTES/1024/1024)) MB image (>= 40% of RAM)"
-    run_sh mem-hash memory_hashes.txt "$D_MEM" 1800 0 'cd "'"$D_MEM"'" && for f in memory.lime memory.raw; do [ -f "$f" ] && { echo "SHA256 $(sha256sum "$f")"; echo "MD5    $(md5sum "$f")"; }; done; true'
+  # stability check: a killed/hung imager leaves a partial that is still growing
+  local stable=0
+  if [ -n "$img" ]; then
+    local s1 s2; s1="$(fsize "$img")"; sleep 3; s2="$(fsize "$img")"
+    [ "${s1:-0}" = "${s2:-1}" ] && stable=1
+    MEM_BYTES="${s2:-$MEM_BYTES}"
+  fi
+  MEM_FAIL_CODE=verified
+  if [ -n "$img" ] && [ "${MEM_BYTES:-0}" -ge "$need" ] && [ "$stable" = 1 ]; then
+    MEM_OK=1
+    audit "RAM VERIFIED: $((MEM_BYTES/1024/1024)) MB image, stable (threshold $((need/1024/1024)) MB)"
+    run_sh mem-hash memory_hashes.txt "$D_MEM" 1800 0 'cd "'"$D_MEM"'" && for f in memory.lime memory.raw; do [ -f "$f" ] && { echo "SHA256 $(irhash "$f")  $f"; echo "MD5    $(irmd5 "$f")  $f"; }; done; true'
   else
-    MEM_OK=0; audit "RAM WARNING: only $((MEM_BYTES/1024/1024)) MB - capture likely FAILED (no AVML/LiME, or blocked). *** Do NOT power off an encrypted host without the LUKS key - the master key is only in RAM. ***"
-    run_sh mem-fail RAM_CAPTURE_FAILED.txt "$D_MEM" 10 0 'echo "RAM capture failed/incomplete. If the disk is LUKS-encrypted, do NOT power off without the key."'
+    MEM_OK=0
+    local v why hint
+    v="$(resolve_mem_verdict "$MEM_BYTES" "$need" "$( [ -n "$img" ] && echo 1 || echo 0 )" "$stable" "$( [ -n "$MEM_IMAGER" ] && echo 1 || echo 0 )")"
+    MEM_FAIL_CODE="${v%%|*}"; v="${v#*|}"; why="${v%%|*}"; hint="${v#*|}"
+    audit "RAM WARNING: $((MEM_BYTES/1024/1024)) MB - capture NOT verified [$MEM_FAIL_CODE]: $why. $hint *** Do NOT power off an encrypted host without the LUKS key - the master key is only in RAM. ***"
+    run_sh mem-fail RAM_CAPTURE_FAILED.txt "$D_MEM" 10 0 "echo \"RAM CAPTURE NOT VERIFIED [$MEM_FAIL_CODE]: $why. $hint If the disk is LUKS-encrypted, do NOT power off without the key.\""
   fi
   DONE[memory]=1
 }
@@ -539,7 +783,7 @@ job_persistence() {
 job_filehashes() {
   audit "--- HEAVY: full filesystem SHA-256 inventory ---"
   [ "${DO_NO_HARM:-0}" = "1" ] && { audit "filehashes skipped (do-no-harm/OT-ICS)"; run_sh hash-skip-ot FILEHASH_SKIPPED_OT.txt "$D_ART" 10 0 'echo "Skipped: do-no-harm (OT/ICS) mode - a full live-filesystem hash walk is too intrusive for control systems."'; DONE[filehashes]=1; return; }
-  run_sh hash-all filehashes.csv "$D_ART" 7200 0 "$NICE "'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(sha256sum "$f" 2>/dev/null | cut -d" " -f1); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,\"$f\""; done'
+  run_sh hash-all filehashes.csv "$D_ART" 7200 0 "$NICE "'find / -xdev -type f -print0 2>/dev/null | while IFS= read -r -d "" f; do h=$(irhash "$f" 2>/dev/null); s=$(stat -c "%s|%Y" "$f" 2>/dev/null); echo "${h:-ERR},$s,\"$f\""; done'
   DONE[filehashes]=1
 }
 job_ad() {
@@ -568,7 +812,7 @@ job_diskimage() {
   if command -v dd >/dev/null 2>&1; then
     for disk in $(lsblk -dnp -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'); do
       n="$(basename "$disk")"
-      run_sh disk-$n - "$D_DISK" 36000 0 "set -o pipefail; $NICE dd if=$disk conv=noerror,sync bs=4M status=progress 2>>'$AUDIT' | gzip > '$D_DISK/${n}.raw.gz' && sha256sum '$D_DISK/${n}.raw.gz' > '$D_DISK/${n}.sha256'"
+      run_sh disk-$n - "$D_DISK" 36000 0 "set -o pipefail; $NICE dd if=$disk conv=noerror,sync bs=4M status=progress 2>>'$AUDIT' | gzip > '$D_DISK/${n}.raw.gz' && irhash '$D_DISK/${n}.raw.gz' > '$D_DISK/${n}.sha256'"
     done
   else
     run_sh disk-note DISK_NOT_IMAGED.txt "$D_DISK" 30 0 'echo "dd not found - cannot image."'
@@ -667,31 +911,97 @@ EOF
   nplan=$(grep -c '"ev":"planned"' "$STATE_JSONL" 2>/dev/null)
   : "${nok:=0}" "${nfail:=0}" "${ntmo:=0}" "${nskip:=0}" "${nplan:=0}"
   local incomplete=""
-  [ "${MEM_OK:-0}" != 1 ] && [ "$RAPID_ONLY" != 1 ] && incomplete="memory(no-verified-RAM)"
+  # carry the specific reason so the verdict says what to fix, not just that RAM is missing
+  [ "${MEM_OK:-0}" != 1 ] && [ "$RAPID_ONLY" != 1 ] && incomplete="memory(${MEM_FAIL_CODE:-not-attempted})"
   local failed_names; failed_names=$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
   [ -n "$failed_names" ] && incomplete="$(echo "$incomplete $failed_names" | sed 's/^ //; s/ $//')"
   incomplete="$(printf %s "$incomplete" | tr -cd '[:alnum:] ._():/-' | sed 's/  */ /g; s/^ //; s/ $//')"
   local verdict=COMPLETE; [ -n "$incomplete" ] && verdict=INCOMPLETE
+
+  # --- self-diagnosis rollup (parity with the Windows collector's diagnostics{}) -------------
+  # Reduce run_state.jsonl into something an analyst reads at a glance: HOW steps executed, WHY
+  # they failed (grouped, with a sample message), and what the self-heal engine actually did.
+  # Pure sed/sort/awk - no jq, which is not present on a stock host.
+  local diag_cls_json="" diag_rem_json="" diag_cls_md="" diag_rem_md=""
+  if [ -f "$STATE_JSONL" ]; then
+    local cls_line first=1
+    while IFS='|' read -r cnt cls; do
+      [ -z "$cls" ] && continue
+      # first message seen for this class, as the human-readable sample
+      local sample; sample="$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null \
+        | grep "\"error_class\":\"$cls\"" | head -1 | sed -n 's/.*"error_msg":"\([^"]*\)".*/\1/p')"
+      [ "$first" = 1 ] || diag_cls_json="$diag_cls_json,"
+      diag_cls_json="$diag_cls_json\"$(jesc "$cls")\":{\"count\":$cnt,\"sample\":\"$(jesc "$sample")\"}"
+      diag_cls_md="${diag_cls_md}${diag_cls_md:+$NL}- ${cls}: ${cnt} step(s)$( [ -n "$sample" ] && printf ' - e.g. %s' "$sample" )"
+      first=0
+    done <<EOF
+$(grep -E '"ev":"(failed|timeout)"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"error_class":"\([^"]*\)".*/\1/p' | sort | uniq -c | awk '{print $1"|"$2}')
+EOF
+    first=1
+    while IFS='|' read -r cnt act; do
+      [ -z "$act" ] && continue
+      [ "$first" = 1 ] || diag_rem_json="$diag_rem_json,"
+      diag_rem_json="$diag_rem_json\"$(jesc "$act")\":$cnt"
+      diag_rem_md="$diag_rem_md ${act} x${cnt}"
+      first=0
+    done <<EOF
+$(grep '"ev":"remediation"' "$STATE_JSONL" 2>/dev/null | sed -n 's/.*"action":"\([^"]*\)".*"result":"\([^"]*\)".*/\1\/\2/p' | sort | uniq -c | awk '{print $1"|"$2}')
+EOF
+  fi
   cat > "$D_LOG/run_state.json" 2>/dev/null <<RSEOF
 { "schema":"ir-collect/run-state@1","tool":"ir-collect.sh","case":"$CASE","host":"$HOSTN","output_dir":"$OUTDIR",
   "ended_utc":"$end","status":"$( [ "$verdict" = COMPLETE ] && echo complete || echo partial )","resumed":$( [ -n "${RESUME_DIR:-}" ] && echo true || echo false ),
   "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
   "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
-  "completeness":{"verdict":"$verdict","incomplete":"$incomplete"} }
+  "completeness":{"verdict":"$verdict","incomplete":"$incomplete"},
+  "diagnostics":{"exec_mode":"$EXEC_MODE","hash_backend":"$HASH_BACKEND","by_error_class":{$diag_cls_json},"remediations":{$diag_rem_json}} }
 RSEOF
   { echo; echo "## Completeness - $verdict"; echo "- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)"; [ -n "$incomplete" ] && echo "- incomplete:$incomplete"; echo "- resume: ./kit/ir-collect.sh --resume '$OUTDIR'"; } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
+  # Diagnostics section - printed whenever something failed OR the exec path is degraded
+  if [ -n "$diag_cls_md" ] || [ "$EXEC_MODE" != "setsid-pgroup" ] || [ "$HASH_BACKEND" != "sha256sum" ]; then
+    { echo; echo "## Diagnostics (self-diagnosis)"
+      case "$EXEC_MODE" in
+        setsid-pgroup) echo "- exec mode: setsid process-group watchdog (preferred - a hung pipeline is killed as a unit)";;
+        timeout-cmd)   echo "- exec mode: \`timeout\` only (no setsid) - it signals just the direct child, so a hung pipeline can orphan grandchildren";;
+        bare-watchdog) echo "- exec mode: bare single-PID watchdog (no setsid, no timeout) - hang containment is best-effort only";;
+      esac
+      echo "- hash backend: $HASH_BACKEND$( [ "$HASH_BACKEND" = none ] && printf ' (NO hashing available - manifest entries will read ERR)' )"
+      [ -n "$diag_cls_md" ] && printf '%s\n' "$diag_cls_md"
+      [ -n "$diag_rem_md" ] && echo "- self-heal actions:$diag_rem_md"
+    } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
+  fi
   RUN_INCOMPLETE=$( [ "$verdict" = COMPLETE ] && echo 0 || echo 1 )
 
+  # Document the manifest's own gaps inside the bundle (parity with the Windows collector).
+  # Written BEFORE the manifest step so the note is itself covered by the manifest.
+  cat > "$D_LOG/MANIFEST-README.txt" 2>/dev/null <<MREOF
+MANIFEST-SHA256.txt coverage
+============================
+Format: <sha256>  <path relative to the evidence root>
+Hashes were produced with the '$HASH_BACKEND' backend (sha256sum is not present on every
+platform this collector supports - stock macOS uses shasum, FreeBSD sha256, illumos digest).
+A digest of 'ERR' means hashing failed for that file specifically.
+
+Deliberately NOT listed, and why:
+  99_logs/MANIFEST-SHA256.txt   the manifest cannot hash itself
+  99_logs/audit.log             still being appended to while the manifest runs
+  99_logs/errors.log            same
+  99_logs/audit.frozen.log      created after the manifest - a frozen snapshot of audit.log,
+                                hashed separately into MANIFEST-audit-log.sha256
+  MANIFEST-audit-log.sha256     created after the manifest; holds the hash above
+
+Anything else absent from the manifest was NOT excluded by design - treat it as unexplained.
+MREOF
   # manifest LAST so it covers SUMMARY.md
-  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' -print0 | xargs -0 sha256sum 2>/dev/null"
+  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' ! -path './99_logs/audit.frozen.log' -print | while IFS= read -r f; do printf '%s  %s\n' \"\$(irhash \"\$f\" 2>/dev/null || echo ERR)\" \"\$f\"; done"
   # freeze + hash the custody trail itself (excluded above because it is still being written)
-  cp -a "$AUDIT" "$D_LOG/audit.frozen.log" 2>/dev/null && ( cd "$OUTDIR" && sha256sum 99_logs/audit.frozen.log ) > "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Custody trail frozen + hashed."
+  cp -a "$AUDIT" "$D_LOG/audit.frozen.log" 2>/dev/null && ( cd "$OUTDIR" && printf '%s  %s\n' "$(irhash 99_logs/audit.frozen.log)" 99_logs/audit.frozen.log ) > "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Custody trail frozen + hashed."
 
   # ship the sealed bundle: scp/rsync to a collection server, and/or HTTP(S) POST to a lab collector
   if [ -n "$NETWORK_DEST" ] || [ -n "$HTTP_DEST" ]; then
     audit "Sealing + shipping evidence (${HTTP_DEST:-$NETWORK_DEST})"
     local zip="$OUTDIR.tar.gz"
-    run_sh seal-tar - "$D_LOG" 3600 0 "tar czf '$zip' -C '$OUT_ROOT' '$(basename "$OUTDIR")' && sha256sum '$zip' > '$zip.sha256'"
+    run_sh seal-tar - "$D_LOG" 3600 0 "tar czf '$zip' -C '$OUT_ROOT' '$(basename "$OUTDIR")' && irhash '$zip' > '$zip.sha256'"
     if [ -n "$NETWORK_DEST" ]; then
       local SSHOPT="-o StrictHostKeyChecking=accept-new"
       [ -n "$IR_SSH_KNOWN_HOSTS" ] && SSHOPT="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$IR_SSH_KNOWN_HOSTS"
@@ -942,5 +1252,5 @@ EXIT_CODE=0
 [ "${STEPS_FAIL:-0}" -gt 0 ] && EXIT_CODE=10
 [ "${RUN_INCOMPLETE:-0}" = "1" ] && EXIT_CODE=15
 [ "${MEM_OK:-0}" != "1" ] && [ "$RAPID_ONLY" != "1" ] && EXIT_CODE=20
-audit "EXIT $EXIT_CODE (0=clean 10=skips 20=no-RAM 40=fatal)"
+audit "EXIT $EXIT_CODE (0=clean 10=skips 15=incomplete-critical 20=no-RAM 40=fatal)"
 exit $EXIT_CODE

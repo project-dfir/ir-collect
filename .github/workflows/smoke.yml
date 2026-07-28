@@ -29,6 +29,16 @@ jobs:
             '::endgroup::'
           }
           if ($fail) { throw "$fail unit test file(s) failed" }
+      - name: Run tests/unit (bash)
+        shell: bash
+        run: |
+          fail=0
+          for t in tests/unit/test-*.sh; do
+            echo "::group::$(basename "$t")"
+            bash "$t" || { fail=$((fail+1)); echo "::error::$(basename "$t") failed"; }
+            echo "::endgroup::"
+          done
+          [ "$fail" = 0 ] || { echo "$fail bash unit test file(s) failed"; exit 1; }
 
   posix:
     name: posix (${{ matrix.os }})

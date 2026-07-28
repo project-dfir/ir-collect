@@ -44,6 +44,7 @@ param(
     [switch]$Auto,
     [switch]$RapidOnly,
     [switch]$SkipAD,
+    [switch]$NoKeyCapture, # skip BitLocker recovery-password / key-package capture (engagements where extracting key material is out of scope)
     [switch]$IncludeGroundTruth,   # with -Auto: also run the hours-long ground-truth jobs (full-FS hash + disk image)
     [switch]$DeferMemory,  # capture RAM AFTER the volatile-command battery instead of before it
     [switch]$Lab,          # training/exercise mode: read-only-media launch, VM detection, HTTP egress, relaxed contamination
@@ -124,6 +125,13 @@ function Get-IRMd5 { param([string]$Path)
 }
 '@
 . ([scriptblock]::Create($script:HashShimText))   # also define them in the parent scope
+# Record WHICH backend is live so the operator can see it in diagnostics (parity with the Linux
+# collector's hash_backend). 'dotnet-fallback' means Get-FileHash was missing or broken on this
+# host - worth knowing, because that is the condition that used to silently produce an all-'ERR'
+# manifest. Probe against this script file itself: always present, always readable.
+$script:HashBackend = try {
+    Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256 -ErrorAction Stop | Out-Null; 'Get-FileHash'
+} catch { 'dotnet-fallback' }
 
 if ([string]::IsNullOrWhiteSpace($Dest)) { $Dest = (Get-Location).Path }
 $hostName = $env:COMPUTERNAME
@@ -558,7 +566,104 @@ function Invoke-RapidVolatile {
     #     identity battery (systeminfo/os/tz/boot/env) runs AFTER the memory image below (RFC 3227). ---
     # CRITICAL while live: BitLocker status + recovery keys. If the disk is encrypted and you go
     # dead-box without these, the image is unreadable. Capture protectors/keys NOW.
+    $env:IRCOLLECT_META = $M   # so job children can write key packages next to the other metadata
+    if ($NoKeyCapture) {
+        Write-Audit 'KEY CAPTURE SKIPPED (-NoKeyCapture): BitLocker recovery passwords / key packages NOT collected.'
+        Collect 'keys-skipped' { 'Volume-encryption key capture was disabled with -NoKeyCapture. A dead-box image of an encrypted volume will NOT be readable without a custodian-supplied key.' } 'ENCRYPTION_KEYS_SKIPPED.txt' $M
+    } else {
     Collect 'bitlocker'      { Get-BitLockerVolume 2>$null | Format-List MountPoint,VolumeStatus,ProtectionStatus,EncryptionMethod,EncryptionPercentage,KeyProtector; '=== Recovery key protectors (manage-bde) ==='; foreach($d in (Get-Volume | Where-Object DriveLetter).DriveLetter){ "--- $d`: ---"; manage-bde -protectors -get "$($d):" 2>$null } } 'bitlocker_keys.txt' $M
+    # The block above dumps human-readable protector text. Two things it does NOT give you:
+    #  1. a MACHINE-READABLE recovery password per volume - the analyst had to eyeball 48 digits
+    #     out of prose months later, per volume. Emit an unambiguous <MountPoint>,<ID>,<password> file.
+    #  2. the BitLocker KEY PACKAGE - required by repair-bde to recover data from an image whose
+    #     metadata/sectors are damaged, which a recovery password alone cannot do.
+    Collect 'bitlocker-recovery-keys' {
+        'MountPoint,ProtectionStatus,KeyProtectorId,RecoveryPassword'
+        foreach ($v in (Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+            foreach ($kp in @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })) {
+                '{0},{1},{2},{3}' -f $v.MountPoint, $v.ProtectionStatus, $kp.KeyProtectorId, $kp.RecoveryPassword
+            }
+        }
+    } 'bitlocker_recovery_keys.csv' $M
+    Collect 'bitlocker-keypackage' {
+        # -id is required per protector; key packages are what repair-bde consumes
+        foreach ($v in (Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object { $_.ProtectionStatus -eq 'On' })) {
+            foreach ($kp in @($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' })) {
+                # env var, not $using: - Start-Job children inherit the environment, and the
+                # in-process fallback executor does not support $using: at all
+                $dest = Join-Path $env:IRCOLLECT_META ("keypackage_" + ($v.MountPoint -replace '[:\\]','') )
+                New-Item -ItemType Directory -Force $dest | Out-Null
+                "--- $($v.MountPoint) protector $($kp.KeyProtectorId) ---"
+                manage-bde -KeyPackage $v.MountPoint -id $kp.KeyProtectorId -path $dest 2>&1
+            }
+        }
+        'NOTE: key packages feed repair-bde when an image is damaged; a recovery password alone cannot repair.'
+    } 'bitlocker_keypackage.log' $M
+    # Other on-host encryption that also gates reading the evidence later
+    Collect 'other-crypto' {
+        '=== EFS certificates (private keys needed to read EFS files) ==='
+        cipher /y 2>&1
+        Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+            Where-Object { $_.EnhancedKeyUsageList.FriendlyName -match 'Encrypting File System' } |
+            Select-Object Thumbprint, Subject, NotAfter, HasPrivateKey | Format-List
+        '=== DPAPI master keys (decrypt browser logins / saved creds later) ==='
+        foreach ($p in (Get-ChildItem "$env:SystemDrive\Users" -Directory -Force -ErrorAction SilentlyContinue)) {
+            $mk = Join-Path $p.FullName 'AppData\Roaming\Microsoft\Protect'
+            if (Test-Path -LiteralPath $mk) { Get-ChildItem $mk -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName }
+        }
+        '=== Mounted VeraCrypt/TrueCrypt volumes ==='
+        Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue | Where-Object { $_.Label -match 'crypt' } | Format-Table Name,Label,Capacity -AutoSize
+        (Get-Process -Name 'VeraCrypt*','TrueCrypt*' -ErrorAction SilentlyContinue | Select-Object Name,Id | Format-Table -AutoSize | Out-String)
+    } 'other_encryption_keys.txt' $M
+    }
+    # Ship the procedure WITH the keys - the analyst who needs this may be months and several
+    # handovers away from whoever ran the collection.
+    $keyGuide = @'
+# Reading this evidence when the volumes are encrypted
+
+(If the run used `-NoKeyCapture`, the key files below were deliberately NOT collected -
+only the RAM-recovery route at the end of this document applies.)
+
+**These files are the keys to the evidence.** Anyone holding this bundle can decrypt the imaged
+volumes. Store and transfer it at the classification of the data it protects, and record its custody.
+
+## What was captured (00_metadata\)
+| File | What it is |
+|---|---|
+| `bitlocker_recovery_keys.csv` | Machine-readable `MountPoint,ProtectionStatus,KeyProtectorId,RecoveryPassword` - the 48-digit recovery passwords |
+| `bitlocker_keys.txt` | Full protector detail per volume (`manage-bde -protectors -get`) |
+| `keypackage_*\` | BitLocker key packages - what `repair-bde` needs when the image is DAMAGED |
+| `other_encryption_keys.txt` | EFS certs, DPAPI master-key paths, VeraCrypt/TrueCrypt indicators |
+| `..\03_memory\` | RAM image - the FVEK itself is only ever here |
+
+## Unlocking an acquired image with a recovery password
+Attach the image read-only (Arsenal Image Mounter / FTK Imager / `Mount-DiskImage -Access ReadOnly`),
+then against the BitLocker volume:
+
+    manage-bde -unlock X: -RecoveryPassword 123456-...-654321
+    manage-bde -status X:
+
+Linux analysis box, using the same recovery password:
+
+    cryptsetup bitlkOpen /dev/loopNp2 bde --key-file <(printf '%s' 'RECOVERY-PASSWORD')
+    # or: dislocker -r -V /dev/loopNp2 -p<RECOVERY-PASSWORD> -- /mnt/bde
+    mount -o ro,loop /mnt/bde/dislocker-file /mnt/evidence
+
+## When the volume metadata is damaged
+A recovery password alone will not repair a corrupt volume - this is what the key package is for:
+
+    repair-bde X: Y: -kp keypackage_C\<file> -rp 123456-...-654321
+
+## If no recovery password was captured
+The FVEK lives in RAM while the volume is unlocked - recover it from the memory image
+(`volatility3 windows.bitlocker`, or Passware/Elcomsoft against the raw image), or retrieve the
+recovery key escrowed in AD (`msFVE-RecoveryInformation`) or Entra ID / MDM.
+
+## Verify before you rely on it
+Unlock, confirm the filesystem mounts read-only, and check the volume GUID against
+`bitlocker_keys.txt`. Never write to the original evidence.
+'@
+    try { [IO.File]::WriteAllText((Join-Path $M 'DECRYPTION-KEYS.md'), $keyGuide, (New-Object Text.UTF8Encoding($false))) } catch {}
     # host clock vs collection clock (timeline provenance / skew)
     Collect 'clock-skew'     { 'Host local time : '+(Get-Date).ToString('o'); 'Host UTC time   : '+((Get-Date).ToUniversalTime().ToString('o')); 'NOTE: compare against a trusted external time source and record offset for timeline defensibility.' } 'clock_provenance.txt' $M
 
@@ -1036,14 +1141,15 @@ See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log
         counts=[ordered]@{ planned=$nplan; ok=$nok; failed=$nfail; timeout=$ntmo; skipped=$nskip }
         memory_verified=[bool]$script:MemOk
         completeness=[ordered]@{ verdict=$verdict; incomplete=@($incomplete) }
-        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
+        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); hash_backend=$script:HashBackend; by_error_class=$script:DiagClass; remediations=$script:DiagRem }
     }
     try { [IO.File]::WriteAllText((Join-Path $Dirs.logs 'run_state.json'), ($rs | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) } catch {}
     $comp = "`n## Completeness - $verdict`n- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)`n"
     if ($incomplete.Count -gt 0) { $comp += "- incomplete: $($incomplete -join ', ')`n" }
     $comp += "- resume: .\kit\IR-Collect.ps1 -CaseId '$CaseId' -Resume '$OutDir'`n"
-    if (($script:DiagClass.Count -gt 0) -or (-not $script:JobsOk)) {
+    if (($script:DiagClass.Count -gt 0) -or (-not $script:JobsOk) -or ($script:HashBackend -ne 'Get-FileHash')) {
         $comp += "`n## Diagnostics (self-diagnosis)`n- exec mode: $(if($script:JobsOk){'background-job'}else{'in-process fallback (job subsystem unavailable)'})`n"
+        $comp += "- hash backend: $script:HashBackend$(if($script:HashBackend -ne 'Get-FileHash'){' (Get-FileHash unavailable on this host - .NET fallback in use)'})`n"
         foreach($k in $script:DiagClass.Keys){ $sm=$script:DiagClass[$k].sample; $comp += "- ${k}: $($script:DiagClass[$k].count) step(s)$(if($sm){" - e.g. $sm"})`n" }
         if ($script:DiagRem.Count -gt 0) { $comp += "- self-heal actions: " + (($script:DiagRem.GetEnumerator()|ForEach-Object{"$($_.Key) x$($_.Value)"}) -join ', ') + "`n" }
     }
