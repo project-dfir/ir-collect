@@ -43,12 +43,12 @@ $script:HashShimText = $asg[0].Right.Expression.Value
 $dir = Join-Path ([IO.Path]::GetTempPath()) ("manitest_" + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force $dir | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $dir '99_logs') | Out-Null
-New-Item -ItemType Directory -Force (Join-Path $dir '05_artifacts\userhives\alice') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path (Join-Path (Join-Path $dir '05_artifacts') 'userhives') 'alice') | Out-Null
 
 $plainRel  = 'SUMMARY.md'
-$hiveRel   = '05_artifacts\userhives\alice\NTUSER.DAT'
-$auditRel  = '99_logs\audit.log'
-$manRel    = '99_logs\MANIFEST-SHA256.csv'
+$hiveRel   = Join-Path (Join-Path (Join-Path '05_artifacts' 'userhives') 'alice') 'NTUSER.DAT'
+$auditRel  = Join-Path '99_logs' 'audit.log'
+$manRel    = Join-Path '99_logs' 'MANIFEST-SHA256.csv'
 Set-Content (Join-Path $dir $plainRel) 'summary'   -Encoding UTF8
 Set-Content (Join-Path $dir $hiveRel)  'fakehive'  -Encoding UTF8
 Set-Content (Join-Path $dir $auditRel) 'audit'     -Encoding UTF8
@@ -70,10 +70,14 @@ if ($isWindows_) {
 # --- run the generated manifest script ---------------------------------------
 $scriptText = New-ManifestScript $dir
 $rows = & ([scriptblock]::Create($scriptText))
+# A backslash is an ordinary filename character on Linux, so building these paths as
+# backslash literals created ONE oddly-named directory and every coverage assertion compared
+# mismatched separators. The test asserts COVERAGE, not path formatting - normalise both sides.
+function Norm([string]$p) { $p.Replace([char]92, [char]47).TrimStart([char]47) }
 $covered = @{}
 foreach ($r in @($rows)) {
     $p = ($r -split ',', 3)
-    if ($p.Count -eq 3) { $covered[$p[2].TrimStart('\','/')] = $p[0] }
+    if ($p.Count -eq 3) { $covered[(Norm $p[2])] = $p[0] }
 }
 
 $fail = 0
@@ -86,16 +90,16 @@ Check ($scriptText -match '-Force') 'generated manifest script passes -Force to 
 # without the shim prepended, Get-IRSha256 is undefined inside the Start-Job child and every
 # row degrades to 'ERR' - assert the dependency explicitly so a refactor cannot drop it silently
 Check ($scriptText -match 'function Get-IRSha256') 'generated script carries the hashing shim (Start-Job children inherit no functions)'
-Check ($covered.ContainsKey($plainRel)) "covers a normal file ($plainRel)"
-Check ($covered.ContainsKey($hiveRel))  "covers a HIDDEN+SYSTEM per-user hive ($hiveRel)  <-- the regression"
-Check (-not $covered.ContainsKey($manRel))   'excludes MANIFEST-SHA256.csv itself (it is being written)'
-Check (-not $covered.ContainsKey($auditRel)) 'excludes the live audit.log (frozen copy is hashed separately)'
-if ($covered.ContainsKey($hiveRel)) {
-    Check ($covered[$hiveRel] -match '^[0-9A-Fa-f]{64}$') 'hive entry carries a real SHA-256, not ERR'
+Check ($covered.ContainsKey((Norm $plainRel))) "covers a normal file ($plainRel)"
+Check ($covered.ContainsKey((Norm $hiveRel)))  "covers a HIDDEN+SYSTEM per-user hive ($hiveRel)  <-- the regression"
+Check (-not $covered.ContainsKey((Norm $manRel)))   'excludes MANIFEST-SHA256.csv itself (it is being written)'
+Check (-not $covered.ContainsKey((Norm $auditRel))) 'excludes the live audit.log (frozen copy is hashed separately)'
+if ($covered.ContainsKey((Norm $hiveRel))) {
+    Check ($covered[(Norm $hiveRel)] -match '^[0-9A-Fa-f]{64}$') 'hive entry carries a real SHA-256, not ERR'
 }
 # every file present must be accounted for as either covered or deliberately excluded
-$expectExcluded = @($manRel, $auditRel)
-$onDisk = Get-ChildItem $dir -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($dir.Length).TrimStart('\','/') }
+$expectExcluded = @((Norm $manRel), (Norm $auditRel))
+$onDisk = Get-ChildItem $dir -Recurse -File -Force | ForEach-Object { Norm $_.FullName.Substring($dir.Length) }
 $unaccounted = @($onDisk | Where-Object { -not $covered.ContainsKey($_) -and $_ -notin $expectExcluded })
 Check ($unaccounted.Count -eq 0) "no file is silently unaccounted for (found $($unaccounted.Count): $($unaccounted -join ', '))"
 
