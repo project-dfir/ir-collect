@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Unit test for Test-DestHasSpace in kit/IR-Collect.ps1 (disk-full detection).
+    Unit test for Test-DestHasSpace in collectors/IR-Collect.ps1 (disk-full detection).
 
 .DESCRIPTION
     Extracts the shipped function via the AST and drives it against conditions that all raise
@@ -22,7 +22,7 @@ param([string]$CollectorPath)
 $ErrorActionPreference = 'Stop'
 if (-not $CollectorPath) {
     $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'kit') 'IR-Collect.ps1'
+    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'collectors') 'IR-Collect.ps1'
 }
 $col = (Resolve-Path $CollectorPath).Path
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($col, [ref]$null, [ref]$null)

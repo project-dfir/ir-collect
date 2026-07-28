@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for the hashing shim in kit/ir-collect.sh (Linux/macOS/BSD twin of
+# Unit test for the hashing shim in collectors/ir-collect.sh (Linux/macOS/BSD twin of
 # tests/unit/Test-HashShim.ps1).
 #
 # Extracts the shim straight out of the shipped collector (so the test cannot drift from
@@ -14,7 +14,7 @@
 # Usage: bash tests/unit/test-hash-shim.sh
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-COLLECTOR="${1:-$HERE/../../kit/ir-collect.sh}"
+COLLECTOR="${1:-$HERE/../../collectors/ir-collect.sh}"
 [ -f "$COLLECTOR" ] || { echo "collector not found: $COLLECTOR"; exit 2; }
 
 # pull out the shim block: from the backend resolution to the export line

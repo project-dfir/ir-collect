@@ -1117,7 +1117,7 @@ EOF
   "completeness":{"verdict":"$verdict","incomplete":"$incomplete"},
   "diagnostics":{"exec_mode":"$EXEC_MODE","hash_backend":"$HASH_BACKEND","by_error_class":{$diag_cls_json},"remediations":{$diag_rem_json}} }
 RSEOF
-  { echo; echo "## Completeness - $verdict"; echo "- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)"; [ -n "$incomplete" ] && echo "- incomplete:$incomplete"; echo "- resume: ./kit/ir-collect.sh --resume '$OUTDIR'"; } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
+  { echo; echo "## Completeness - $verdict"; echo "- steps: ok=$nok failed=$nfail timeout=$ntmo skipped=$nskip (planned=$nplan)"; [ -n "$incomplete" ] && echo "- incomplete:$incomplete"; echo "- resume: ./collectors/ir-collect.sh --resume '$OUTDIR'"; } >> "$OUTDIR/SUMMARY.md" 2>/dev/null
   # Diagnostics section - printed whenever something failed OR the exec path is degraded
   if [ -n "$diag_cls_md" ] || [ "$EXEC_MODE" != "setsid-pgroup" ] || [ "$HASH_BACKEND" != "sha256sum" ]; then
     { echo; echo "## Diagnostics (self-diagnosis)"

@@ -70,7 +70,7 @@ $Matrix = @{
   '10' = @{ role='server';           ip='198.51.100.131'; dom='pool.mine.example';    hash='' }
   'U'  = @{ role='workstation';      ip='';               dom='';                     hash='' }
 }
-# expected plan per scenario (mirrors kit/IR-Collect.ps1 $Scenarios) - the assertion oracle.
+# expected plan per scenario (mirrors collectors/IR-Collect.ps1 $Scenarios) - the assertion oracle.
 $ExpectPlan = @{
   '1'=@('1','9','2','3','4'); '2'=@('6','2','3'); '3'=@('2','4','7','6'); '4'=@('10','1','2','3','4')
   '5'=@('1','2','3','4'); '6'=@('3','5','2','4'); '7'=@('3','2','4','5'); '8'=@('1','3','4','2')
@@ -190,7 +190,7 @@ function Copy-KitToGuest {
     $sess = New-PSSession -VMName $VMName -Credential $GuestCred
     try {
         Invoke-Command -Session $sess -ScriptBlock { param($d) if(Test-Path $d){Remove-Item $d -Recurse -Force -EA SilentlyContinue}; New-Item -ItemType Directory -Force $d | Out-Null } -ArgumentList 'C:\ir-collector'
-        Copy-Item -ToSession $sess -Path (Join-Path $KitDir 'kit') -Destination 'C:\ir-collector\kit' -Recurse -Force
+        Copy-Item -ToSession $sess -Path (Join-Path $KitDir 'collectors') -Destination 'C:\ir-collector\kit' -Recurse -Force
         $ok = Invoke-Command -Session $sess -ScriptBlock { Test-Path 'C:\ir-collector\kit\IR-Collect.ps1' }
         if (-not $ok) { throw "kit did not land in guest" }
         Log "Kit staged in guest at C:\ir-collector\kit" 'OK'

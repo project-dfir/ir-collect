@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit test for resolve_mem_verdict in kit/ir-collect.sh - the Linux twin of
+# Unit test for resolve_mem_verdict in collectors/ir-collect.sh - the Linux twin of
 # tests/unit/Test-MemVerdict.ps1. Extracts the shipped function out of the collector so the
 # test exercises production code, then asserts every branch of the verdict table.
 #
@@ -12,7 +12,7 @@
 # Usage: bash tests/unit/test-mem-verdict.sh
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-COLLECTOR="${1:-$HERE/../../kit/ir-collect.sh}"
+COLLECTOR="${1:-$HERE/../../collectors/ir-collect.sh}"
 [ -f "$COLLECTOR" ] || { echo "collector not found: $COLLECTOR"; exit 2; }
 
 FN="$(sed -n '/^resolve_mem_verdict() {/,/^}/p' "$COLLECTOR")"

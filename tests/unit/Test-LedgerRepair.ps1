@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Unit test for Repair-LedgerTail in kit/IR-Collect.ps1 (run_state.jsonl integrity).
+    Unit test for Repair-LedgerTail in collectors/IR-Collect.ps1 (run_state.jsonl integrity).
 
 .DESCRIPTION
     Extracts the shipped function via the AST and drives it against synthetic ledgers.
@@ -21,7 +21,7 @@ param([string]$CollectorPath)
 $ErrorActionPreference = 'Stop'
 if (-not $CollectorPath) {
     $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'kit') 'IR-Collect.ps1'
+    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'collectors') 'IR-Collect.ps1'
 }
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path $CollectorPath), [ref]$null, [ref]$null)

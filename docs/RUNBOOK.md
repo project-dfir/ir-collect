@@ -39,7 +39,7 @@ ISO/IEC 27037.)
 ```
 # guided (recommended): answers a few questions, drives volatile -> non-volatile
 powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001 -Authorizer "J.Doe, IR Lead" -LegalBasis "IR engagement" -ScopeNote "host only"
-sudo ./kit/ir-collect.sh -d /mnt/evidence -c CASE001
+sudo ./collectors/ir-collect.sh -d /mnt/evidence -c CASE001
 ```
 
 ## 7. Before you leave

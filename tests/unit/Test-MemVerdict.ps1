@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Unit test for Resolve-MemVerdict in kit/IR-Collect.ps1 (memory-acquisition classification).
+    Unit test for Resolve-MemVerdict in collectors/IR-Collect.ps1 (memory-acquisition classification).
 
 .DESCRIPTION
     Extracts the real shipped function out of the collector via the PowerShell AST (so the test
@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $CollectorPath) {
     $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
     # build with Join-Path segments, not a '..\..\' literal - backslash is not a separator on Linux CI
-    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'kit') 'IR-Collect.ps1'
+    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'collectors') 'IR-Collect.ps1'
 }
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path $CollectorPath), [ref]$null, [ref]$null)

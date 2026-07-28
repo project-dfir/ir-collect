@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Unit test for the hashing shim ($script:HashShimText) in kit/IR-Collect.ps1.
+    Unit test for the hashing shim ($script:HashShimText) in collectors/IR-Collect.ps1.
 
 .DESCRIPTION
     Extracts the shim TEXT from the collector via the AST, defines it, and asserts:
@@ -24,7 +24,7 @@ param([string]$CollectorPath)
 $ErrorActionPreference = 'Stop'
 if (-not $CollectorPath) {
     $root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'kit') 'IR-Collect.ps1'
+    $CollectorPath = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $root)) 'collectors') 'IR-Collect.ps1'
 }
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path $CollectorPath), [ref]$null, [ref]$null)

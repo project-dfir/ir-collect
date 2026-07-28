@@ -20,11 +20,11 @@ collection, **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a real collection (pre
 authorization), **[docs/GAPS.md](docs/GAPS.md)** for what a single-box tool can't see (network/identity/cloud
 vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security
 Onion content, and **[docs/ENTERPRISE.md](docs/ENTERPRISE.md)** for deployment at scale (signing/CLM, EDR
-deconfliction, fleet bridge). Build the tool payload once with `kit/fetch-tools.*`.
+deconfliction, fleet bridge). Build the tool payload once with `collectors/fetch-tools.*`.
 
 ### Repository layout
 ```
-kit/                                the shippable, path-coupled collector kit (archive its CONTENTS)
+collectors/                                the shippable, path-coupled collector kit (archive its CONTENTS)
   IR-Collect.ps1 / ir-collect.sh      collectors (Windows / Linux)    -- run on the compromised host
   fetch-tools.ps1 / fetch-tools.sh    one-time kit builder            -- run on a trusted box
   loader.ps1 / loader.sh              in-guest bootstrap (read-only ISO / share launch)
@@ -136,11 +136,11 @@ Run **as Administrator**. Key switches: `-Auto`, `-RapidOnly`, `-SkipAD`, `-Defe
 
 ### Linux
 ```bash
-sudo ./kit/ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + menu
-sudo ./kit/ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
-sudo ./kit/ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
-sudo ./kit/ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
-sudo ./kit/ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
+sudo ./collectors/ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + menu
+sudo ./collectors/ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
+sudo ./collectors/ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
+sudo ./collectors/ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
+sudo ./collectors/ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
 ```
 
 ### Mobile (Android / iPhone) - runs on the EXAMINER box with the device on USB
@@ -167,7 +167,7 @@ included one-time builder, then carry the drive:
 
 ```
 powershell -ExecutionPolicy Bypass -File .\kit\fetch-tools.ps1     # Windows payload -> tools\
-bash ./kit/fetch-tools.sh                                          # Linux payload  -> tools/bin\
+bash ./collectors/fetch-tools.sh                                          # Linux payload  -> tools/bin\
 ```
 
 These pull **open-source, license-free, professionally-proven** tools from their **official GitHub

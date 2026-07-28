@@ -53,9 +53,9 @@ jobs:
         shell: bash
         run: |
           set -x
-          chmod +x kit/ir-collect.sh
+          chmod +x collectors/ir-collect.sh
           # non-interactive: --scenario injects intake, --rapid-only seals after volatile
-          sudo ./kit/ir-collect.sh --rapid-only --scenario A --host-role workstation \
+          sudo ./collectors/ir-collect.sh --rapid-only --scenario A --host-role workstation \
                --known-bad-ips 203.0.113.5 --known-bad-domains evil.example \
                -c CISMOKE -d ./out || echo "collector exit=$? (non-fatal; asserting artifacts next)"
           # collector ran as root -> hand ownership back so assert/upload (runner user) can read it

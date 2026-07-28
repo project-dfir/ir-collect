@@ -1,8 +1,8 @@
 # --- Downloaded tool payload (fetched by fetch-tools.*, NOT committed) ---
 # Third-party binaries are not redistributed here; build the kit with fetch-tools.
-kit/tools/**
-!kit/tools/README.md
-!kit/tools/.gitkeep
+collectors/tools/**
+!collectors/tools/README.md
+!collectors/tools/.gitkeep
 
 # --- Collection output / evidence (never commit real evidence) ---
 _staging/

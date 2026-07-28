@@ -86,7 +86,7 @@ destination to fail.
 ## Testing hygiene — do not run this on your own workstation
 
 `-RapidOnly` still captures RAM (memory is the most volatile artifact, so it is Stage 1). With a
-memory imager staged in `kit/tools`, **every** local test run writes a full memory image of the
+memory imager staged in `collectors/tools`, **every** local test run writes a full memory image of the
 machine you are sitting at. Six such runs during one session consumed 187 GB and left six complete
 RAM images — containing that host's credentials, keys and session data — sitting in a temp folder.
 
