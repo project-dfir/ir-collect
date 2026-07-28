@@ -30,7 +30,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 |---|---|---|---|---|
 | B1 | **Read-only media** | mount a loop image `-o ro` | Detect, redirect, log the redirect | ✅ |
 | B2 | **Destination full** | Linux: 3 MB loop fs. Windows: 40 MB VHD filled to <96 KB free — **assert a 512 KB write is refused before judging** | Refuse up front rather than dying mid-run with no diagnosis | ✅ **BOTH VERIFIED**. Linux field-tested. Windows: 4th attempt induced the condition (76 KB free, 512 KB write refused) and found the seal-time ENOSPC fallback cannot help — a destination full from the first write kills the run before `Invoke-Seal`, so no `run_state.json` and the fallback never fires. Fixed with a 64 MB destination preflight: **verified exit 40 with the refusal message**. The case folder does remain, containing only `audit.log` with the `PREFLIGHT REFUSED` line — that is deliberate, it is the custody record that a collection was attempted and declined |
-| B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; say the destination vanished; never claim a bundle that is not there | ✅ CLOSED 2026-07-28 (Linux) + 2026-07-29 (Windows) - see below; ⚠️ relocation of a part-written tree still not implemented on either platform |
+| B3 | **USB yanked mid-run** | `qm set <vmid> -delete <disk>` or unmount the loop device mid-collection | Do not hang; say the destination vanished; never claim a bundle that is not there | ✅ CLOSED 2026-07-28 (Linux) + 2026-07-29 (Windows) - see below; salvage of a part-written tree DECLINED with reasoning (see below) |
 | B4 | **Network destination dies mid-ship** | drop the route / stop sshd on the collector server | Retain evidence locally, never delete the local copy on a failed ship | ✅ CLOSED 2026-07-28 - see below |
 | B5 | **UNC auth failure** | wrong credentials to an SMB share | Warn at preflight, keep collecting (evidence is staged locally), never report a clean run when the evidence never arrived | ✅ CLOSED 2026-07-28 - see below |
 | B6 | **MAX_PATH exceeded** | long `-Dest`, or deep nested profile paths | Refuse up front with an actionable message; never report success for a tree that was never written | ✅ CLOSED 2026-07-28 - found the worst false-success yet, see below |
@@ -521,3 +521,35 @@ permissions and path length.
 
 **Re-verified after the fix** under the same live yank: `names the VANISHED volume: True`,
 `wrongly advises shorter dest: False`.
+
+### B3 half (b) - salvaging a part-written tree: DECLINED, 2026-07-29
+
+The scenario's original bar asked the collector to "seal what it has somewhere writable" when the
+destination vanishes. After measuring what is actually possible, that is **deliberately not
+implemented**. The reasoning, so it is not re-opened by instinct:
+
+**1. Salvage after the fact is impossible.** Once the volume is unmounted the already-written
+files are unreachable - you cannot copy what you can no longer read. Nothing at seal time can
+recover them.
+
+**2. The only mechanism that would work costs more than it saves.** Preserving artifacts requires
+duplicating every one to local scratch *as it is collected*, i.e. writing the full evidence set to
+the subject host on **every** run. That inverts the tool's own doctrine - it prints a
+`FOOTPRINT:` line asserting evidence goes only to the destination, and a `CONTAMINATION WARNING`
+when it is forced to stage on the target - and it doubles I/O and space on every collection, to
+insure against an uncommon event. A responder who unplugs the evidence drive mid-collection has a
+procedural problem; permanently contaminating every future engagement is not the fix.
+
+**3. The forensically important part already survives, and it was verified.** The account of what
+happened does not live on the destination alone. Measured on range-WS02 during a live yank:
+`run_state.json` was written to `%TEMP%\ir-collect_run_state_<case>_<stamp>.json` (3,197 bytes) by
+the existing rollup fallback, and the operator is told on the console. So an analyst still learns
+which steps ran, what the verdict was, and that the destination disappeared - they simply do not
+get the artifacts, which are gone with the mount either way.
+
+**What was fixed instead** (both platforms): the run no longer claims success for a bundle that is
+not there, and it names the real cause rather than guessing - see the B3 and B6 entries above.
+
+**Residual, stated plainly:** the fallback rollup lands in `%TEMP%` on the subject host and is not
+cleaned up. That is a small, deliberate footprint - kilobytes of metadata, no evidence content -
+and the console names the path when it happens.
