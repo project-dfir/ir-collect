@@ -691,6 +691,27 @@ try { $domainJoined = (Get-Inv Win32_ComputerSystem).PartOfDomain } catch {}
 # no manifest: the tree looks abandoned. It is not - the append-only ledger survives intact and
 # -Resume finishes the job (verified: ok=38 skipped=32 failed=0). Nothing told the operator that,
 # so leave a note that only exists while the run is unfinished. Invoke-Seal removes it.
+# DESTINATION PREFLIGHT. Measured on WS01 against a genuinely full 40 MB volume (0 KB free,
+# a 512 KB write refused): the collector starts, writes a handful of files, then dies before it
+# ever reaches Invoke-Seal - so run_state.json is never written AND the ENOSPC rollup fallback
+# added earlier never fires, because that fallback lives inside seal. The operator is left with a
+# few files and no diagnosis whatsoever. A self-heal that only works if the run survives to the
+# end is no use when the destination is full from the first write, so refuse up front instead.
+$minFree = 64MB
+$freeNow = Get-FreeBytes $OutDir
+if ($freeNow -ge 0 -and $freeNow -lt $minFree) {
+    $msg = "Destination has only {0:N1} MB free; a collection needs at least {1:N0} MB." -f ($freeNow/1MB), ($minFree/1MB)
+    Write-Host ''
+    Write-Host "  !! $msg" -ForegroundColor Red
+    Write-Host '  !! Refusing to start: on a full destination this tool cannot even record WHY it failed' -ForegroundColor Red
+    Write-Host '  !! (the run dies before the seal step that writes the diagnostics).' -ForegroundColor Red
+    Write-Host '  !! Point -Dest at larger media, or free space and re-run.' -ForegroundColor Yellow
+    Write-Host ''
+    try { Write-Audit "PREFLIGHT REFUSED: $msg" } catch {}
+    exit 40
+}
+Write-Audit ("PREFLIGHT destination: {0:N1} GB free" -f ($freeNow/1GB))
+
 $script:ResumeNote = Join-Path $OutDir 'RUN-INTERRUPTED-READ-ME.txt'
 try { [IO.File]::WriteAllText($script:ResumeNote, @"
 THIS COLLECTION DID NOT FINISH.
