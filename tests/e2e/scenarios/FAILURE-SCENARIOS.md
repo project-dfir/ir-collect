@@ -42,7 +42,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | C1 | **Killed mid-run** — EDR live-response harnesses commonly cap child tools at ~30 min | `-Auto` (Stage 2 runs 13–20 min), kill the collector's process tree at ~90s | Ledger survives; `-Resume` recovers the collection; operator is told the tree is resumable | ✅ **VALIDATED 2026-07-28 on WS02** (3rd attempt — the first two were invalid because RapidOnly finishes in <60s). Hard `Stop-Process -Force` skips `finally`, so the always-seal wrapper **cannot** run: no SUMMARY.md, no run_state.json, no manifest. But `run_state.jsonl` survived intact (113 records, 0 invalid) and `-Resume` finished it: **ok=38 skipped=32 failed=0 COMPLETE**, 139→147 files. Gap found and fixed: an interrupted tree looked abandoned, so the collector now drops `RUN-INTERRUPTED-READ-ME.txt` at start and deletes it at seal |
 | C2 | **Host reboots mid-run** | `qm reset <vmid>` during an `-Auto` run — assert evidence BYTES are growing first (file count is static during a RAM capture) | Ledger stays parseable; `-Resume` finishes it; operator is told the tree is resumable | ✅ **VALIDATED 2026-07-28 on WS02.** Reset fired with 6.44 GB written and growing. Survived: `run_state.jsonl` **20 records / 0 invalid** and `audit.log` — a hard power event leaves the ledger parseable. Absent as expected: SUMMARY.md, run_state.json (seal never ran). `-Resume` completed it: **ok=34 skipped=5 failed=0 COMPLETE**, 13→49 files. **Defect found:** `RUN-INTERRUPTED-READ-ME.txt` did NOT survive — a write-once file never touched again sits in the NTFS cache, while the ledger survives precisely because continuous appends force flushes. Fixed with a WriteThrough FileStream + `Flush($true)`. **Fix VERIFIED under the original condition** (2nd reset, 2026-07-28): `RUN-INTERRUPTED-READ-ME.txt` **714 B PRESENT** after a hard `qm reset` where it was previously ABSENT; ledger 17 records / 0 invalid; `-Resume` then completed it (**ok=33 skipped=5 failed=0 COMPLETE**, 14→49 files). Root cause of the earlier launch failures: stale collector processes holding the redirect targets — fixed by killing leftovers, using unique per-run redirect filenames, and gating on the child being alive at 15s |
 | C3 | **Step hangs forever** | carried tool that `sleep`s past its bound | Watchdog kills the whole process group, `timeout` classified | ✅ |
-| C4 | **Console closed / no TTY** | run detached | Non-interactive fallback runs everything, no prompt deadlock | ⬜ |
+| C4 | **Console closed / no TTY** | run detached as SYSTEM with stdin bound to NUL | Non-interactive fallback runs everything, no prompt deadlock | ✅ CLOSED 2026-07-29 - see below |
 
 ## D. Data-shape surprises
 
@@ -577,3 +577,24 @@ control with `-ExecutionPolicy Bypass`: exit 0, 1 bundle, 49 files.
 never starts, so there is no half-run tree to clean up and nothing for the tool to detect. The
 scenario's bar ("clear failure at launch, not a half-run") is met, but no collector logic is
 responsible for it, and none should be added: refusing to run an unsigned script is the host's job.
+
+## C4 - no TTY / fully detached (CLOSED 2026-07-29)
+
+**Setup.** Scheduled task running as `NT AUTHORITY\SYSTEM`, no interactive session, action wrapped
+in `cmd /c ... < NUL` so stdin is bound to NUL. Bounded wait of 300 s, because a prompt deadlock
+is precisely what this scenario hunts and an unbounded wait would hide one.
+
+**Attempt 1 was not scored.** It launched the same task without the `< NUL` binding, and the
+in-task probe reported `console : True` - a SYSTEM scheduled task still gets a conhost, so the
+condition the scenario names was not live. More usefully, it was the *wrong* condition to chase:
+console presence is not what deadlocks a collector. A **readable stdin that blocks** is. The
+governing value is `[Console]::IsInputRedirected`, and the gate now asserts that instead.
+
+**Result** with stdin genuinely unreadable (`IsInputRedirected: True`, running as `WS02$`): the
+collection finished with **49 files**, verdict `COMPLETE`, `ok=33 failed=0`, manifest 45 rows /
+**0 ERR**, exit 0, no deadlock. Identical output to an interactive administrator run.
+
+**Observation worth keeping, not a defect.** The detached SYSTEM run took **270 s** against
+roughly 25 s for the same `-RapidOnly` collection interactively. Correctness is unaffected - every
+count matches - but a 10x slowdown under SYSTEM is unexplained and worth understanding before
+anyone builds timeouts around detached execution.
