@@ -440,3 +440,33 @@ function bodies by counting brace characters; every `${var}` expansion contribut
 depth never returned to zero, the whole file read as "inside a function", and the check inspected
 nothing. Reintroducing the real B4 bug did **not** fail the test. It now anchors on a closing
 brace at column 0, and that same mutation fails as it should.
+
+## B3 half (a) - Windows yanked destination: NOT SCORED, but it found something worse
+
+**The scenario was not run.** A 300 MB VHD was attached as `X:` and proven writable, the collector
+was launched with `-Dest X:\`, and the harness gated on the destination accumulating bytes before
+detaching the disk. That gate never tripped, so nothing was yanked and nothing is claimed.
+
+**Why it never tripped is the finding.** The collector silently abandoned `X:\` and wrote the
+bundle to **`C:\ir_evidence\`** - the subject host's own system drive - then reported
+`Collection complete (49 files)` and `EXIT 0`. The redirect was never announced. Three separate
+statements in the custody record are false as a result:
+
+| audit line | reality |
+|---|---|
+| `Destination is local/drive: X:\` | evidence went to `C:\ir_evidence\` |
+| `PREFLIGHT destination: 45.3 GB free` | that is **C:**'s free space; `X:` had 284 MB |
+| `FOOTPRINT: ... evidence written only to destination` | it was written to the subject's system disk |
+
+This is the contamination case the tool explicitly warns about elsewhere (`!!! CONTAMINATION
+WARNING` exists for the network-staging path, and scenario A1 exists because ConstrainedLanguage
+once redirected evidence to the target's `C:`). Here it happened for an ordinary local `-Dest`
+that was **writable**, with no warning at all, and the run reported success.
+
+Not investigated yet: whether `-Dest 'X:\'` (trailing separator) fails a check in
+`Resolve-UsableOutDir` or `Get-WritableRoot`, or whether a removable/virtual volume is rejected
+by some other test. The redirect target `C:\ir_evidence` is hardcoded fallback behaviour.
+
+**Priority for the next iteration**, ahead of finishing B3(a) itself: a writable destination must
+never be silently replaced, the free-space figure must describe the destination actually used, and
+any redirect must be stated loudly in both the console and the custody log.
