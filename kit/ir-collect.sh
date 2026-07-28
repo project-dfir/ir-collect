@@ -20,6 +20,16 @@
 #   sudo ./ir-collect.sh -d user@10.0.0.5:/evidence -c C1   # ship to IP (rsync/ssh)
 #   sudo ./ir-collect.sh -d /mnt/usb --auto                 # unattended, all jobs
 #   sudo ./ir-collect.sh -d /mnt/usb --rapid-only           # volatile only
+#   sudo ./ir-collect.sh -d /mnt/usb --no-keys              # do NOT extract volume keys
+#
+# ENCRYPTION KEYS: while volumes are unlocked the collector captures the live dm-crypt
+#   master keys (dmsetup --showkeys) and LUKS header backups into 00_metadata, because
+#   after shutdown an image of an encrypted volume is unreadable without them. Those
+#   outputs ARE the keys to the evidence - see 00_metadata/DECRYPTION-KEYS.md for handling
+#   and for how to apply them later. Use --no-keys where that is out of scope.
+#
+# EXIT CODES: 0 clean | 10 completed-with-skips | 15 incomplete-critical | 20 RAM not
+#   verified | 40 fatal.
 # =============================================================================
 
 set +e                      # self-heal: never abort on a single command failure
@@ -599,9 +609,12 @@ sectors**, here 32768 = 16 MiB), then on the analysis box:
 
     printf '%s' '<MASTER-KEY-HEX>' | xxd -r -p > /tmp/mk.bin      # hex -> raw key
     losetup --find --show --read-only /evidence/disk.raw          # -> /dev/loopN
-    cryptsetup open --type luks --master-key-file /tmp/mk.bin \
+    cryptsetup open --type luks --volume-key-file /tmp/mk.bin \
         --readonly /dev/loopN decrypted                            # LUKS w/ header intact
     mount -o ro,noload /dev/mapper/decrypted /mnt/evidence
+
+`--volume-key-file` is the current spelling; on cryptsetup older than 2.7 use its obsolete alias
+`--master-key-file`. Both open a LUKS device with no passphrase at all.
 
 If the LUKS header is missing or damaged, map the raw payload directly instead - note the offset
 is applied to the LOOP device, and `dmsetup` sizes are in 512-byte sectors:
@@ -615,9 +628,17 @@ Restore a header first if you have one and prefer the normal path:
     cryptsetup luksHeaderRestore /dev/loopN --header-backup-file luks_header_dev_sda3.img
 
 ## If no master key was captured
-Recover it from the RAM image instead - the key is resident while the volume is unlocked:
-`volatility3 -f memory.lime linux.luksscan` / `linux.pslist` + `bulk_extractor -e aes`, or
-`cryptsetup open --key-file` with a custodian-provided passphrase and the header backup.
+Recover it from the RAM image instead - the key is resident in kernel memory while the volume is
+unlocked. Note there is **no first-party Volatility 3 plugin for LUKS**; the working routes are:
+
+- `bulk_extractor -e aes memory.lime` or `findaes` - carve AES key schedules from the image
+- the `luks2-master-key-extract` project (community) against a LUKS2 host
+- Volatility 2's `dm_dump` plugin, which reconstructs the `dmsetup` arguments for the mapping
+- failing all of that, a custodian-supplied passphrase plus the header backup:
+  `cryptsetup open --header luks_header_dev_sda3.img /dev/loopN decrypted`
+
+This is precisely why the collector grabs `dmsetup table --showkeys` live - carving a key out of
+a memory image is markedly less reliable than reading it from the kernel while the box is up.
 
 ## Verify before you rely on it
 Decrypt, then confirm the filesystem mounts read-only and its UUID matches `encryption.txt`.
@@ -901,6 +922,9 @@ seal() {
 
 Stage 1 (auto) secured volatile state in order of volatility. Stage 2 heavy jobs were operator-selected.
 See 99_logs/audit.log for the full timestamped trail; 99_logs/errors.log for recovered failures.
+$( [ "${NO_KEYS:-0}" = "1" ] && printf '%s' "- **Encryption keys:** NOT captured (--no-keys). An image of an encrypted volume will not be readable without a custodian key." || printf '%s' "> **HANDLING - this bundle contains VOLUME ENCRYPTION KEYS.** 00_metadata holds key material that
+> decrypts the imaged volumes. Store and transfer it at the classification of the data it protects
+> and record its custody. See 00_metadata/DECRYPTION-KEYS.md." )
 EOF
 
   # --- completion rollup + completeness verdict (reduce run_state.jsonl; no jq dependency) ---

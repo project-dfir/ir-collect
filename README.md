@@ -68,8 +68,27 @@ docs/ENTERPRISE.md                  deployment at scale (signing/CLM, EDR deconf
 | **Two-stage: fast then slow** | Stage 1 (automatic) secures volatile data quickly → **VOLATILE GREEN** confirmation → Stage 2 menu for the hours-long non-volatile jobs. |
 | **Chain of custody** | UTC audit log of every command (exit code, duration, retries), SHA-256 manifest of all output, acquisition GUID, collector identity, host-clock provenance, tool hashes, sealed zip hash on ship. |
 | **Ground-truth caveat** | Live results from a compromised host can be faked by a kernel/eBPF/LD_PRELOAD rootkit. **The RAM image + a dead-box disk image are ground truth**; live enumeration is corroboration. |
+| **Keys are volatile too** | Order of volatility applies to **encryption keys**, not just data: power the box off and the volume master key is gone from kernel memory, leaving the image unreadable unless a custodian supplies a passphrase. While volumes are unlocked the collector captures them — see below. |
 
 Standards followed: **RFC 3227**, **NIST SP 800-86**, **SWGDE**, **ISO/IEC 27037**.
+
+### Volume encryption keys — captured by default
+
+| | Windows | Linux |
+|---|---|---|
+| Key material | BitLocker recovery passwords (`bitlocker_recovery_keys.csv`, machine-readable) + **key packages** for `repair-bde` | live dm-crypt **volume master keys** (`dmsetup table --showkeys`) — decrypt the image with no passphrase at all |
+| Container metadata | protector detail per volume | **LUKS header backups** — without the header even a *correct* passphrase fails, and header destruction is a known ransomware move |
+| Also | EFS certs, DPAPI master-key paths, VeraCrypt/TrueCrypt indicators | `/etc/crypttab` + keyfile inventory, kernel keyring (fscrypt/eCryptfs) |
+
+Everything lands in `00_metadata/`, alongside **`DECRYPTION-KEYS.md`** — what was captured plus the
+actual verified commands to apply it months later (`--volume-key-file`, `dmsetup` mapping with the
+sector offset, `luksHeaderRestore`, `manage-bde`/`dislocker`, `repair-bde`), and the
+RAM-recovery route if no key was captured.
+
+> **These outputs are the keys to the evidence.** Anyone holding the bundle can decrypt the imaged
+> volumes, so store and transfer it at the classification of the data it protects and record its
+> custody. The SUMMARY carries a handling banner to that effect. Where extracting key material is
+> outside the engagement's authority, pass **`-NoKeyCapture`** / **`--no-keys`**.
 
 ---
 

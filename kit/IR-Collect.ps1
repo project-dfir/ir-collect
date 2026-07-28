@@ -26,6 +26,14 @@
 .PARAMETER IncludeGroundTruth  With -Auto, also run the hours-long ground-truth jobs (7 full-FS hash, 8 disk image).
 .PARAMETER RapidOnly    Run only Stage 1 (volatile) and seal.
 .PARAMETER SkipAD       Never run the AD phase.
+.PARAMETER NoKeyCapture Skip BitLocker recovery-password / key-package capture. By default the
+                        collector grabs them while the volume is unlocked, because a dead-box
+                        image of an encrypted disk is unreadable without a key. Those outputs
+                        ARE the keys to the evidence - see 00_metadata\DECRYPTION-KEYS.md.
+                        Use this where extracting key material is outside the engagement's scope.
+
+.NOTES  Exit codes: 0 clean | 10 completed-with-skips | 15 incomplete-critical |
+        20 RAM not verified | 40 fatal.
 
 .EXAMPLE  powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -OutputRoot E:\evidence -CaseId CASE001
 .EXAMPLE  powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Auto   # full unattended
@@ -643,11 +651,15 @@ then against the BitLocker volume:
     manage-bde -unlock X: -RecoveryPassword 123456-...-654321
     manage-bde -status X:
 
-Linux analysis box, using the same recovery password:
+Linux analysis box, using the same recovery password. Prefer dislocker here - note there is NO
+space after `-p`, and `-r` keeps it read-only:
 
-    cryptsetup bitlkOpen /dev/loopNp2 bde --key-file <(printf '%s' 'RECOVERY-PASSWORD')
-    # or: dislocker -r -V /dev/loopNp2 -p<RECOVERY-PASSWORD> -- /mnt/bde
+    dislocker -r -V /dev/loopNp2 -p563200-557084-...-239976 -- /mnt/bde
     mount -o ro,loop /mnt/bde/dislocker-file /mnt/evidence
+
+`cryptsetup bitlkOpen` also accepts a recovery passphrase, but supply it INTERACTIVELY - passing a
+BITLK passphrase via `--key-file` is a known cryptsetup bug (fails with "No key available with
+this passphrase"). `--volume-key-file` does work, but it takes the FVEK, not a recovery password.
 
 ## When the volume metadata is damaged
 A recovery password alone will not repair a corrupt volume - this is what the key package is for:
@@ -655,9 +667,18 @@ A recovery password alone will not repair a corrupt volume - this is what the ke
     repair-bde X: Y: -kp keypackage_C\<file> -rp 123456-...-654321
 
 ## If no recovery password was captured
-The FVEK lives in RAM while the volume is unlocked - recover it from the memory image
-(`volatility3 windows.bitlocker`, or Passware/Elcomsoft against the raw image), or retrieve the
-recovery key escrowed in AD (`msFVE-RecoveryInformation`) or Entra ID / MDM.
+The FVEK lives in RAM while the volume is unlocked, so recover it from the memory image. There is
+no first-party Volatility 3 BitLocker plugin - it is a COMMUNITY plugin you must install into
+`volatility3/plugins/windows/`, and the invocation is the scanner, not a bare module name:
+
+    vol -f memdump.raw windows.bitlocker.BitlockerFVEKScan --dislocker
+
+That emits a Dislocker-ready `.fvek`, which unlocks the image without any password:
+
+    dislocker -r -V /dev/loopNp2 -k <file>.fvek -- /mnt/bde
+
+Otherwise: Passware/Elcomsoft against the raw image, or the recovery key escrowed in AD
+(`msFVE-RecoveryInformation`) or Entra ID / Intune.
 
 ## Verify before you rely on it
 Unlock, confirm the filesystem mounts read-only, and check the volume GUID against
@@ -1112,6 +1133,11 @@ function Invoke-Seal {
 
 Stage 1 (auto) secured volatile state in order of volatility. Stage 2 heavy jobs were operator-selected.
 See 99_logs/audit.log for the full timestamped command trail; 99_logs/errors.log for any recovered failures.
+$(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An image of an encrypted volume will not be readable without a custodian key.'}else{@'
+> **HANDLING - this bundle contains VOLUME ENCRYPTION KEYS.** 00_metadata holds key material that
+> decrypts the imaged volumes. Store and transfer it at the classification of the data it protects
+> and record its custody. See 00_metadata\DECRYPTION-KEYS.md.
+'@})
 "@
     try { $summary | Out-File (Join-Path $OutDir 'SUMMARY.md') -Encoding UTF8 } catch {}
     try { $info.endUtc=$endUtc; $info.stepsOk=$script:StepsOk; $info.stepsFail=$script:StepsFail; $info.stepsTotal=$script:StepNum; $info.heavyJobs=$doneList

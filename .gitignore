@@ -36,3 +36,6 @@ mobile/tools/
 # python bytecode
 **/__pycache__/
 *.pyc
+
+# --- graphify knowledge-graph output (local analysis artifact, not project source) ---
+graphify-out/
