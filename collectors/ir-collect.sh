@@ -30,6 +30,30 @@
 #
 # EXIT CODES: 0 clean | 10 completed-with-skips | 15 incomplete-critical | 20 RAM not
 #   verified | 40 fatal.
+#
+# READING THE VERDICT - 99_logs/run_state.json holds machine-readable findings that the
+#   console summary states only in passing. The three worth knowing before you act:
+#
+#   encryption_risk  THE DO-NOT-POWER-OFF SIGNAL. Three states, and the third is the point:
+#       ok                 nothing to lose by shutting down (RAM captured, or no encrypted
+#                          volume found).
+#       encrypted-no-ram   an unlocked encrypted volume IS present and RAM was NOT captured.
+#                          Power off and the disk image is unreadable. Capture keys first.
+#       unknown-no-ram     the probe COULD NOT DETERMINE whether a volume is encrypted -
+#                          lsblk missing or failed. This is NOT a claim that the disk is
+#                          clear, and it is not a claim that it is encrypted. Treat it as
+#                          encrypted-no-ram until a human establishes otherwise.
+#
+#   clock_provenance  whether the recorded timestamps can be anchored to real time, and by
+#       what source. Timestamps from an unsynchronised clock still correlate internally, but
+#       will not line up with any other host's log until the offset is known.
+#
+#   by_error_class  a tally of failures by kind. AN EMPTY MAP DOES NOT MEAN NOTHING WENT
+#       WRONG: several conditions - a preflight refusal, a destination that cannot be
+#       written - are handled before any class could be assigned. Read completeness.verdict
+#       and the counts, not the absence of classes.
+#
+#   Ship results, when shipping was requested, are in <bundle>.ship.json beside the bundle.
 # =============================================================================
 
 set +e                      # self-heal: never abort on a single command failure
@@ -71,7 +95,13 @@ while [ $# -gt 0 ]; do
     --authorizer)     AUTHORIZER="$2"; shift 2 ;;
     --legal)          LEGAL_BASIS="$2"; shift 2 ;;
     --scope)          SCOPE_NOTE="$2"; shift 2 ;;
-    -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print ONLY the operator header - the block between the two banner lines. A plain
+    # `grep '^#' "$0"` printed all 233 comment lines in the file, of which 197 were
+    # implementation commentary written for whoever edits this script ("Pure (no I/O) so it
+    # is unit-testable", repair_ledger_tail's rationale). A responder looking for what a
+    # verdict means had to find it inside that. Documentation nobody can locate is not
+    # documentation - see tests/unit/test-help-output.sh, which keeps the noise out.
+    -h|--help)        awk 'NR==1{next} /^# ={10,}$/{if(s){exit} s=1; next} /^#/{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
