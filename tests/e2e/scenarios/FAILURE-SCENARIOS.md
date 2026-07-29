@@ -1998,3 +1998,43 @@ The run reported "NO BUNDLE" for the network case because the harness looked in 
 the collector had correctly redirected to `C:\ir\_staging`. My error, not the product's - and the
 fifth time a harness path assumption produced a phantom finding. The bundle was read from the real
 location and the staging directory left clean (0 dirs, evidence back to the baseline 3).
+
+### The class channel proven working - which makes the empty results findings (2026-07-29)
+
+Two runs had produced no classes: a healthy host, and an unreachable UNC destination. **"No classes
+fired" is ambiguous** until something is shown to fire - the channel could simply be broken, and
+every result so far would mean nothing. So the missing piece was a positive control for the channel
+itself.
+
+`tool_missing` is the right instrument: it is assigned **directly** at seal
+(`IR-Collect.ps1:2127`) when `Compare-ToolInventory` sees a carried tool vanish, so it exercises the
+write path into `by_error_class` **without depending on the classifier**.
+
+A carried tool was removed **mid-run** - after the inventory was taken, before the seal - with the
+condition asserted live (`winpmem present=False runStillGoing=True`):
+
+```
+verdict = INCOMPLETE   ok=33 failed=0
+CLASS OBSERVED: tool_missing x1
+incomplete = toolkit-tampered(winpmem.exe)
+TOOLKIT RESTORED: present=True  hashMatchesBaseline=True
+```
+
+### The three-point result
+
+| condition | classes fired | reading |
+|---|---|---|
+| healthy host | none | correct - the baseline is quiet |
+| unreachable UNC destination | **none** | **genuine stranding** - not instrument failure |
+| carried tool removed mid-run | **`tool_missing`** | the channel works end to end |
+
+The third row is what turns the second into a finding. Without it the empty result was unusable
+evidence; with it, `net_unreachable` and `dns_blocked` demonstrably do not fire for the condition
+they name, while a class that *is* wired end-to-end fires and drives the verdict.
+
+Worth recording separately: toolkit tampering produces `INCOMPLETE` with a **named** reason
+(`toolkit-tampered(winpmem.exe)`), not a generic one. That is the behaviour the whole catalogue is
+about, working correctly and now witnessed.
+
+Range left as found: winpmem restored and hash-verified against the `86691BB4AF2C17DD…` baseline,
+zero leftover tasks, evidence at 3 directories, staging empty.
