@@ -81,10 +81,15 @@ if not os.path.exists(SRC):
     print('collector not found: %s' % SRC); sys.exit(2)
 lines = io.open(SRC, encoding='utf-8').read().split('\n')
 
+# Volume guard: on a whole collector, a handful of matches means the pattern broke rather than the
+# file being clean. Small CALIBRATION FIXTURES legitimately have few, so the floor is a parameter -
+# lowered deliberately per-invocation, never removed.
+MIN_SWALLOW = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+
 total = sum(1 for l in lines if SWALLOW.search(l.split('#')[0]))
 print('%s' % SRC)
-print('  lines with a swallowing construct : %d' % total)
-if total < 20:
+print('  lines with a swallowing construct : %d (floor %d)' % (total, MIN_SWALLOW))
+if total < MIN_SWALLOW:
     print('  SUSPICIOUSLY FEW - pattern may be wrong'); sys.exit(2)
 
 hits = analyse(lines)

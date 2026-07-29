@@ -1901,3 +1901,47 @@ fire" from a guess about code shape into a list of classes observed firing.
 Recorded here so the next iteration does not rebuild the same static instrument. **No verdicts are
 carried forward from this attempt** - the one fact worth keeping is that `tool_missing` has a
 direct-assignment path at seal, which nothing else in this catalogue had recorded.
+
+## The safe-default guard is now in CI, and its calibration is inside it (2026-07-29)
+
+The signature defect is bounded on both platforms, but a bound measured once decays. This turns the
+measurement into a standing guard: `tests/unit/test-safe-default-guard.sh`.
+
+**The calibration is the point, not the zero.** An earlier version of the detector implemented only
+`VAR=$(probe 2>/dev/null)`, reported 0 on the current collector *and* 0 on a file that provably
+contained the bug, and would have shipped a false all-clear. So the guard refuses to report clean
+unless it has first **re-found a known defect**.
+
+Three outcomes, deliberately distinct - the middle one is the whole reason this exists:
+
+| outcome | meaning |
+|---|---|
+| pass | calibration found the known defect **and** the collector is clean |
+| FAIL (exit 1) | the collector grew a new instance - a product regression |
+| **exit 2** | the guard could not calibrate - a **tool** failure, never reported as clean |
+
+### The known positive is vendored, not fetched
+
+Calibrating with `git show 09ccfe4~1:collectors/ir-collect.sh` works locally and would have been
+**silently useless in CI**: GitHub Actions checks out at depth 1, so that revision does not exist
+there, the command yields nothing, and the calibration would pass over an empty file. That is the
+project's most persistent failure shape - a check that could not run looking exactly like one that
+passed - so the pre-fix gate is vendored as
+`tests/tools/fixtures/known-positive-luks-gate.sh` and the fixture header says not to "fix" it.
+
+The detector's volume floor (fewer than 20 swallowing constructs means the pattern broke, not that
+the file is clean) became a parameter so a small fixture can be calibrated against without removing
+the guard from real files.
+
+### Mutation-tested for both failure modes
+
+| mutation | required outcome | actual |
+|---|---|---|
+| reintroduce the two-state gate into the collector | FAIL, exit 1 | exit 1, 1 FAIL |
+| disable the detector's shape-2 branch | exit 2, "guard is broken, NOT clean" | exit 2, caught by the detector's own self-test first |
+
+**The first attempt at the second mutation was not actually tested** - the setup copied the good
+detector over the mutant before running it, so it reported a pass while the mutant sat unused. Re-run
+in an isolated directory with the mutant's presence asserted first (`grep -c 'if False:'`), it fails
+correctly. That is the same shape *again*, this time in the mutation setup rather than the runner -
+sixth distinct place it has appeared.
