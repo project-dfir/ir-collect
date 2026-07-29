@@ -66,6 +66,63 @@ check "$([ "$(has "$o" 'BEHIND')" = 0 ] && echo 1 || echo 0)" 'a negative zero n
 o="$(clock_verdict "chronyc (dc01)" "0.000001")"
 check "$([ "$(has "$o" 'WARNING')" = 0 ] && echo 1 || echo 0)" 'a healthy clock does not warn'
 
+# --- the chronyc PARSE, against real output shapes -------------------------------------------
+# The live positive control proved end-to-end extraction works for a ~0s offset, and clock_verdict
+# is unit-tested above for direction and the 60s warning. What neither covers is whether the awk
+# parse handles chronyc's LARGE-offset output, and that could not be proven live: no Linux VM on
+# the range is ssh-reachable, and the only other host is the Proxmox hypervisor - skewing a
+# production hypervisor's clock to test a string parse is not a trade worth making.
+#
+# So the parse is extracted from the shipped collector and driven with real chronyc output shapes.
+# The convention: chronyc says "fast" (host ahead -> positive) or "slow" (host behind -> negated).
+chrony_parse() { awk '/System time/{v=$4; if ($0 ~ /slow/) v="-" v; print v; exit}'; }
+# The function above is a COPY of the parse embedded in the collector's meta-clock step (it lives
+# inside a long single-quoted bash -c string and cannot be sourced). A copy can drift from the
+# original and keep passing, so assert the shipped file still contains the same awk program.
+# grep -F, not a pattern: the shipped text contains backslash-escaped $ and a BRE pattern for it
+# failed to match correct code on the first attempt.
+if grep -qF 'System time/{v=' "$COLLECTOR" && grep -qF 'slow/) v=' "$COLLECTOR"; then
+    printf 'ok    the collector still ships the parse this test mirrors
+'
+else
+    printf 'FAIL  the collector parse has drifted from the copy under test
+'; FAIL=$((FAIL+1))
+fi
+
+o="$(printf 'Reference ID    : 0A140AE9 (dc01.lab.local)
+System time     : 200.123456789 seconds fast of NTP time
+Last offset     : +0.000001 seconds
+' | chrony_parse)"
+check "$([ "$o" = "200.123456789" ] && echo 1 || echo 0)" "a LARGE 'fast' offset parses to a positive number (got '$o')"
+
+o="$(printf 'Reference ID    : 0A140AE9 (dc01)
+System time     : 200.123456789 seconds slow of NTP time
+' | chrony_parse)"
+check "$([ "$o" = "-200.123456789" ] && echo 1 || echo 0)" "a LARGE 'slow' offset parses to a NEGATIVE number (got '$o')"
+
+o="$(printf 'System time     : 0.000000242 seconds fast of NTP time
+' | chrony_parse)"
+check "$([ "$o" = "0.000000242" ] && echo 1 || echo 0)" "a sub-microsecond offset parses (matches the live positive control)"
+
+o="$(printf 'Reference ID    : 00000000 ()
+Stratum         : 0
+System time     : 0.000000000 seconds slow of NTP time
+' | chrony_parse)"
+check "$([ "$o" = "-0.000000000" ] && echo 1 || echo 0)" "an unsynchronised chrony yields the negative zero seen live (feeds the agreement case above)"
+
+# the parse must not pick up a DIFFERENT line that happens to contain a number
+o="$(printf 'Last offset     : +0.000001 seconds
+RMS offset      : 0.000002 seconds
+System time     : 5.5 seconds fast of NTP time
+' | chrony_parse)"
+check "$([ "$o" = "5.5" ] && echo 1 || echo 0)" "only the 'System time' line is read, not 'Last offset' or 'RMS offset' (got '$o')"
+
+# end-to-end: parse feeding the formatter must produce a correct large-offset verdict
+v="$(clock_verdict "chronyc (dc01)" "$(printf 'System time     : 200.5 seconds fast of NTP time
+' | chrony_parse)")"
+check "$(has "$v" 'is AHEAD of the reference by 200.5s')" 'parse + verdict together describe a large fast clock as AHEAD'
+check "$(has "$v" 'WARNING')" 'parse + verdict together warn on a large offset'
+
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)

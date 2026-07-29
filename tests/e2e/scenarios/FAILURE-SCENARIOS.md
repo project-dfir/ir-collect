@@ -867,3 +867,32 @@ band, and a mutation that checks the sign first fails the suite.
 
 **E5 parity needs nothing:** `ir-collect.sh` already requires bash 4+ and, better than refusing,
 re-execs a carried static bash from `tools/bin` when the host's is too old.
+
+
+### Linux clock: closing the gap the invalid negative control left (2026-07-29)
+
+The live negative control could not be redone. No Linux VM on the range answers ssh, and the only
+other host is the Proxmox hypervisor - skewing a production hypervisor's clock to exercise a string
+parse is not a trade worth making. So the gap was closed by narrowing it instead of by re-running:
+
+| what | how it is now covered |
+|---|---|
+| end-to-end extraction from real chronyc | the live POSITIVE control (`0.000242663s`, agreement, no false warning) |
+| direction and the 60s warning | `clock_verdict` unit tests, both mutations caught |
+| **parsing chronyc's LARGE-offset output** | **new**: the parse driven with real chronyc output shapes |
+
+The last row was the genuine unknown - the positive control only ever exercised a ~0s offset, so
+nothing proved the awk handled `200.123456789 seconds fast of NTP time`. It now parses fast (+),
+slow (-), sub-microsecond, and the unsynchronised `-0.000000000` seen live; and it asserts the
+parse reads only the `System time` line, not `Last offset` or `RMS offset` - which sit above it in
+real `chronyc tracking` output and would have been a live bug had the regex been looser.
+
+**The test mirrors a copy of the parse**, because the original lives inside a long single-quoted
+`bash -c` string and cannot be sourced. A copy can drift from the original and keep passing, so the
+test also asserts the shipped file still contains the same awk program. Two mutations - renaming
+the captured field, and flipping `slow` to `fast` - each fail it.
+
+Anchoring that guard took three attempts: `grep` patterns for the shipped text kept failing against
+*correct* code because the awk program is embedded with backslash-escaped `$`. Fixed by reading the
+exact bytes out of the file and matching fragments confirmed to exist, rather than guessing the
+escaping - the same trap that has now cost time in five separate iterations.
