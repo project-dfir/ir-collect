@@ -1712,3 +1712,54 @@ reporting an absence**.
 
 The Linux `unknown` state also remains un-exercised live (it needs a host with no working `lsblk`);
 a PATH-shadowed stub is the cheap way in.
+
+## Linux `unknown` encryption control - INVALID, defeated by the collector's own PATH hardening (2026-07-29)
+
+Attempt: force `ENCRYPTED=unknown` on a real host by shadowing `lsblk` with a stub that exits 1,
+so the branch added by the LUKS fix could be seen firing in production rather than only in tests.
+
+The condition was asserted live and was genuinely in effect for the shell that launched the run:
+
+```
+CONDITION: lsblk resolves to /tmp/lsblkstub/lsblk, exit=1
+CONDITION LIVE: lsblk is present but fails
+```
+
+**And the collector still reported `ENCRYPTED=no`.** For a few minutes that looked like a defect in
+my own fix - unit-tested with 22 assertions and 5 mutations, yet apparently dead in production.
+
+**It is not. The collector pins its own PATH on purpose** (`collectors/ir-collect.sh:173-175`):
+
+```bash
+BASE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ -d "$TOOL_DIR/bin" ]; then export PATH="$TOOL_DIR/bin:$BASE_PATH"; TRUSTED_BIN=1
+else export PATH="$BASE_PATH"; TRUSTED_BIN=0; fi
+```
+
+A live-response tool must not resolve its binaries through a PATH an intruder can influence. The
+stub was ignored **because the hardening worked**, the real `lsblk` ran, and `ENCRYPTED=no` was the
+correct answer for a host with no encrypted volumes.
+
+Verified separately that the branch itself is sound - the shipped condition, extracted and run under
+the exact `bash -c` form `run_sh` uses:
+
+```
+as the invoking user:  ENCRYPTED=unknown / REASON=failed
+under sudo env:        ENCRYPTED=unknown / REASON=failed
+```
+
+So: **control INVALID, logic verified in isolation, no defect.** Also confirmed the collector does
+not re-exec, which was the other candidate explanation.
+
+### What this changes
+
+- **PATH-shadowing is not a usable technique against this collector**, by design. Recorded so the
+  next attempt does not repeat it. To reach the branch live, `lsblk` has to fail *at its real path*
+  - a `mount --bind` of a failing stub over `/usr/bin/lsblk`, or `chmod 000` - both invasive enough
+  to need a trap and a watchdog, and neither attempted here.
+- The PATH pinning is a genuine strength of this tool that no scenario had exercised or recorded.
+  It is now documented, and it is the reason an attacker cannot make the collector run their
+  `lsblk`, `dmsetup` or `cryptsetup`.
+
+The `unknown` state therefore remains **unit- and mutation-verified only**, unchanged from before
+this attempt - which is the honest position, not a downgrade.
