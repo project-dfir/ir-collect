@@ -1691,13 +1691,24 @@ Both are the same rule the collector itself keeps violating, now caught in the t
 result from a check that could not run is not a finding.** Three defects were nearly filed against
 working code in a single run.
 
-### Not concluded
+### Resolved: the master-key capture works too
 
-`volume_keys_bytes=0` in the encrypted case - the dm-crypt master key file was looked for at a
-**guessed** filename (`volume_keys.txt`) that the metadata listing does not obviously contain. Given
-the three false defects above, this is recorded as *unverified*, not as a gap: the header backup
-demonstrably worked, and whether the `dmsetup --showkeys` capture landed under a different name has
-not been established. Next iteration should read the actual filename before judging.
+The `volume_keys_bytes=0` left unconcluded above was **entirely my wrong filename**. Reading the
+source (`run_sh meta-volkeys volume_master_keys.txt`) rather than guessing gives the real name, and
+re-running the same harness against it:
+
+| | `volume_master_keys.txt` | LUKS header backups |
+|---|---|---|
+| encrypted volume | **857 B, 23 lines, `showkeys` section present** | 1 |
+| volume closed | 354 B, 8 lines - section headers only, no key material | 0 |
+
+So the full key-capture path is verified end to end: dm-crypt master keys **and** the LUKS header
+backup are captured while the volume is unlocked, and on a host with nothing encrypted the same step
+writes its headers and no keys - it does not fabricate material or fail loudly over nothing.
+
+This was the right call to defer. Reported as a gap it would have been a fourth false defect in the
+same investigation; the rule that saved it is simply **read the source for the real path before
+reporting an absence**.
 
 The Linux `unknown` state also remains un-exercised live (it needs a host with no working `lsblk`);
 a PATH-shadowed stub is the cheap way in.
