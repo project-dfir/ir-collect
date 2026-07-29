@@ -763,6 +763,42 @@ $script:CriticalSteps = @('processes','processes-csv','process-owners','tasklist
 # and every entry was a LABEL, not an action - 'cim-to-wmi-fallback', 'degrade-nonadmin',
 # 'fallback-or-skip' were strings that got logged while the step gave up. The point is to COMPLETE
 # the collection, so each rung below either does something real or is named honestly as a marker.
+# REACHABILITY, MEASURED 2026-07-29 - which of these can actually be OFFERED to a responder.
+#
+# A class only reaches a responder if Get-ErrorClass assigns it, and that happens solely when a
+# step fails INSIDE its own execution and surfaces error TEXT - or via the one direct assignment
+# further down (tool_missing, on toolkit tampering). Five conditions were induced live and read
+# back from diagnostics.by_error_class and the ledger:
+#
+#   carried tool removed mid-run -> tool_missing FIRED (this is the proof the channel works)
+#   healthy host                 -> nothing        (correct)
+#   unreachable UNC destination  -> nothing
+#   IRCOLLECT_FORCE_INPROC=1     -> nothing
+#   over-long -Dest              -> nothing, and NO BUNDLE at all
+#
+# The empty results are not gaps. Each of those conditions is handled EARLIER and BETTER than a
+# ladder could, so the matching ladder below is VESTIGIAL - kept because the class is still a valid
+# label if a step ever does fail that way, but it will not be reached by the obvious trigger:
+#
+#   path_too_long   - refused before the tree exists ("a run that cannot create its own tree cannot
+#                     record why it failed"). There is no ledger to carry a class, and no retry
+#                     helps: the operator must pass a shorter -Dest, which the refusal already says.
+#   job_subsystem   - the in-process fallback IS this ladder's first rung (force-inproc), applied
+#                     automatically and reported via diagnostics.exec_mode. The remediation happens
+#                     before anything could offer it.
+#   wmi_failure     - a broken CIM subsystem returns EMPTY rather than throwing, so no text reaches
+#                     the classifier. Covered instead by diagnostics.cim_evidence.
+#   net_unreachable - the destination probe returns a STRUCTURED RESULT rather than throwing, and a
+#                     failed ship is recorded in <bundle>.ship.json + ship.preflight_reason + an
+#                     exit code >= 10. DELIBERATELY NOT WIRED to this ladder: the bundle is already
+#                     sealed and safe locally, so an automatic backoff-retry would only delay the
+#                     operator's return for a destination that may be down for hours. A retry
+#                     policy belongs to whatever orchestrates the collection, which already has
+#                     everything it needs to make that choice.
+#
+# DO NOT "fix" this by having those detections write error_class. That would manufacture ERRORS for
+# conditions the collector handled correctly - a transparent fallback is not a job_subsystem error -
+# and would degrade the diagnostics it appears to improve.
 $script:FixLadders = @{
     'wmi_failure'     = @('restart-wmi','native-source','skip')
     'no_space'        = @('purge-scratch','relocate-dest','retry-in-place','skip')

@@ -2123,3 +2123,37 @@ failed ship *does* have a meaningful retry - and that is a design decision worth
 deliberately rather than as a side effect of this sweep.
 
 Recorded with the map complete so that decision can be made from evidence.
+
+## The reachability map, recorded where it will be read (2026-07-29)
+
+The map is now a comment above `$script:FixLadders` in the collector itself, not only in this
+catalogue. A reader wondering why `job_subsystem`'s ladder never fires will be standing at that
+table when the question occurs to them; a note two thousand lines into a scenario document is not
+where they will look.
+
+### The `net_unreachable` decision, made deliberately
+
+This was the one class with a genuine case for wiring up - a failed ship *does* have a meaningful
+retry. Reading the ship path settled it. On failure the collector already records:
+
+- `$script:ShipOk = $false` and the first line of the error
+- an operator message naming the local bundle: *"The COLLECTION is intact; only the transfer failed"*
+- `<bundle>.ship.json` - `ok`, `error`, `preflight_ok`, `local_copy`, written **beside** the sealed
+  bundle so the container is never modified after its manifest
+- an exit code of at least 10, distinct from a clean run
+
+**Decision: do not wire it.** An automatic `backoff-retry` at seal time would delay the operator's
+return to the console for a destination that may be down for hours, while the evidence is already
+sealed and safe locally. Everything needed to retry is machine-readable, so **the retry policy
+belongs to whatever orchestrates the collection** - which knows whether the share is coming back,
+and a forensic tool should hand control back promptly rather than own that judgement.
+
+Recorded in the source with the reasoning, so the next reader inherits the decision rather than the
+question.
+
+### Scope kept honest
+
+The note says these ladders are vestigial *for the obvious trigger*, not that the classes are dead.
+`net_unreachable` remains assignable if some step ever throws a network error inside its own
+execution - that simply was not among the five conditions induced. Claiming more than was measured
+would be the same overreach this catalogue keeps catching.
