@@ -1763,3 +1763,47 @@ not re-exec, which was the other candidate explanation.
 
 The `unknown` state therefore remains **unit- and mutation-verified only**, unchanged from before
 this attempt - which is the honest position, not a downgrade.
+
+## Audit: the status cross-check is now a test, not a habit (2026-07-29)
+
+Status for a scenario is written in three places - the summary table row, the section heading, and
+the prose - and they drift. Four times now:
+
+| drift | found |
+|---|---|
+| E3 heading said PARTIAL; row said CLOSED; body said "both controls passing" | 2026-07-29 audit |
+| E5 shipped with no legend glyph | same audit |
+| E1 marked handled while its own text described an open gap | same audit |
+| D5 row still said "never run against a real encrypted volume" while the section recorded both controls passing | 2026-07-29 |
+
+Every one was found by cross-checking and none by reading, and the page is now 1765 lines - well
+past the size where a human pass reliably catches this. So the cross-check moved into the unit
+suite (`tests/unit/test-catalogue-consistency.sh`), where CI runs it whether or not anyone is
+auditing. Eight assertions:
+
+- the extractors find the table and the headings at all (a checker that matches nothing reports a
+  clean document - the exact failure this page is about)
+- no scenario heading claims a status its table row contradicts
+- every CLOSED row carries a glyph from the legend
+- every `tests/` `collectors/` `docs/` path the page references exists
+- the page's live-verification claims are outnumbered by captured-output blocks
+- records of INVALID controls are still present and still marked
+
+It compares the document against itself and the filesystem; it cannot tell whether a claim is
+*true*, only whether the page contradicts itself or points at something absent.
+
+### Two of my own checks were wrong before the test was right
+
+**`tr -d '`,.'` strips every dot**, so `Set-TestPolicy.ps1` became `Set-TestPolicyps1` and the
+checker reported seven missing files that all exist. A failing assertion on working code, again -
+read first, and the document was fine.
+
+**Two of three mutations were false passes.** The mutation script died partway, `cat-m2.md` and
+`cat-m3.md` were never written, the test exited "catalogue not found", and the harness counted that
+non-zero exit as a caught mutation. Both showed `[covered]` while testing nothing. Re-run with an
+existence guard and an explicit check for the harness-error string, all three are genuinely caught.
+
+That is the same defect as the collector's, in the tool built to police it: **a check that could not
+run is indistinguishable from a check that passed.** It is worth noticing how persistent this shape
+is - it has now appeared in the product, in three scenario harnesses, in the path auditor, and here
+in a mutation runner.
