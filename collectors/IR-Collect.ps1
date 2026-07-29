@@ -10,9 +10,10 @@
 # have .NET 2.0 (Server 2008 R2, Win7 - exactly the machines a live-response collector still
 # meets) nothing would have stopped it. #requires makes the refusal universal and immediate,
 # which is what the A6 precedent asks for: let the host refuse, but only if it actually will.
+
 <#
 .SYNOPSIS
-    IR-Collect - Self-healing incident-response collector for Windows (two-stage: rapid volatile + menu).
+    IR-Collect - self-healing incident-response collector for Windows (two-stage: rapid volatile + menu).
 
 .DESCRIPTION
     STAGE 1 (automatic, no prompts): a fast "hasty grab" of all super-important VOLATILE data in
@@ -30,34 +31,115 @@
     SELF-HEALING: every action runs in an isolated job with a per-step timeout + retry; any failure,
     hang, or missing tool is logged and skipped - the run never aborts.
 
-.PARAMETER OutputRoot   Case folder location (point at an external drive). Default: script dir.
-.PARAMETER CaseId       Case identifier. Default: IR.
-.PARAMETER StepTimeoutSec  Default per-step timeout. Default: 120.
-.PARAMETER Auto         Run Stage 1 then all Stage-2 jobs EXCEPT the two hours-long ground-truth jobs
-                        (full-filesystem SHA-256 + full-disk image); no menu (practical unattended triage).
-.PARAMETER IncludeGroundTruth  With -Auto, also run the hours-long ground-truth jobs (7 full-FS hash, 8 disk image).
-.PARAMETER RapidOnly    Run only Stage 1 (volatile) and seal.
-.PARAMETER SkipAD       Never run the AD phase.
+    READING THE VERDICT. 99_logs\run_state.json carries machine-readable findings that the console
+    summary states only in passing. Four are worth knowing before you act on a bundle:
+
+    encryption_risk - THE DO-NOT-POWER-OFF SIGNAL, and it has three states because the third one
+    is the whole point:
+      ok                a shutdown costs nothing (RAM was captured, or no encrypted volume found).
+      encrypted-no-ram  an unlocked encrypted volume IS present and RAM was NOT captured. Power the
+                        host off and the disk image is unreadable. Capture keys or RAM first.
+      unknown-no-ram    the probe COULD NOT DETERMINE whether a volume is encrypted - the BitLocker
+                        cmdlets and manage-bde both failed. This is NOT a claim that the disk is
+                        clear, and not a claim that it is encrypted. Treat it as encrypted-no-ram
+                        until a human establishes otherwise.
+
+    cim_evidence - the PROVENANCE of the collected content, not its contents. A dead WMI is itself
+    a finding: it can mean a broken host, and it can mean an intruder disabled it.
+
+    subsystem_probe - whether a subsystem answered at all. 'insufficient-evidence' means the probe
+    could not reach a conclusion; it is not a clean bill of health.
+
+    by_error_class - a tally of failures by kind. AN EMPTY MAP DOES NOT MEAN NOTHING WENT WRONG:
+    conditions such as a preflight refusal, or a destination that cannot be written, are handled
+    before any class could be assigned. Read completeness.verdict and the counts, not the absence
+    of classes. Ship results, when shipping was requested, are in <bundle>.ship.json.
+
+.PARAMETER Dest
+    Case folder location - an external drive path, a UNC \\IP\share, or a bare IP. Aliased as
+    -OutputRoot. Default: the script's own directory.
+.PARAMETER Share
+    SMB share name to use when -Dest is given as a bare IP. Default: evidence.
+.PARAMETER Cred
+    Optional credentials for the network share.
+.PARAMETER CaseId
+    Case identifier. Default: IR.
+.PARAMETER StepTimeoutSec
+    Default per-step timeout in seconds. Default: 120.
+.PARAMETER Auto
+    Run Stage 1 then all Stage-2 jobs EXCEPT the two hours-long ground-truth jobs (full-filesystem
+    SHA-256 and full-disk image); no menu. Practical unattended triage.
+.PARAMETER IncludeGroundTruth
+    With -Auto, also run the hours-long ground-truth jobs (7 full-FS hash, 8 disk image).
+.PARAMETER RapidOnly
+    Run only Stage 1 (volatile) and seal.
+.PARAMETER SkipAD
+    Never run the Active Directory phase.
+.PARAMETER DeferMemory
+    Capture RAM AFTER the volatile-command battery instead of before it.
+.PARAMETER NoKeyCapture
+    Skip BitLocker recovery-password / key-package capture. By default the collector grabs them
+    while the volume is unlocked, because a dead-box image of an encrypted disk is unreadable
+    without a key. Those outputs ARE the keys to the evidence - see 00_metadata\DECRYPTION-KEYS.md.
+    Use this where extracting key material is outside the engagement's scope.
 .PARAMETER AllowConstrainedLanguage
-                        Proceed even though PowerShell is in ConstrainedLanguage. By default the
-                        collector REFUSES (exit 40): in that mode step construction and all hashing
-                        are blocked, so it cannot produce a manifest or custody digests, and the
-                        writable probe fails in a way that can redirect evidence onto the target's
-                        system drive. Prefer the native triage binaries in .	ools, or off-host
-                        acquisition. This switch collects partial, UNVERIFIABLE volatile data.
-.PARAMETER NoKeyCapture Skip BitLocker recovery-password / key-package capture. By default the
-                        collector grabs them while the volume is unlocked, because a dead-box
-                        image of an encrypted disk is unreadable without a key. Those outputs
-                        ARE the keys to the evidence - see 00_metadata\DECRYPTION-KEYS.md.
-                        Use this where extracting key material is outside the engagement's scope.
+    Proceed even though PowerShell is in ConstrainedLanguage mode. By default the collector REFUSES
+    (exit 40): in that mode step construction and all hashing are blocked, so it cannot produce a
+    manifest or custody digests, and the writable probe fails in a way that can redirect evidence
+    onto the target's system drive. Prefer the native triage binaries in .\tools, or off-host
+    acquisition. This switch collects partial, UNVERIFIABLE volatile data.
+.PARAMETER Lab
+    Training/exercise mode: read-only-media launch, VM detection, HTTP egress, relaxed
+    contamination rules. Not for real evidence.
+.PARAMETER Authorizer
+    Who authorized this collection. Recorded for chain of custody.
+.PARAMETER LegalBasis
+    Authority or legal basis for the collection (IR engagement, warrant, consent, ...).
+.PARAMETER ScopeNote
+    The authorized scope of collection.
+.PARAMETER Resume
+    Resume a prior run: point at its output directory. Only unsatisfied steps are re-run.
+.PARAMETER Scenario
+    Non-interactive scenario id (1-10 or U). Injects intake and plan with no prompts, for
+    automation, lab and end-to-end use.
+.PARAMETER HostRole
+    Non-interactive host role: workstation, server, domain-controller, cloud-vm, container,
+    ot-ics or network-device.
+.PARAMETER KnownBadIps
+    Comma- or space-separated seed IOCs, folded into intake.json.
+.PARAMETER KnownBadDomains
+    Comma- or space-separated seed domain IOCs, folded into intake.json.
+.PARAMETER KnownBadHashes
+    Comma- or space-separated seed file-hash IOCs, folded into intake.json.
 
-.NOTES  Exit codes: 0 clean | 10 completed-with-skips | 15 incomplete-critical |
-        20 RAM not verified | 40 fatal.
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
 
-.EXAMPLE  powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -OutputRoot E:\evidence -CaseId CASE001
-.EXAMPLE  powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Auto   # full unattended
+    Interactive: Stage 1 runs immediately, then the Stage-2 menu is offered.
 
-.NOTES  Run elevated. Read-only w.r.t. the evidence disk (writes only to OutputRoot).
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -Auto
+
+    Full unattended triage, skipping only the two hours-long ground-truth jobs.
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\IR-Collect.ps1 -RapidOnly -Dest \\10.0.0.5\evidence
+
+    Volatile capture only, written straight to a network share.
+
+.NOTES
+    Exit codes: 0 clean | 10 completed-with-skips | 15 incomplete-critical | 20 RAM not verified
+    | 40 fatal.
+
+    Run elevated. Read-only with respect to the evidence disk - the collector writes only under
+    -Dest.
+
+    KEYWORD PLACEMENT MATTERS HERE. .NOTES and .EXAMPLE text MUST start on the line after the
+    keyword: with it on the same line, PowerShell silently discards the ENTIRE comment-based help
+    block and Get-Help falls back to an auto-generated syntax stub. .PARAMETER is worse, because it
+    fails quietly in a different way - the block still renders, but every same-line description is
+    dropped. That is how this help sat dead in the repo: 50 lines of accurate documentation that
+    Get-Help never showed anyone. tests/unit/Test-HelpOutput.ps1 guards it.
 #>
 
 [CmdletBinding()]
