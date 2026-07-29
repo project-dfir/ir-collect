@@ -1169,20 +1169,36 @@ returned a meaningless `0`. **An empty result from a broken check is not a findi
 wrapper is `Collect 'name' { } 'file.txt'`, not `Invoke-Step 'name'`; two separate patterns in this
 session were written against the wrong call shape.
 
-### Defect A - a dead WMI is invisible in the bundle (REAL, NOT FIXED)
+### Defect A - CORRECTED 2026-07-29 by the audit pass that followed
 
-The run above is the finding. With WMI **completely stopped**, the bundle's counts are identical to
-a healthy host's, and nothing anywhere records that CIM was unavailable. The `catch { $null }`
-swallows the failure, the fallback quietly substitutes, and the artifact does not say which source
-it came from.
+**As first recorded, this was WRONG, and the error is worth keeping.** The claim was "nothing
+anywhere records that CIM was unavailable... the artifact does not say which source it came from".
+That is false. The fallback branches write an explicit banner into the artifact:
 
-That matters beyond tidiness. **Adversaries disable WMI**, and a responder reading these artifacts
-cannot tell a host whose WMI was working from one whose WMI was dead - the fallback data looks the
-same. The tool *knows* (the `catch` executed); it discards the fact before anything durable. Same
-family as E1/A3/E3, the clock sync flag, and the stranded fix ladders.
+```
+### CIM/WMI unavailable - collected via native fallback (data is equivalent, formatting differs) ###
+```
 
-The fix is to record fallback use per step - which source actually produced each artifact - so the
-bundle states its own provenance. Left for the next harden pass rather than bolted on here.
+Nine such banner sites exist. The claim came from reading `run_state.json` counts and never opening
+an artifact - concluding an ABSENCE from the wrong layer, which is the same defect this page keeps
+finding in the collector: asserting a cause, or the lack of one, that was never established. It was
+committed and had to be corrected a pass later.
+
+**What is actually true, and still worth fixing.** The fallback is recorded in artifact TEXT and
+reaches nothing else. There is no tracker at all - `FallbackSteps`, `native-fallback` and
+`CimFallback` each appear **0 times** in the collector; the 31 other matches for "fallback" are the
+ENOSPC rollup, the hash backend and the exec mode, none of them this. So:
+
+- an analyst who **opens each artifact** sees that CIM was down
+- an operator reading `SUMMARY.md`, and any tooling reading `run_state.json`, does **not**: the run
+  presents as `COMPLETE ok=33 failed=0 empty_outputs=0` with no finding and no count of how many
+  steps fell back
+
+Adversaries disable WMI, so "six core steps silently switched to native sources" is a finding in its
+own right, and it is currently discoverable only by grepping the evidence. Same family as the
+stranded fix ladders - the fact exists, it just never reaches the verdict - but far narrower than
+first written. The fix is a fallback census surfaced in `run_state.json` and the report, not new
+artifact provenance, which already exists.
 
 ### Defect B - my own verdict was two-state (FIXED)
 
@@ -1199,3 +1215,35 @@ Added `Get-SubsystemProbeState`, and `run_state.json` now carries `diagnostics.s
 with `state` = `not-answering` | `answered` | `insufficient-evidence`, plus the step counts and a
 note saying plainly when the bundle proves nothing either way. 12 further assertions, including one
 that the three situations produce three *different* states.
+
+
+## Audit: swallowed failures across the Windows collector (2026-07-29)
+
+Inventory taken before fixing Defect A, so one site does not get fixed while others stay silent.
+By AST, with the classifier **self-tested** against known `catch` shapes (`$null` / empty /
+recorded / rethrow) before any count over the real file was trusted - a text scrape has matched the
+wrong call shape at least three times in this project.
+
+| catch clauses | 149 |
+|---|---|
+| discard the error entirely (empty or `$null`) | **91 (61%)** |
+| record something (audit/ledger/script-scope) | 23 |
+| rethrow or other handling | 35 |
+| touch CIM/WMI **and** discard | 11 |
+
+The 11 CIM sites are exactly the core volatile artifacts: `os-cim` (1511), processes and owners
+(1521/1525/1527), drivers (1531), local users (1557), services (1755), plus capability probes at
+151/154/716/1277.
+
+Two things this changed:
+
+1. **It corrected Defect A** (above). Reading the `else` branches showed the fallbacks announce
+   themselves in the artifact - the opposite of what had been recorded from the counts alone.
+2. **It reframes the -Auto negative control.** Every CIM step examined has a fallback, so the
+   subsystem-failure verdict may not fire under `-Auto` either - the steps will produce data, not
+   emptiness. Before spending another live run on it, check whether ANY CIM-backed step lacks a
+   fallback. If none does, the verdict as built can only fire on a host where CIM fails in a way
+   the fallbacks also cannot cover, and that is worth knowing before testing rather than after.
+
+The wider number is the one to keep: **91 of 149 catch clauses discard what they caught.** Defect A
+is one instance of a habit, and the habit is what produces "the tool saw it and said nothing".
