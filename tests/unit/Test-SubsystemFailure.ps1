@@ -186,5 +186,60 @@ Check ($src -match 'Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; \$sc
 Check ($src -match "unavailable\.\*\(native fallback\|fallback chain\)") `
       'the seal scans artifacts for the fallback banner (the reliable carrier across job runspaces)'
 
+# --- ENCRYPTION RISK: the one where being wrong is IRREVERSIBLE --------------------------------
+# Was: $encRisk = $false; try { $encRisk = (Get-BitLockerVolume ...) -and -not $memOk } catch {}
+# Initialised to "no risk", catch discards everything. Get-BitLockerVolume throws with no BitLocker
+# cmdlets, on editions lacking the feature, with a broken provider, and WHEN NOT ELEVATED - which
+# is scenario A3, a case this collector supports. Every one of those printed GREEN, so the operator
+# powers off an encrypted host and the disk image is unreadable forever.
+$fn4 = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $n.Name -eq 'Get-EncryptionRiskVerdict' }, $true) | Select-Object -First 1
+if (-not $fn4) { Write-Host 'FAIL  Get-EncryptionRiskVerdict not found in the shipped collector'; exit 2 }
+. ([scriptblock]::Create($fn4.Extent.Text))
+
+# THE REGRESSION: probe could not answer, no RAM -> must WARN, not clear the host
+$v = Get-EncryptionRiskVerdict -DiskEncrypted $null -MemoryVerified $false
+Check ($v.amber -eq $true)                  'probe failed + no RAM -> AMBER (the old code printed GREEN here)'
+Check ($v.state -eq 'unknown-no-ram')       'the unknown case has its own state, not the encrypted one'
+Check ($v.note -match 'COULD NOT BE DETERMINED') 'the note says the probe failed rather than claiming encryption'
+Check ($v.note -match 'not a claim that the disk is encrypted') `
+      'it explicitly refuses to assert encryption it never observed'
+
+# genuinely encrypted, no RAM -> the original AMBER case must still fire
+$v = Get-EncryptionRiskVerdict -DiskEncrypted $true -MemoryVerified $false
+Check ($v.amber -eq $true)                  'encrypted + no RAM -> AMBER'
+Check ($v.state -eq 'encrypted-no-ram')     'the encrypted case is distinguishable from the unknown one'
+
+# POSITIVE CONTROLS: neither may raise a false alarm, or the banner becomes noise and gets ignored
+$v = Get-EncryptionRiskVerdict -DiskEncrypted $false -MemoryVerified $false
+Check ($v.amber -eq $false)                 'not encrypted + no RAM -> no alarm'
+$v = Get-EncryptionRiskVerdict -DiskEncrypted $true -MemoryVerified $true
+Check ($v.amber -eq $false)                 'encrypted but RAM CAPTURED -> no alarm (the key is in the bundle)'
+Check ($v.note -match 'RAM was captured')   'and it says why the host is cleared'
+$v = Get-EncryptionRiskVerdict -DiskEncrypted $null -MemoryVerified $true
+Check ($v.amber -eq $false)                 'unknown encryption but RAM captured -> no alarm'
+
+# the three situations must be distinguishable, not collapsed
+$states = @(
+  (Get-EncryptionRiskVerdict -DiskEncrypted $true  -MemoryVerified $false).state,
+  (Get-EncryptionRiskVerdict -DiskEncrypted $null  -MemoryVerified $false).state,
+  (Get-EncryptionRiskVerdict -DiskEncrypted $false -MemoryVerified $false).state
+)
+Check (($states | Select-Object -Unique).Count -eq 3) 'encrypted / unknown / clear are three distinct states'
+
+# --- WIRING ---
+Check ($src -notmatch '\$encRisk = \$false\s*\r?\n\s*try \{ \$encRisk = \(\[bool\]\(Get-BitLockerVolume') `
+      'the old swallowing two-state probe is gone'
+Check ($src -match 'Get-EncryptionRiskVerdict -DiskEncrypted \$encState -MemoryVerified \$memOk') `
+      'the collector CALLS the encryption verdict with the probed state'
+Check ($src -match 'catch \{ \$encState = \$null \}') `
+      'a failed probe yields $null (unknown), not $false (safe)'
+Check ($src -match 'manage-bde\.exe -status') `
+      'a second probe is tried before giving up - capability proven, not inferred'
+Check ($src -match 'encryption_risk=\$script:EncVerdict') `
+      'run_state.json carries the encryption verdict, not just the console banner'
+Check ($src -match 'ENCRYPTION UNKNOWN \+ NO VERIFIED RAM') `
+      'the console distinguishes "could not tell" from "encrypted"'
+
 Write-Host ''
 if ($fail -eq 0) { Write-Host 'all assertions passed'; exit 0 } else { Write-Host "$fail failed"; exit 1 }

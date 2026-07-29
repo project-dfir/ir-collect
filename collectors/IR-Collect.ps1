@@ -560,6 +560,49 @@ function Get-SubsystemFailureVerdict {
     }
 }
 
+# Get-EncryptionRiskVerdict - may this host be powered off without destroying the evidence?
+#
+# THE DEFECT THIS CLOSES, and it is the most consequential in this file because the loss is
+# PHYSICAL AND IRREVERSIBLE. The risk flag was computed as:
+#
+#     $encRisk = $false
+#     try { $encRisk = ([bool](Get-BitLockerVolume ...)) -and (-not $memOk) } catch {}
+#
+# initialised to "no risk" and with the catch discarding everything. Get-BitLockerVolume throws on
+# hosts without the BitLocker cmdlets, on editions that lack the feature, when the provider is
+# broken, and WHEN NOT ELEVATED - which is scenario A3, a case this collector explicitly supports.
+# In every one of those the flag stayed $false, the console printed GREEN, and the responder was
+# told nothing. The AMBER banner exists to say "the BitLocker key lives in RAM you did NOT capture,
+# get a recovery key BEFORE powering off, or the disk image is unreadable". A failed probe read as
+# "not encrypted", so the operator powers the host off and the evidence is gone for good.
+#
+# TWO-STATE WHERE IT MUST BE THREE. "not encrypted" and "could not determine" are different facts
+# and only one of them is safe. An unrun probe must never resolve to the safe side when the cost of
+# being wrong is an unreadable disk image.
+function Get-EncryptionRiskVerdict {
+    param(
+        [System.Nullable[bool]]$DiskEncrypted,   # $null = the probe could not answer
+        [bool]$MemoryVerified
+    )
+    # Verified RAM means the key was captured, so encryption stops being a power-off risk. This is
+    # the only branch that clears the host, and it turns on a fact we measured rather than assumed.
+    if ($MemoryVerified) {
+        return [ordered]@{ state='ok'; amber=$false
+                           note='RAM was captured, so any volume key resident in memory is preserved in this bundle' }
+    }
+    if ($DiskEncrypted -eq $true) {
+        return [ordered]@{ state='encrypted-no-ram'; amber=$true
+                           note='this disk is encrypted and RAM was NOT captured - the volume key exists only in memory that is about to be lost' }
+    }
+    if ($null -eq $DiskEncrypted) {
+        # Warn, and say WHY it is a warning rather than a finding. Claiming encryption we did not
+        # observe would be its own false statement; staying silent risks the disk.
+        return [ordered]@{ state='unknown-no-ram'; amber=$true
+                           note='encryption status COULD NOT BE DETERMINED (the probe failed - commonly no BitLocker cmdlets, or not elevated) and RAM was NOT captured. This is not a claim that the disk is encrypted; it is a refusal to assume it is not, because that assumption is unrecoverable if wrong' }
+    }
+    [ordered]@{ state='ok'; amber=$false; note='no encrypted volume detected' }
+}
+
 # Get-CimEvidenceVerdict - did CIM actually produce this bundle's evidence, or did fallbacks?
 #
 # THE DEFECT THIS CLOSES. Eight of the thirteen CIM-backed steps carry a native fallback, so on a
@@ -2155,7 +2198,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
             # where at least one CIM step returned data - emptiness alone never sets it.
             $sf = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
             if ($sf) { [ordered]@{ subsystem=$sf.subsystem; error_class=$sf.class; steps=$sf.steps; ladder=@($script:FixLadders[$sf.class]); inferred_from='every subsystem-backed step empty (no error was raised)' } } else { $null }
-        ); cim_evidence=$script:CimEvidence; subsystem_probe=$(
+        ); encryption_risk=$script:EncVerdict; cim_evidence=$script:CimEvidence; subsystem_probe=$(
             # Never a bare null: says WHICH of the three situations produced it.
             Get-SubsystemProbeState -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
         ) }
@@ -2534,14 +2577,33 @@ function Show-VolatileGate {
     try { $n = (Get-ChildItem -LiteralPath $Dirs.volatile,$Dirs.network -File -Recurse -ErrorAction SilentlyContinue | Measure-Object).Count } catch {}
     $memOk = [bool]$script:MemOk
     # is the disk encrypted but we have no verified RAM (where the key lives)?
-    $encRisk = $false
-    try { $encRisk = ([bool](Get-BitLockerVolume 2>$null | Where-Object { $_.ProtectionStatus -eq 'On' })) -and (-not $memOk) } catch {}
+    # THREE-STATE: $null means the probe could not answer, and must not collapse into "no risk".
+    $encState = $null
+    try { $encState = [bool](Get-BitLockerVolume -ErrorAction Stop | Where-Object { $_.ProtectionStatus -eq 'On' }) } catch { $encState = $null }
+    if ($null -eq $encState) {
+        # manage-bde ships on editions where the PowerShell module does not, so a cmdlet-less host
+        # is not automatically an unknown one. Prove the capability rather than inferring it.
+        try {
+            $bde = (& manage-bde.exe -status 2>&1 | Out-String)
+            if ($bde -match 'Protection\s+On')       { $encState = $true }
+            elseif ($bde -match 'Protection\s+Off')  { $encState = $false }
+        } catch { $encState = $null }
+    }
+    $script:EncVerdict = Get-EncryptionRiskVerdict -DiskEncrypted $encState -MemoryVerified $memOk
+    $encRisk = [bool]$script:EncVerdict.amber
     $memNote = if ($memOk) { "RAM: VERIFIED ({0:N1} GB)" -f ($script:MemBytes/1GB) } else { 'RAM: NOT verified - capture failed/absent (see 03_memory)' }
     Write-Host ""
     if ($encRisk) {
         Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+        if ($script:EncVerdict.state -eq 'unknown-no-ram') {
+            Write-Host "  !!  VOLATILE: AMBER - ENCRYPTION UNKNOWN + NO VERIFIED RAM !!" -ForegroundColor Red
+            Write-Host "  !!  The encryption probe could NOT answer (no cmdlets, or !!" -ForegroundColor Red
+            Write-Host "  !!  not elevated). If this disk IS encrypted, its key is  !!" -ForegroundColor Red
+            Write-Host "  !!  in RAM you did not capture. Do not assume it is not.  !!" -ForegroundColor Red
+        } else {
         Write-Host "  !!  VOLATILE: AMBER - ENCRYPTED DISK + NO VERIFIED RAM   !!" -ForegroundColor Red
         Write-Host "  !!  The BitLocker key lives in RAM you did NOT capture.  !!" -ForegroundColor Red
+        }
         Write-Host "  !!  Get a recovery key (00_metadata\bitlocker_keys.txt)  !!" -ForegroundColor Red
         Write-Host "  !!  BEFORE powering off, or the disk image is unreadable.!!" -ForegroundColor Red
         Write-Host "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red

@@ -1314,3 +1314,87 @@ assertion** - that is the lesson, and only the live run could have produced it.
 `run_state.json` and `DIAGNOSTIC-REPORT.md` are verified live. The SUMMARY.md hoist is verified
 structurally and by unit test but **has not been re-run live** - recorded as such rather than
 claimed. 51 unit assertions; 6 mutations (2 logic, 4 wiring) all caught, unmutated clean.
+
+## SUMMARY hoist confirmed live, and the sweep finds the worst defect yet (2026-07-29)
+
+**Loose end closed.** The SUMMARY.md hoist is now verified live on WS02 under a real WMI outage:
+
+```
+cim_evidence.state=cim-unavailable
+SUMMARY names the evidence source: True
+report names the CIM evidence source: True
+TEARDOWN Winmgmt=Running rows=129 HEALTHY, evidence dirs=3
+```
+
+All three operator-facing layers - `run_state.json`, `DIAGNOSTIC-REPORT.md`, `SUMMARY.md` - now
+carry the finding. Defect A is fully closed.
+
+## Encryption risk was two-state, and being wrong destroys the evidence (FIXED 2026-07-29)
+
+Found by sweeping the 91 swallowed catches. This is the most consequential defect in the file,
+because the loss is **physical and irreversible**.
+
+```powershell
+$encRisk = $false
+try { $encRisk = ([bool](Get-BitLockerVolume 2>$null | Where-Object { $_.ProtectionStatus -eq 'On' })) -and (-not $memOk) } catch {}
+```
+
+Initialised to "no risk", with the catch discarding everything. `Get-BitLockerVolume` throws on
+hosts without the BitLocker cmdlets, on editions lacking the feature, when the provider is broken,
+and **when not elevated - which is scenario A3, a case this collector explicitly supports.**
+
+In every one of those the flag stayed `$false` and the console printed **GREEN**. The AMBER banner
+it suppressed says:
+
+> The BitLocker key lives in RAM you did NOT capture. Get a recovery key BEFORE powering off, or
+> the disk image is unreadable.
+
+So a failed probe read as "not encrypted", the responder powered the host off, and the evidence was
+gone permanently. Every other defect in this catalogue produces a misleading bundle; this one
+produces an **unreadable disk**.
+
+**The shape is the familiar one: two-state where it must be three.** "Not encrypted" and "could not
+determine" are different facts and only one of them is safe. An unrun probe must never resolve to
+the safe side when being wrong is unrecoverable.
+
+`Get-EncryptionRiskVerdict` is pure and three-state:
+
+| disk | RAM captured | verdict |
+|---|---|---|
+| encrypted | no | `encrypted-no-ram` - AMBER |
+| **unknown (probe failed)** | no | **`unknown-no-ram` - AMBER** |
+| not encrypted | no | clear |
+| any | **yes** | clear - the key is in the bundle |
+
+The unknown banner deliberately does **not** claim encryption it never observed - asserting a cause
+that was not established is its own defect. It says the probe could not answer, names the usual
+reasons (no cmdlets, not elevated), and refuses to assume the disk is unencrypted.
+
+A second probe (`manage-bde -status`, which ships where the PowerShell module does not) runs before
+declaring unknown - the capability is proven rather than inferred, so a cmdlet-less host is not
+automatically an unknown one. The verdict now reaches `run_state.json` as `encryption_risk`, not
+just the console.
+
+### Verification
+
+65 unit assertions. Five mutations, all caught:
+
+| mutation | failures |
+|---|---|
+| **unknown collapses back to safe (the original bug re-introduced)** | **5** |
+| captured RAM no longer clears the host | 3 |
+| wiring: failed probe defaults to safe again | 1 |
+| wiring: run_state stops carrying it | 1 |
+| wiring: console stops distinguishing unknown | 1 |
+
+**Not live-verified.** Reproducing it needs a host that throws on `Get-BitLockerVolume` - an
+unelevated run, or an edition without the cmdlets. WS02 has both the cmdlets and SYSTEM rights, so
+it cannot produce the condition. Recorded as unit-and-mutation-verified only. The natural live test
+is an **unelevated** run (the A3 harness already exists), which is a better fit than a new scenario.
+
+### Sweep note
+
+The triage taxonomy that found this had a sloppy regex - `SYSTEM\b` matched `Win32_ComputerSystem`,
+inflating a "registry-hive" bucket to 13 entries that were mostly false positives. The finding was
+real; the category was not. Worth remembering that a classifier's *grouping* can be wrong even when
+its *detection* is right.
