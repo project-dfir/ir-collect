@@ -52,7 +52,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | D2 | **Junction loops** | legacy `Application Data` reparse points | No duplicate artifacts, no infinite recursion | ✅ |
 | D3 | **Multi-GB Security.evtx on a DC** | the range DC | Priority channels secured before the bulk copy | ✅ |
 | D4 | **Hidden/system evidence files** | copied `NTUSER.DAT` | Present in the manifest with real hashes | ✅ |
-| D5 | **Encrypted volume** | BitLocker on, or LUKS | Keys captured while unlocked; AMBER if no verified RAM | ⚠️ code paths never run against a *real* encrypted volume |
+| D5 | **Encrypted volume** | BitLocker on, or LUKS | Keys captured while unlocked; AMBER if no verified RAM | ✅ CLOSED 2026-07-29 - exercised live on a LUKS loopback, both controls: encrypted -> `encrypted-no-ram` + the do-not-power-off banner + a real LUKS header backup; closed -> `ok` + generic amber only |
 | D6 | **Filenames with spaces / `%4` / Unicode** | winevt channel names | Quoted correctly | ✅ |
 
 ## E. Platform / environment
