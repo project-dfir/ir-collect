@@ -218,6 +218,24 @@ KAPE, FTK Imager, Magnet RAM. **Python** tools install on your *analysis* box vi
   SUMMARY.md
 ```
 
+### Reading the verdict — `99_logs/run_state.json`
+
+The bundle's machine-readable answer to *"can I trust this collection, and what do I do next?"*
+Beyond `completeness.verdict` and the step counts, `diagnostics` carries findings that a responder
+should read **before acting on the evidence or on the host**:
+
+| field | says |
+|---|---|
+| `encryption_risk` | **`encrypted-no-ram`** — the disk is encrypted and RAM was not captured: the volume key exists only in memory that is about to be lost. **`unknown-no-ram`** — the encryption probe could not answer *and* RAM was not captured; this is **not** a claim the disk is encrypted, it is a refusal to assume it is not. **`ok`** — either nothing encrypted, or RAM was captured so the key is in the bundle. Anything but `ok` means **do not power the host off** until a recovery key is in hand. |
+| `cim_evidence` | whether CIM/WMI actually produced this evidence. `cim-unavailable` with `fallback_steps` listed means those artifacts came from **native sources**, not WMI — the content is equivalent, the provenance is not, and a host whose WMI was dead during collection is itself a finding. |
+| `subsystem_probe` | three-state census behind `subsystem_failure`: `not-answering` / `answered` / `insufficient-evidence`. The last one means the bundle says nothing either way — it is not a clean bill of health. |
+| `by_error_class` | which failure classes were assigned, with a sample. Empty on a healthy run. Note that several conditions are handled *before* a class could be assigned (a refused destination, a transparent in-process fallback), so an empty map does not mean nothing went wrong — read `ship`, `exec_mode` and the verdict too. |
+| `ship` | `preflight_ok`, `preflight_reason`, and whether the transfer succeeded. A failed ship leaves the **collection intact locally** and exits ≥ 10; `<bundle>.ship.json` beside the archive is the machine-readable record, written outside the sealed container so the manifest stays valid. |
+
+`SUMMARY.md` carries the same findings in prose, and `99_logs/DIAGNOSTIC-REPORT.md` explains what
+failed, what self-heal attempted, and how to reproduce it.
+
+
 ---
 
 ## What makes it bulletproof (anti-halt hardening)

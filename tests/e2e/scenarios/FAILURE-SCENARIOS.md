@@ -2304,3 +2304,49 @@ the service is returned to `Stopped`/`Manual` afterwards.
 **Not run.** The plan is now specific, the way out is proven, and the residual risk is named - but
 locking a range VM out of remote access is the user's call to make, not one to take silently on
 their behalf.
+
+## Audit: the tool grew five machine-readable findings and told nobody (2026-07-29)
+
+An unexamined seam - not the code, the **operator-facing documentation**. A responder reads the
+README and the bundle, not a 2400-line scenario catalogue. So: does the shipped documentation
+describe what the tool now produces?
+
+It did not. Every diagnostic added during this session was absent from both the collector's header
+docs and the README:
+
+| field | documented before |
+|---|---|
+| `encryption_risk` | no |
+| `cim_evidence` | no |
+| `subsystem_probe` | no |
+| `subsystem_failure` | no |
+| `<bundle>.ship.json` | no |
+
+`encryption_risk` is the one that matters. It is the **do-not-power-off signal** - the difference
+between `ok`, `encrypted-no-ram` and `unknown-no-ram` decides whether a responder can safely shut
+the host down - and its three states were defined only inside this catalogue. A field appearing in
+`run_state.json` that nobody has explained is a field that gets ignored, and the whole point of the
+three-state work was that `unknown` must not be read as "fine".
+
+The README now has a **Reading the verdict** section immediately after the output layout, where
+someone holding a bundle will actually be standing. It documents each field in terms of what the
+responder should *do*, and states the non-obvious parts explicitly:
+
+- `unknown-no-ram` is **not** a claim that the disk is encrypted - it is a refusal to assume it is
+  not;
+- `cim_evidence` distinguishes equivalent **content** from equivalent **provenance**, and notes that
+  a dead WMI is itself a finding;
+- `subsystem_probe`'s `insufficient-evidence` means the bundle says nothing either way - not a clean
+  bill of health;
+- an empty `by_error_class` does **not** mean nothing went wrong, because several conditions are
+  handled before a class could be assigned. Read `ship`, `exec_mode` and the verdict too.
+
+That last line is the reachability map's finding, translated from an implementation detail into the
+one sentence a responder needs so they do not misread an empty map as an all-clear.
+
+### The pattern
+
+Twice in three iterations the gap has been **where a finding was recorded**, not whether it was
+correct: the reachability map was accurate in the catalogue and useless there until it moved next to
+`$script:FixLadders`; these fields were correct in `run_state.json` and unexplained until the README
+described them. Work that is right but unfindable is not finished.
