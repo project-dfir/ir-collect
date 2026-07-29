@@ -2157,3 +2157,50 @@ The note says these ladders are vestigial *for the obvious trigger*, not that th
 `net_unreachable` remains assignable if some step ever throws a network error inside its own
 execution - that simply was not among the five conditions induced. Claiming more than was measured
 would be the same overreach this catalogue keeps catching.
+
+## C4 follow-up: the 270s was never the detached launch (2026-07-29)
+
+Seven detached-SYSTEM runs had all landed at 270-285 s against a "~25 s interactive baseline", and
+that gap was carried for many iterations attributed to *the detached-SYSTEM launch* - an attribution
+that was never measured. The audit log records a duration per step, so every one of those runs had
+already written the answer down.
+
+One ordinary detached collection, read for timings:
+
+```
+wall clock             270 s
+sum of step durations  247 s
+unaccounted            23 s      <- launch + seal overhead
+
+150 s  mem-hash-verify
+ 72 s  manifest-sha256
+ 12 s  mem-winpmem
+  2 s  process-owners
+  ...  29 of 34 steps complete in 0-1 s
+```
+
+**222 s of the 270 s is hashing** - verifying the memory image, then hashing every artifact into the
+manifest. The detached launch accounts for **23 s**, not 245.
+
+So the hypothesis was wrong in its central claim. The runs are not slow *because they are detached*;
+they are slow because they **capture a memory image and then hash it**, and a 12 s capture produces
+something that takes 150 s to verify.
+
+### What this says about the "~25 s baseline"
+
+Almost certainly not a like-for-like comparison. This page's own testing-hygiene note records that a
+run with no `tools/` alongside the script finds no imager and takes the fast `mem-fallback` path -
+"a few KB instead of 32 GB". A run with no memory image has no `mem-hash-verify` and a trivial
+manifest, which is exactly the 200-second difference.
+
+**Stated as inference, not measurement:** no interactive comparison was run this iteration, so that
+explanation is supported by the timings above plus the hygiene note, not by a paired experiment. The
+measured claim is the narrow one - 82 % of the wall clock is hashing and the launch overhead is
+23 s - and it is sufficient to retire the original attribution.
+
+### Why this sat open so long
+
+The number was reproducible (seven runs, all ~270 s), which made it feel understood. A reproducible
+number with an unmeasured cause is still a guess, and "tracks the detached-SYSTEM launch" was
+repeated across iterations until it read like a finding. The data to refute it was in every bundle
+the whole time.
