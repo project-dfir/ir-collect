@@ -2074,3 +2074,52 @@ What a working version needs is the page quoting code in a **machine-checkable f
 block tagged with its file and line - rather than a heuristic guessing which nearby backtick refers
 to the citation. Until the page carries that, citation drift is caught by hand, and the reasoning
 sits in the test file where the next person will look for it.
+
+## Error-class reachability: the complete map, and what it means for the ladders (2026-07-29)
+
+Five conditions induced live, read from `diagnostics.by_error_class` and the ledger's `error_class`
+rows. No instrumentation was added - the channel already ships, and the `tool_missing` run proved it
+works end to end, which is what makes the empty results below evidence rather than silence.
+
+| condition induced | live proof | class fired | where the condition IS recorded |
+|---|---|---|---|
+| healthy host | - | none | - (correct baseline) |
+| carried tool removed mid-run | `present=False, runStillGoing=True` | **`tool_missing`** | ledger + verdict `toolkit-tampered(winpmem.exe)` |
+| unreachable UNC destination | probe returned unreachable | none | `ship.preflight_ok=False` + `preflight_reason` |
+| `IRCOLLECT_FORCE_INPROC=1` | `exec_mode=in-process(self-heal)` | none | `diagnostics.exec_mode` |
+| 212-char `-Dest` | refused in 15 s, no bundle | none | stdout refusal + exit code |
+
+### The rule this reveals
+
+A class is produced only when a failure happens **inside a step** and surfaces as error *text*, or
+via the one direct assignment. Every other condition here is handled **earlier and better**:
+
+- **refused before starting** (`path_too_long`) - the collector declines to create a tree it cannot
+  write, saying *"a run that cannot create its own tree cannot record why it failed"*. There is no
+  ledger to carry a class, and that is the correct order of operations.
+- **handled preemptively** (`job_subsystem`) - the in-process fallback IS the first rung of that
+  class's own ladder (`force-inproc`). The remediation was applied automatically, so the ladder
+  describing it can never be needed.
+- **detected structurally** (`net_unreachable`) - a bounded probe returns a result rather than
+  throwing; the evidence stays local and the operator is told why.
+- **emptiness instead of error** (`wmi_failure`) - already covered by `cim_evidence`.
+
+So the stranded ladders are **vestigial, not broken**. Three of the four describe a remediation
+that is either already applied automatically, or impossible by construction: you cannot retry your
+way out of an over-long `-Dest`, and the refusal message already tells the operator the one thing
+that helps ("use a shorter `-Dest`").
+
+### Recommendation, deliberately not executed here
+
+The tempting fix - have the structured detections write `error_class` so the ladders become
+reachable - would manufacture *errors* for conditions the collector handled correctly. A run that
+transparently fell back to in-process is not a run with a `job_subsystem` error, and labelling it
+one would degrade the diagnostics rather than improve them.
+
+The defensible change is the opposite: **mark the vestigial ladders as such in the source**, so the
+next reader does not spend an iteration discovering that `force-inproc` can never be offered
+because it already happened. `net_unreachable` is the one genuine candidate for wiring up, since a
+failed ship *does* have a meaningful retry - and that is a design decision worth making
+deliberately rather than as a side effect of this sweep.
+
+Recorded with the map complete so that decision can be made from evidence.
