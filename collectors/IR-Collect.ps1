@@ -2167,6 +2167,10 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     $script:CimProbeOk = $null
     try { $null = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; $script:CimProbeOk = $true }
     catch { $script:CimProbeOk = $false }
+    # Three-state on the SCAN itself, not just on its result. If this throws, an empty
+    # $script:FallbackSteps is indistinguishable from "no step fell back" - the same collapse this
+    # census exists to fix, one level up. Found by the safe-default sweep 2026-07-29, in my own code.
+    $script:FallbackScanOk = $true
     $script:FallbackSteps = @()
     try {
         foreach ($d in @($Dirs.volatile, $Dirs.system, $Dirs.network) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
@@ -2177,9 +2181,12 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
                 if ($head -match 'unavailable.*(native fallback|fallback chain)') { $script:FallbackSteps += $f.Name }
             }
         }
-    } catch {}
+    } catch { $script:FallbackScanOk = $false }
     $cimEmpty = @($script:EmptySteps | Where-Object { $script:CimStepsRan -contains $_.name } | ForEach-Object { $_.name })
     $script:CimEvidence = Get-CimEvidenceVerdict -CimAvailable $script:CimProbeOk -FallbackSteps $script:FallbackSteps -EmptyCimSteps $cimEmpty
+    if (-not $script:FallbackScanOk -and $script:CimEvidence) {
+        $script:CimEvidence.note = $script:CimEvidence.note + ' NOTE: the fallback scan itself failed, so the list of native-sourced artifacts below is INCOMPLETE - absence from it is not evidence a step used CIM.'
+    }
 
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$script:CaseIdRaw; case_path_token=$script:CaseIdSafe; host=$hostName; output_dir=$OutDir

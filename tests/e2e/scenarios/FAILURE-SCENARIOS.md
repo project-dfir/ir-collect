@@ -1592,3 +1592,51 @@ parity hole in the other direction. Full shell unit suite green.
 **Not live-verified**, and recorded as such: producing `unknown` needs a host with no working
 `lsblk`, which none of the range VMs is. The encrypted path itself (a real LUKS volume) remains
 D5's untested gap on both platforms.
+
+## Audit: how widespread is the signature defect, actually? (2026-07-29)
+
+The swallowed-catch inventory (91 of 149) has been sitting as an open seam that produced the two
+worst defects found. This pass asked the bounding question - **is the BitLocker shape typical or
+rare?** - because "91 latent disasters" and "91 mostly-harmless cleanups with a few real ones" call
+for very different amounts of remaining work.
+
+Rather than another subject-matter taxonomy (the previous one grouped by topic and got it wrong -
+`SYSTEM\b` matched `Win32_ComputerSystem`), this detector looks for the **consequence shape** that
+actually bites:
+
+```powershell
+$x = <safe default>             # a value meaning "nothing to worry about"
+try { $x = <probe> } catch {}   # the probe may never run; the failure is discarded
+if ($x) { ...decision... }      # a decision taken on a value that may be the default
+```
+
+Self-tested against a known-present and a known-absent case before its output was trusted.
+
+**Result: 60 swallowing assignments, and only 4 have the shape.** Each was then judged individually
+rather than counted:
+
+| line | variable | verdict |
+|---|---|---|
+| 872 | `$alts` (alternate imager search) | fails toward *giving up* - the rung returns false and the ladder ends. Conservative, not a false success |
+| 1342 | `$script:GuestTools` | `$script:Hypervisor` beside it is **already** `'unknown'` - the codebase gets this right here. The empty tool list is informational |
+| 2577 | `$n` (volatile file count) | GREEN requires `$n -ge 10`, so a failed count **cannot** produce GREEN. Correct by construction |
+| 2171 | `$script:FallbackSteps` | **a real one, and mine** - see below |
+
+**The useful conclusion is a negative one: the signature defect is rare, not endemic.** The
+BitLocker case was an outlier, not a representative sample of the 91. That bounds the remaining
+sweep, and it is worth recording precisely because the earlier framing implied otherwise.
+
+### The one real hit was in code I added two iterations ago
+
+The seal-time scan that builds the CIM fallback census wrapped its whole directory walk in
+`} catch {}`. If that scan throws, `$script:FallbackSteps` stays empty - **indistinguishable from
+"no step fell back"**. That is the exact collapse the census exists to fix, reproduced one level up
+in the mechanism doing the fixing.
+
+Fixed with `$script:FallbackScanOk`; when the scan fails, the note now says the list is INCOMPLETE
+and that absence from it is not evidence a step used CIM.
+
+This is the third time a defect I was hunting turned up in my own code for it (the two-state null in
+the subsystem probe, the empty-result-asserts-a-cause in the encryption harness, and now this).
+Worth stating plainly rather than filing quietly: the detector should always be run over the fix,
+not only over the original.
