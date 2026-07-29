@@ -2204,3 +2204,42 @@ The number was reproducible (seven runs, all ~270 s), which made it feel underst
 number with an unmeasured cause is still a guess, and "tracks the detached-SYSTEM launch" was
 repeated across iterations until it read like a finding. The data to refute it was in every bundle
 the whole time.
+
+## The Windows safe-default guard, with a justified baseline (2026-07-29)
+
+The Linux guard has been in CI since the LUKS fix; this is its Windows twin. Same three outcomes -
+pass / FAIL (product regression) / **exit 2** (the guard could not calibrate, never reported as
+clean) - and the same vendored known-positive, because `git show <sha>~1` is silently empty at CI's
+checkout depth.
+
+The fixture is the whole pre-fix `Show-VolatileGate`, not an excerpt. The first attempt vendored a
+16-line fragment and the detector reported a **parse error**: it works on the PowerShell AST, so an
+unbalanced excerpt is not analysable. A fixture has to satisfy the instrument that reads it.
+
+### Windows is not at zero, and pretending otherwise would ship a red test
+
+The Linux collector genuinely has 0 sites. Windows has **three**, and they are the same three
+judged individually during the earlier audit:
+
+| site | why it is safe |
+|---|---|
+| `$alts` | alternate-imager search; a failed search leaves the list empty, the rung returns false and the ladder **ends** - fails toward giving up, never toward false success |
+| `$script:GuestTools` | `$script:Hypervisor` beside it is **already** three-state (`unknown`); an empty tool list is informational |
+| `$n` | volatile artifact count; the GREEN branch requires `$n -ge 10`, so a failed count **cannot** produce GREEN |
+
+A blanket "must be 0" would have been permanently red - the cries-wolf failure this project already
+has a rule about. So the guard asserts **no site beyond a judged baseline**, allowlisted by variable
+name (line numbers drift) with the reason recorded inline.
+
+It also checks the allowlist for **staleness**: if a listed site disappears, the entry is flagged
+for removal, so a future site reusing that name cannot inherit an excuse it was never judged for.
+
+### Mutation-tested both ways
+
+| mutation | required | actual |
+|---|---|---|
+| inject a new safe-default site into the collector | FAIL, exit 1 | exit 1, and it **names** `$newFlagXyz` |
+| cripple the detector so calibration finds nothing | exit 2, never clean | exit 2, *"the detector re-finds the known BitLocker defect (got 0, need 1)"* |
+
+Both platforms are now guarded by an instrument that must prove it can still find a real defect
+before its zero - or its baseline - is believed.
