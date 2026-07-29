@@ -1945,3 +1945,56 @@ detector over the mutant before running it, so it reported a pass while the muta
 in an isolated directory with the mutant's presence asserted first (`grep -c 'if False:'`), it fails
 correctly. That is the same shape *again*, this time in the mutation setup rather than the runner -
 sixth distinct place it has appeared.
+
+## Error-class reachability, by runtime evidence this time (2026-07-29)
+
+The static attempt failed calibration and was abandoned. This is the same question answered with
+observation - and the first finding is that **the planned instrumentation was unnecessary**.
+
+### The evidence channel is already in the product
+
+`Write-Ledger` records `error_class` on every failed / timeout / exception row; `Invoke-Seal` reads
+those back out of `run_state.jsonl` and aggregates them into `diagnostics.by_error_class`; and the
+one direct assignment (`$ec = 'tool_missing'` on toolkit tampering) writes into the same map. Both
+collectors emit it. So "which classes fired" is answerable from any bundle, with no new code.
+
+Worth noting for its own sake: an instinct to instrument was wrong, and reading the code first
+saved building a parallel mechanism next to one that already ships.
+
+### Observed: an unreachable destination fires NO class
+
+Positive control first - a healthy local run on WS02:
+
+```
+CLSOK  verdict=COMPLETE ok=33 failed=0    by_error_class: {}    ledger classes: (none)
+```
+
+A clean host produces no classes, so anything below is signal rather than background.
+
+Then the condition, `-Dest \10.255.255.1\evidence` (unroutable):
+
+```
+ship.preflight_ok = False
+ship.preflight_reason = "no response within 20s (host unreachable or SMB hung)"
+by_error_class: EMPTY          ledger classes: (none)
+verdict=COMPLETE ok=33 failed=0
+```
+
+**The condition happened, the collector detected it, and no error class was produced.**
+`net_unreachable` and `dns_blocked` both name exactly this situation and neither fired.
+
+The mechanism is the one that stranded `wmi_failure`: `Test-NetworkDestination` is a *bounded job
+probe* that returns a structured result instead of throwing, so no error text ever reaches
+`Get-ErrorClass`. The condition is recorded faithfully - just in `ship.preflight_ok` and
+`preflight_reason`, outside the class system. The **fix ladder for `net_unreachable`
+(`backoff-retry`, `skip`) is therefore stranded for this trigger**, exactly as `wmi_failure`'s was.
+
+This is not a false-evidence bug - `COMPLETE` is correct here because the evidence was staged
+locally, which is B5's contract. It is a remediation-reachability gap of the same family.
+
+### Harness note
+
+The run reported "NO BUNDLE" for the network case because the harness looked in `C:\evidence` while
+the collector had correctly redirected to `C:\ir\_staging`. My error, not the product's - and the
+fifth time a harness path assumption produced a phantom finding. The bundle was read from the real
+location and the staging directory left clean (0 dirs, evidence back to the baseline 3).
