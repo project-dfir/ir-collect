@@ -97,5 +97,40 @@ $ladder = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language
 Check ($null -ne $ladder) 'the wmi_failure ladder is still declared'
 Check ($ladder.Extent.Text -match 'restart-wmi') 'the ladder still starts with restart-wmi'
 
+# --- THREE-STATE census: a bare $null cannot say WHICH situation produced it -------------------
+# Caught by the 2026-07-29 live negative control. With Winmgmt STOPPED and Win32_Process returning
+# 0 rows, a -RapidOnly run gave verdict=COMPLETE ok=33 empty_outputs=0, identical to a healthy run,
+# because the CIM steps fall back to native sources. The verdict correctly returned $null - one
+# step DID answer - but "cleared by fallback" and "genuinely healthy" and "too few steps ran to
+# say" were all the same null. That is the two-state defect this project keeps fixing elsewhere.
+$fn2 = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $n.Name -eq 'Get-SubsystemProbeState' }, $true) | Select-Object -First 1
+if (-not $fn2) { Write-Host 'FAIL  Get-SubsystemProbeState not found in the shipped collector'; exit 2 }
+. ([scriptblock]::Create($fn2.Extent.Text))
+
+$st = Get-SubsystemProbeState -Ran @('processes','tcp-conns') -Empty @('processes','tcp-conns')
+Check ($st.state -eq 'not-answering')       'all steps empty -> state not-answering'
+Check ($st.steps_empty -eq 2)               'the census counts the empty steps'
+
+$st = Get-SubsystemProbeState -Ran @('processes','tcp-conns') -Empty @('processes')
+Check ($st.state -eq 'answered')            'one step returning data -> state answered (NOT a bare null)'
+Check ($st.steps_empty -eq 1)               'answered still reports how many were empty'
+
+$st = Get-SubsystemProbeState -Ran @('processes') -Empty @('processes')
+Check ($st.state -eq 'insufficient-evidence') 'too few steps -> insufficient-evidence, distinct from answered'
+$st = Get-SubsystemProbeState -Ran @() -Empty @()
+Check ($st.state -eq 'insufficient-evidence') 'nothing ran -> insufficient-evidence, never "answered"'
+Check ($st.note -match 'says nothing either way')  'the insufficient case says plainly that it proves nothing'
+
+# the three states must be mutually exclusive and total over these inputs
+$states = @(
+  (Get-SubsystemProbeState -Ran @('a','b') -Empty @('a','b')).state,
+  (Get-SubsystemProbeState -Ran @('a','b') -Empty @('a')).state,
+  (Get-SubsystemProbeState -Ran @('a')     -Empty @('a')).state
+)
+Check (($states | Select-Object -Unique).Count -eq 3) 'the three situations produce three DIFFERENT states'
+
+Check ($src -match 'subsystem_probe=') 'run_state.json carries the three-state census, not just the verdict'
+
 Write-Host ''
 if ($fail -eq 0) { Write-Host 'all assertions passed'; exit 0 } else { Write-Host "$fail failed"; exit 1 }

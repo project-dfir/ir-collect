@@ -559,6 +559,33 @@ function Get-SubsystemFailureVerdict {
         evidence  = ("all {0} {1}-backed step(s) produced no output: {2}" -f $ran.Count, $Subsystem, (($ran | Sort-Object) -join ', '))
     }
 }
+
+# THREE-STATE census of the same probe. Get-SubsystemFailureVerdict returns $null for THREE
+# different situations - the subsystem answered, it was cleared because one step returned data, or
+# too few subsystem-backed steps ran to say anything - and a bare null in run_state.json cannot be
+# told apart. That is the exact two-state defect this project keeps fixing in other people's code
+# (E3's domain probe, the clock sync flag), introduced here by me and caught by the 2026-07-29
+# negative control, where null meant "cleared by native fallbacks" and read as "healthy".
+#
+# Live evidence for why it matters: with Winmgmt STOPPED and Win32_Process returning 0 rows, a
+# -RapidOnly run produced verdict=COMPLETE ok=33 empty_outputs=0 - identical to a healthy run -
+# because the CIM steps fall back to native sources. Nothing in the bundle said WMI was dead.
+function Get-SubsystemProbeState {
+    param([string[]]$Ran, [string[]]$Empty, [int]$MinSteps = 2)
+    $ran = @($Ran | Where-Object { $_ })
+    if ($ran.Count -lt $MinSteps) {
+        return [ordered]@{ state='insufficient-evidence'; steps_ran=$ran.Count; steps_empty=0
+                           note="fewer than $MinSteps subsystem-backed steps ran, so this bundle says nothing either way about the subsystem" }
+    }
+    $empties = @($Empty | Where-Object { $_ })
+    $e = @($ran | Where-Object { $empties -contains $_ }).Count
+    if ($e -eq $ran.Count) {
+        return [ordered]@{ state='not-answering'; steps_ran=$ran.Count; steps_empty=$e
+                           note='every subsystem-backed step returned nothing' }
+    }
+    [ordered]@{ state='answered'; steps_ran=$ran.Count; steps_empty=$e
+                note='at least one subsystem-backed step returned data' }
+}
 # path -> SHA-256 of every carried tool, taken before collection and re-verified at seal.
 # Initialised here (not only inside the "tools dir exists" branch) so the seal-time check has a
 # defined value on a host with no toolkit at all.
@@ -2069,6 +2096,9 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
             # where at least one CIM step returned data - emptiness alone never sets it.
             $sf = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
             if ($sf) { [ordered]@{ subsystem=$sf.subsystem; error_class=$sf.class; steps=$sf.steps; ladder=@($script:FixLadders[$sf.class]); inferred_from='every subsystem-backed step empty (no error was raised)' } } else { $null }
+        ); subsystem_probe=$(
+            # Never a bare null: says WHICH of the three situations produced it.
+            Get-SubsystemProbeState -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
         ) }
     }
     $rsPath = Join-Path $Dirs.logs 'run_state.json'

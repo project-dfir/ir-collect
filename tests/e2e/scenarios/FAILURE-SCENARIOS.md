@@ -1124,3 +1124,78 @@ harden step, and it is the E1 repro that already exists (`sc config Winmgmt star
 **Incidental data point for C4.** This run was detached as SYSTEM via `schtasks` and took **270 s**
 against a ~25 s interactive baseline - the same 270 s recorded as C4's unexplained slowdown. So the
 slowdown tracks the *detached-SYSTEM launch*, not the C4 scenario, which narrows that open item.
+
+## E1 negative control - INVALID as designed, but it found two real defects (2026-07-29)
+
+**Attempt.** Break WMI on WS02 and prove the new subsystem-failure verdict fires. Detached via
+`schtasks`, status file, teardown in a `finally` plus a watchdog task, since leaving `Winmgmt`
+disabled would break every later scenario on this VM.
+
+The condition was induced and asserted live, before and *after* the run - the environment healing a
+condition mid-test has silently voided a control here before:
+
+```
+BASELINE     Winmgmt=Running  Win32_Process rows=131
+AFTER BREAK  Winmgmt=Stopped  Win32_Process rows=0     <- condition live
+AT MEASUREMENT TIME  Winmgmt=Stopped rows=0            <- still live, result valid
+TEARDOWN     Winmgmt=Running  rows=130 HEALTHY, evidence dirs=3 (baseline)
+```
+
+**Result: the path did not fire.** `subsystem_failure=NULL`, no "Likely cause" section, and:
+
+```
+verdict=COMPLETE  ok=33  failed=0  empty_outputs=0
+```
+
+Byte-identical counts to the healthy positive control run.
+
+**Why the control is INVALID, not the feature broken.** `-RapidOnly` runs `Invoke-RapidVolatile`,
+whose CIM steps carry native fallbacks:
+
+```powershell
+Collect 'os-cim' { $r = try { Get-CimInstance Win32_OperatingSystem -EA Stop ... } catch { $null }
+                   if ($r -and $r.Trim()) { ... } else { <native fallback> } }
+```
+
+So with WMI dead those steps still wrote data, no step was empty, and the corroboration rule
+correctly cleared the subsystem - a step that answers *is* evidence the subsystem answered. To
+exercise the firing path the run must use steps with no fallback, which live in the full volatile
+job (`-Auto`), not the rapid stage. Recorded INVALID; the firing path remains covered by unit tests
+and mutation only.
+
+Two notes on getting here: the earlier claim that `-RapidOnly` "does not run CIM steps" came from a
+grep for `function Invoke-Volatile`, which does not exist - the awk range matched nothing and
+returned a meaningless `0`. **An empty result from a broken check is not a finding.** The step
+wrapper is `Collect 'name' { } 'file.txt'`, not `Invoke-Step 'name'`; two separate patterns in this
+session were written against the wrong call shape.
+
+### Defect A - a dead WMI is invisible in the bundle (REAL, NOT FIXED)
+
+The run above is the finding. With WMI **completely stopped**, the bundle's counts are identical to
+a healthy host's, and nothing anywhere records that CIM was unavailable. The `catch { $null }`
+swallows the failure, the fallback quietly substitutes, and the artifact does not say which source
+it came from.
+
+That matters beyond tidiness. **Adversaries disable WMI**, and a responder reading these artifacts
+cannot tell a host whose WMI was working from one whose WMI was dead - the fallback data looks the
+same. The tool *knows* (the `catch` executed); it discards the fact before anything durable. Same
+family as E1/A3/E3, the clock sync flag, and the stranded fix ladders.
+
+The fix is to record fallback use per step - which source actually produced each artifact - so the
+bundle states its own provenance. Left for the next harden pass rather than bolted on here.
+
+### Defect B - my own verdict was two-state (FIXED)
+
+`Get-SubsystemFailureVerdict` returns `$null` for **three** different situations: the subsystem
+answered; it was cleared because one step returned data; too few subsystem-backed steps ran to say
+anything. In `run_state.json` all three were the same bare null. Reading that run, `null` looked
+like "healthy" when it actually meant "cleared by native fallbacks on a host with dead WMI".
+
+Precisely the two-state defect this project keeps fixing in the collector (E3's domain probe, the
+clock sync flag) - introduced here by me, and caught only because the negative control produced a
+null whose meaning I had to work out by hand.
+
+Added `Get-SubsystemProbeState`, and `run_state.json` now carries `diagnostics.subsystem_probe`
+with `state` = `not-answering` | `answered` | `insufficient-evidence`, plus the step counts and a
+note saying plainly when the bundle proves nothing either way. 12 further assertions, including one
+that the three situations produce three *different* states.
