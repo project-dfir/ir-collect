@@ -1463,3 +1463,64 @@ complete, which is what the finally-plus-watchdog rule is for.
 five mutations including one that re-introduces the original bug. That status is unchanged by this
 attempt, and is not weakened by it either: nothing here suggests the fix is wrong, only that the
 condition has still never been produced on real hardware.
+
+## Encryption risk - LIVE VERIFIED, both controls (2026-07-29)
+
+The third attempt produced the condition. `Get-EncryptionRiskVerdict` is now verified on real
+hardware in both directions, closing the most consequential defect in the catalogue - the one whose
+failure mode is an unreadable disk rather than a misleading bundle.
+
+Every capability was proven by reading something back before it was relied on:
+
+```
+BATCH LOGON PROVEN: ran as iruser at 2026-07-29T07:27:46
+FS CAPABILITY:      w|collector-readable
+UNELEVATED BITLOCKER PROBE: THREW:CommandNotFoundException   <- condition live
+```
+
+**NEGATIVE control** - unelevated run, BitLocker cmdlets unavailable:
+
+```
+ENCNEG verdict=INCOMPLETE ok=33
+       incomplete=access-denied(clock-skew)|unelevated(privileged artifacts unobtainable...)
+ENCNEG encryption_risk.state=unknown-no-ram  amber=True
+```
+
+The AMBER warning fires where the old code printed GREEN. A3's own behaviour is intact alongside it.
+
+**POSITIVE control** - elevated run on the same host, same collector:
+
+```
+ENCPOS verdict=COMPLETE ok=33  encryption_risk.state=ok  amber=False
+```
+
+No false alarm, so the banner keeps its meaning. Teardown verified: `iruser` removed, zero `Enc*`
+tasks, `C:\evidence` at its baseline 3 directories, `Winmgmt` Running.
+
+### Why attempts 1 and 2 failed, and what actually fixed it
+
+`schtasks /RU <local account>` **requires `/RP <password>`**. Without it the task registers happily
+and can never start - `schtasks` returns 0 for *created*, not for *ran*. Both earlier attempts read
+the resulting empty output as a statement about BitLocker. Also `C:\Windows\Temp` is not writable by
+standard users, so probe output had nowhere to land; it now goes to `C:\Users\Public`.
+
+The harness improvement is what made this diagnosable. Attempt 2 correctly reported:
+
+> INVALID: the trivial LIMITED task produced NO OUTPUT - the account still cannot run batch work.
+> **This says nothing about BitLocker.**
+
+That is the fix for the defect attempt 1 had: empty no longer falls through to an `else` that
+asserts a cause. The harness said what it did not know, which is what pointed at the account rather
+than at the collector.
+
+### Tooling note worth keeping
+
+Three separate edits in this iteration were silently destroyed by backslash handling - `C:\Users`
+is an invalid Python escape (`\U`), so a heredoc died at parse time and the **unmodified** script
+was uploaded and re-run twice, each time producing an identical INVALID that looked like a real
+result. And a PowerShell `-like` check on a string containing `[Guid]` reported the anchor missing,
+because `[` is a wildcard metacharacter.
+
+Both are the same mistake in different syntax: **a check that cannot match is indistinguishable
+from a condition that is absent.** Windows paths go through PowerShell `.Replace()`/`.Contains()`
+or `chr(92)` - never a bare Python string literal - and any replace must assert it applied.
