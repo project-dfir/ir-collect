@@ -1398,3 +1398,68 @@ The triage taxonomy that found this had a sloppy regex - `SYSTEM\b` matched `Win
 inflating a "registry-hive" bucket to 13 entries that were mostly false positives. The finding was
 real; the category was not. Worth remembering that a classifier's *grouping* can be wrong even when
 its *detection* is right.
+
+## Encryption-risk live control - ATTEMPT INVALID (2026-07-29)
+
+Goal: produce the condition `Get-EncryptionRiskVerdict` was built for - a host where the BitLocker
+probe throws - so the three-state fix is verified live rather than only by unit test and mutation.
+`Get-BitLockerVolume` needs an unelevated context to fail, and WS02 has both the cmdlets and SYSTEM
+rights, so the plan was the A3 route: a standard user under `schtasks /RL LIMITED`.
+
+**Outcome: INVALID. The control never ran the collector.** The status file ends four lines in:
+
+```
+created local user iruser (removed again in teardown)
+iruser exists=True enabled=True inAdministrators=0
+CONDITION PROBE:
+CONDITION NOT LIVE: the probe answers even unprivileged - NEGATIVE CONTROL INVALID on this host
+```
+
+`iruser` had been removed after A3, so the harness recreated it. But the probe wrote **nothing**,
+and the run stopped there.
+
+### The harness reproduced the very defect it was testing
+
+```powershell
+$condLive = ($po -match 'THREW') -or ($po -match 'returned 0 volume')
+if (-not $condLive) { S 'CONDITION NOT LIVE: the probe answers even unprivileged ...' }
+```
+
+`$po` was **empty** - the probe never executed - and empty matches neither pattern, so it fell to
+the else and the harness printed a CAUSE it had never established: *"the probe answers even
+unprivileged"*. Nothing observed supported that. It is the same two-state collapse this catalogue
+keeps finding in the collector (E3's domain probe, the clock sync flag, the BitLocker flag itself),
+written this time into the test harness - the second time this session my own checking code carried
+the defect it was hunting.
+
+A probe result has three states, not two: **threw** / **answered** / **did not run**. Only the
+first makes the control valid; the third makes it INVALID and must say so.
+
+### Why the probe produced nothing
+
+A freshly created local account has no profile and, more importantly, is not granted **Log on as a
+batch job**, so `schtasks /RU iruser /RL LIMITED` cannot actually start work as that user. A3's
+account had been prepared; the recreated one had not. The task registered and reported success -
+`schtasks` returning 0 says the task was *created*, not that it *ran* - which is another
+infer-the-capability-from-a-call-that-did-not-throw.
+
+### Requirements for the next attempt
+
+1. Grant `SeBatchLogonRight` to the account (`secedit` export/import, or `ntrights`), and **assert
+   it took** by running a trivial task as that user and reading back its output before proceeding.
+2. Treat an empty probe result as `did-not-run` -> record INVALID, never as evidence either way.
+3. Grant the account read on `C:\ir` and write on the output dir *before* the probe, and confirm by
+   writing and reading back a file as that user - prove the capability, do not infer it.
+4. Keep the elevated positive control in the same run: an elevated collection must still report
+   `state=ok`, or the AMBER banner becomes noise and gets ignored.
+
+### Range state
+
+Left exactly as found, verified: `iruser` removed, zero `Enc*` scheduled tasks, `C:\evidence` back
+to its baseline 3 directories, `Winmgmt` Running. The teardown ran even though the body did not
+complete, which is what the finally-plus-watchdog rule is for.
+
+`Get-EncryptionRiskVerdict` therefore remains **unit- and mutation-verified only** - 65 assertions,
+five mutations including one that re-introduces the original bug. That status is unchanged by this
+attempt, and is not weakened by it either: nothing here suggests the fix is wrong, only that the
+condition has still never been produced on real hardware.
