@@ -1056,3 +1056,71 @@ bracket, so the pattern matched garbage and reported three nonexistent "missing"
 missing the real one. Re-run with a self-test asserting the pattern finds a known-present and a
 known-absent path before its output was trusted. **A checking script needs a positive control as
 much as a scenario does.**
+
+## E1 follow-up - the fix ladder no condition could ever select (2026-07-29)
+
+The audit re-marked E1 ⚠️ because its own text described an open gap. This closes the gap it named.
+
+**The defect.** Error classes are assigned by `Get-ErrorClass`, which matches error TEXT, and it is
+only ever called from the two paths where a step *threw* (`IR-Collect.ps1` error-record and
+exception arms). When WMI is broken the CIM steps do not throw - they return NOTHING. So
+`wmi_failure` was unreachable, and the ladder declared for it (`restart-wmi` / `native-source` /
+`skip`) could never be handed to a responder. The run was still safe - emptiness detection stopped
+it claiming COMPLETE - but the person at the console was told *what* was missing and never *what to
+try*. The same shape as E1/A3/E3 and the clock work, one layer further out: not a false verdict,
+but a correct verdict with its remediation stranded.
+
+The asymmetry was visible in one screenful: a DEGRADED output already sets
+`error_class='not_elevated'` on its ledger row, while an EMPTY output sets no class at all.
+
+**Why this needed a second fact, not a longer critical list.** Emptiness alone is not evidence -
+plenty of queries legitimately return nothing. A rule firing on any empty CIM step would accuse
+healthy hosts, which is exactly the mistake the E3 positive control caught. So the rule is
+**corroboration**: at least two subsystem-backed steps must have run, and none may have produced
+data. One step returning rows proves the subsystem answers, and clears it.
+
+**Membership is derived, not listed.** Which steps are CIM-backed is read at runtime from each
+step's own scriptblock text (`Get-CimInstance|Get-WmiObject`), not from a hand-maintained array.
+This file already warns that such lists silently no-op once a name stops matching - the note above
+`$script:CriticalSteps` records exactly that hazard. A scriptblock cannot drift from itself.
+
+`Get-SubsystemFailureVerdict` is pure and unit-tested; the report gains a "Likely cause" section
+with the ladder and concrete commands, and `run_state.json` gains `diagnostics.subsystem_failure`.
+
+### Verification
+
+**Unit** - 21 assertions, function extracted from the shipped collector by AST so it cannot be
+tested against a drifted copy. Covers the firing case, degenerate inputs, and the healthy-host
+cases.
+
+**Mutation** - four, two of them against the WIRING rather than the logic, because every in-function
+assertion can pass while the feature is dead in production:
+
+| mutation | failures |
+|---|---|
+| corroboration removed (one empty step suffices) | 1 |
+| a step that answered no longer clears the subsystem | 3 |
+| **wiring:** `Invoke-Step` stops populating the tracked list | 1 |
+| **wiring:** the report stops consuming the verdict | 1 |
+
+**Live positive control, WS02** - condition asserted live at measurement time (`Winmgmt=Running`,
+`Win32_Process` returning 130 rows) before judging:
+
+```
+verdict=COMPLETE ok=33 failed=0   empty_outputs=0
+subsystem_failure=null            report claims a dead subsystem: False
+```
+
+A healthy host is not accused, and nothing regressed. Teardown left `C:\evidence` at its baseline 3
+directories.
+
+### Not done this iteration
+
+The **live negative control** - stopping Winmgmt on WS02 so every CIM step really does come back
+empty - has not been run. The firing path is covered by unit tests and mutation, but not yet by the
+condition itself, so this is recorded as verified-in-part rather than closed. That is the next
+harden step, and it is the E1 repro that already exists (`sc config Winmgmt start= disabled`).
+
+**Incidental data point for C4.** This run was detached as SYSTEM via `schtasks` and took **270 s**
+against a ~25 s interactive baseline - the same 270 s recorded as C4's unexplained slowdown. So the
+slowdown tracks the *detached-SYSTEM launch*, not the C4 scenario, which narrows that open item.

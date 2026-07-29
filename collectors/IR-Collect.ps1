@@ -518,6 +518,47 @@ function Get-Backoff { param([string]$Cls,[int]$Attempt)
 }
 $script:RemTried = @{}
 $script:EmptySteps = @()
+# Names of steps that queried CIM/WMI and had somewhere to write. Populated in Invoke-Step from the
+# step's own script text. Exists to give emptiness a SECOND FACT: one empty CIM step proves
+# nothing, but every CIM step on the host coming back empty is a broken subsystem.
+$script:CimStepsRan = @()
+
+# Get-SubsystemFailureVerdict <ran> <empty> -> $null, or the class + ladder to hand the operator.
+#
+# THE GAP THIS CLOSES. Error classes are assigned by matching error TEXT (Get-ErrorClass), and are
+# only ever fed from a step that threw. When WMI is broken the steps do not throw - they return
+# NOTHING - so `wmi_failure` could never be produced, and the fix ladder declared for it
+# (restart-wmi / native-source / skip) could never be offered to a responder. The run correctly
+# refused to claim COMPLETE, but the person holding the console was never told what to try. Same
+# shape as E1/A3/E3 and the clock work: the tool sees the condition and stops short of the verdict.
+#
+# EMPTINESS ALONE IS NOT EVIDENCE, so this needs a second fact rather than a longer critical list.
+# A single empty CIM step is ordinary - plenty of queries legitimately return nothing. What is not
+# ordinary is EVERY CIM-backed step on the host returning nothing at once. So the rule is
+# corroboration: at least two such steps must have run, and none of them may have produced data.
+# That is also what keeps a healthy host quiet - one empty query can never trip it.
+function Get-SubsystemFailureVerdict {
+    param(
+        [string[]]$Ran,
+        [string[]]$Empty,
+        [string]$Subsystem = 'CIM/WMI',
+        [string]$Class     = 'wmi_failure'
+    )
+    $ran = @($Ran | Where-Object { $_ })
+    # Fewer than two steps is not corroboration, it is a single observation.
+    if ($ran.Count -lt 2) { return $null }
+    $empties = @($Empty | Where-Object { $_ })
+    $worked  = @($ran | Where-Object { $empties -notcontains $_ })
+    # ANY step that produced data proves the subsystem answers, so emptiness elsewhere is a
+    # property of those queries, not of the subsystem.
+    if ($worked.Count -gt 0) { return $null }
+    [pscustomobject]@{
+        subsystem = $Subsystem
+        class     = $Class
+        steps     = @($ran | Sort-Object)
+        evidence  = ("all {0} {1}-backed step(s) produced no output: {2}" -f $ran.Count, $Subsystem, (($ran | Sort-Object) -join ', '))
+    }
+}
 # path -> SHA-256 of every carried tool, taken before collection and re-verified at seal.
 # Initialised here (not only inside the "tools dir exists" branch) so the seal-time check has a
 # defined value on a host with no toolkit at all.
@@ -937,6 +978,13 @@ function Invoke-Step {
                 # reported verdict=COMPLETE, ok=33, failed=0 - identical to a healthy run. An
                 # analyst would read "no suspicious processes" from evidence that captured no
                 # processes at all. Record emptiness so the verdict can tell the truth.
+                # Which subsystem did this step depend on? Derived from the step's OWN SOURCE TEXT
+                # rather than a hand-maintained name list, because this file already carries a
+                # warning that such a list silently no-ops when a name stops matching (see
+                # $script:CriticalSteps). A scriptblock cannot drift from itself.
+                if ($OutFile -and $Script.ToString() -match 'Get-CimInstance|Get-WmiObject') {
+                    $script:CimStepsRan += $Name
+                }
                 if ($OutFile -and $bytes -le 2) {
                     $script:EmptySteps += [pscustomobject]@{ id=$id; name=$Name; phase=$phase; file=$OutFile }
                     Write-Ledger $id $Name $phase 'ok' @{ attempt=$attempt; bytes=$bytes; lines=$lines; empty=$true }
@@ -2016,7 +2064,12 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         # invalidates the custody digest. So state what IS known at seal time, and point at the
         # file written beside the bundle once the transfer has actually been attempted.
         ship=[ordered]@{ target=$NetworkDest; attempted=[bool]$NetworkDest; preflight_ok=$(if($script:NetProbe){[bool]$script:NetProbe.ok}else{$null}); preflight_reason=$(if($script:NetProbe){$script:NetProbe.reason}else{$null}); result_file=$(if($NetworkDest){'<bundle>.ship.json (written after the seal)'}else{$null}) }
-        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; empty_outputs=@($script:EmptySteps | ForEach-Object { $_.name }); degraded_outputs=@($script:DegradedSteps | ForEach-Object { [ordered]@{ name=$_.name; bytes=$_.bytes; reason=$_.reason } }); by_error_class=$script:DiagClass; remediations=$script:DiagRem }
+        diagnostics=[ordered]@{ exec_mode=$(if($script:JobsOk){'background-job'}else{'in-process(self-heal)'}); language_mode=$script:LangMode; hash_backend=$script:HashBackend; empty_outputs=@($script:EmptySteps | ForEach-Object { $_.name }); degraded_outputs=@($script:DegradedSteps | ForEach-Object { [ordered]@{ name=$_.name; bytes=$_.bytes; reason=$_.reason } }); by_error_class=$script:DiagClass; remediations=$script:DiagRem; subsystem_failure=$(
+            # Machine-readable twin of the report section. Null on a healthy host, and on any host
+            # where at least one CIM step returned data - emptiness alone never sets it.
+            $sf = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
+            if ($sf) { [ordered]@{ subsystem=$sf.subsystem; error_class=$sf.class; steps=$sf.steps; ladder=@($script:FixLadders[$sf.class]); inferred_from='every subsystem-backed step empty (no error was raised)' } } else { $null }
+        ) }
     }
     $rsPath = Join-Path $Dirs.logs 'run_state.json'
     $rsJson = $rs | ConvertTo-Json -Depth 5
@@ -2153,6 +2206,30 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
             foreach ($e in $script:EmptySteps) {
                 $crit = if ($script:CriticalSteps -contains $e.name) { '**CORE**' } else { '' }
                 [void]$rep.AppendLine("| $($e.id) | $($e.name) | $($e.phase) | $($e.file) | $crit |")
+            }
+        }
+        # A whole subsystem being down is a different finding from a list of empty steps, and it is
+        # the one with an actionable fix. Without this the responder gets the symptom table above
+        # and no name for the cause - the ladder for it existed but nothing could ever select it.
+        $subFail = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
+        if ($subFail) {
+            [void]$rep.AppendLine("")
+            [void]$rep.AppendLine("### Likely cause: the $($subFail.subsystem) subsystem is not answering")
+            [void]$rep.AppendLine("")
+            [void]$rep.AppendLine("$($subFail.evidence).")
+            [void]$rep.AppendLine("")
+            [void]$rep.AppendLine("Classified as ``$($subFail.class)``. This is inferred from every one of those steps")
+            [void]$rep.AppendLine("coming back empty at once, not from an error message - a broken $($subFail.subsystem)")
+            [void]$rep.AppendLine("returns nothing rather than failing, which is why the run did not mark them failed.")
+            [void]$rep.AppendLine("")
+            $ladder = @($script:FixLadders[$subFail.class])
+            if ($ladder.Count) {
+                [void]$rep.AppendLine("Try, in order: " + (($ladder | ForEach-Object { "``$_``" }) -join ' -> ') + ".")
+                [void]$rep.AppendLine("")
+                [void]$rep.AppendLine("On Windows that means: ``Restart-Service Winmgmt -Force`` (or ``net stop winmgmt``")
+                [void]$rep.AppendLine("then start it), re-run this collector, and if CIM still returns nothing use the")
+                [void]$rep.AppendLine("native equivalents (``tasklist``, ``netstat -ano``, ``sc query``) which do not go")
+                [void]$rep.AppendLine("through WMI. Re-collect before treating any of the empty artifacts as findings.")
             }
         }
         [void]$rep.AppendLine("")
