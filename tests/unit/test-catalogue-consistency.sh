@@ -18,6 +18,9 @@ REPO="$(cd "$HERE/../.." && pwd)"
 DOC="${1:-$REPO/tests/e2e/scenarios/FAILURE-SCENARIOS.md}"
 [ -f "$DOC" ] || { echo "FAIL  catalogue not found: $DOC"; exit 2; }
 
+PY_BIN=""
+for c in python python3; do command -v "$c" >/dev/null 2>&1 && { PY_BIN="$c"; break; }; done
+
 FAIL=0
 check() { if [ "$1" = 1 ]; then printf 'ok    %s\n' "$2"; else printf 'FAIL  %s\n' "$2"; FAIL=$((FAIL+1)); fi; }
 
@@ -86,6 +89,25 @@ check "$([ "$FENCES" -ge "$CLAIMS" ] && echo 1 || echo 0)" \
 # prevent - so assert the word survives wherever a control was recorded invalid.
 INV=$(grep -cE 'INVALID' "$DOC" || true)
 check "$([ "$INV" -ge 3 ] && echo 1 || echo 0)" "invalid-control records are still present and marked ($INV mentions)"
+
+# --- 6. cited LINE NUMBERS: attempted and WITHDRAWN, deliberately ---------------------------
+# The page cites code positions as evidence ("IR-Collect.ps1:767 defines the wmi_failure ladder"),
+# and those drift whenever code is inserted above them. A real instance was found by hand on
+# 2026-07-29: the page cited :618 for that ladder, which had moved to :767 - the citation still
+# read as authoritative while pointing at an unrelated comment. That citation is now corrected.
+#
+# An automated version of the check is NOT shipped. Two attempts produced FALSE POSITIVES on
+# citations that were correct: the first compared only the first backticked token after a citation
+# (often a symbol from the surrounding sentence, not the code at that line), and the second failed
+# because the extractor captured `'wmi_failure'` WITH its quotes, so a literal search never matched.
+#
+# A check that cries wolf gets switched off, and then it protects nothing. Shipping an assertion
+# known to fire on correct input is worse than shipping none - the same reasoning that made
+# "publish nothing when the instrument fails calibration" the rule elsewhere in this project.
+#
+# What a working version needs: the doc quoting code in a machine-checkable form (a fenced block
+# tagged with its file and line), rather than a heuristic guessing which nearby backtick refers to
+# the cited line. Until the page carries that, citation drift is caught by hand.
 
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi

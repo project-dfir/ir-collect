@@ -1037,7 +1037,7 @@ steps return empty rather than throwing, nothing ever classifies as `wmi_failure
 
 The scenario's stated requirement *is* met - emptiness detection stops the run claiming COMPLETE -
 so the ✅ was not baseless. But the consequence is real and worth its own harden pass:
-`collectors/IR-Collect.ps1:618` defines a fix ladder for `wmi_failure` (`restart-wmi`,
+`collectors/IR-Collect.ps1:767` defines a fix ladder for `wmi_failure` (`restart-wmi`,
 `native-source`, `skip`) that **can never be offered to an operator**, because the only path that
 would select it is unreachable in the one scenario it exists for. The tool detects the condition and
 still fails to hand the responder the remediation - the same shape as E1/A3/E3 and the clock work.
@@ -2038,3 +2038,39 @@ about, working correctly and now witnessed.
 
 Range left as found: winpmem restored and hash-verified against the `86691BB4AF2C17DD…` baseline,
 zero leftover tasks, evidence at 3 directories, staging empty.
+
+## Audit: a stale code citation, and a check withdrawn for crying wolf (2026-07-29)
+
+The consistency test compares the page against itself and the filesystem. It cannot tell that a
+**line-number citation has drifted** - and this page cites code positions as evidence.
+
+**Found by hand: `IR-Collect.ps1:618` was cited as the `wmi_failure` fix ladder. The ladder is at
+:767.** It moved 149 lines when functions were added above it. The citation still read as
+authoritative and pointed at an unrelated comment - the same failure mode as the four status drifts,
+in a different field. Corrected, and the corrected line verified to be
+`'wmi_failure' = @('restart-wmi','native-source','skip')`.
+
+Three other citations were checked and are accurate: `IR-Collect.ps1:2127` (the direct
+`tool_missing` assignment), `IR-Collect.ps1:510` (the classifier arm), `ir-collect.sh:173-175` (the
+PATH pinning).
+
+### The automated check was built, and then withdrawn
+
+Two attempts both produced **false positives on citations that were correct**:
+
+1. matching only the *first* backticked token after a citation - which is often a symbol from the
+   surrounding sentence rather than the code at that line, flagging `:2127` wrongly;
+2. matching *any* nearby token - which failed on `:510` because the extractor captured
+   `` `'wmi_failure'` `` **with its quotes**, so a literal search never matched.
+
+The second was verified by hand: the same grep/awk pipeline finds line 510 at distance 0 when run
+directly. The defect was in the extractor, not the catalogue.
+
+**It is not shipped.** A check that cries wolf gets switched off, and then it protects nothing -
+the same reasoning that made *publish nothing when the instrument fails its calibration* a rule
+here. An assertion known to fire on correct input is worse than no assertion.
+
+What a working version needs is the page quoting code in a **machine-checkable form** - a fenced
+block tagged with its file and line - rather than a heuristic guessing which nearby backtick refers
+to the citation. Until the page carries that, citation drift is caught by hand, and the reasoning
+sits in the test file where the next person will look for it.
