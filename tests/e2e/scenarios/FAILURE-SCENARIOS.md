@@ -59,11 +59,11 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 
 | # | Scenario | Reproduce | Correct behaviour | Status |
 |---|---|---|---|---|
-| E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ✅ tested on WS02 — found the worst defect of the session (see below); `wmi_failure` still never fires because the steps do not error, they return nothing — emptiness detection is what catches it |
+| E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ⚠️ tested on WS02 — found the worst defect of the session (see below). The scenario's requirement IS met: emptiness detection stops the run claiming COMPLETE. But `wmi_failure` is unreachable - the steps return nothing rather than erroring, and the classifier only matches error TEXT - so a genuinely broken WMI never reaches the operator with its `restart-wmi`/`native-source` fix ladder. Marked ⚠️ per this page's own legend: tested, gap remains |
 | E2 | **No `sha256sum`** (stock macOS/BSD/busybox) | `HASH_BACKEND` forced per backend | shasum/sha256/openssl/digest/python3 fallback | ✅ unit-tested across 4 backends |
 | E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ✅ CLOSED 2026-07-29 - defect found AND fixed; both controls pass (see below) |
 | E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to; Linux second pass 2026-07-29 found 3 more defects (empty Reference ID, a fabricated "no reachable peer" cause, and NTPSynchronized=no reported as a working source) - all fixed, both controls live |
-| E5 | **PowerShell 2.0** | `powershell -Version 2` | Refuse; v2 lacks the language features | CLOSED 2026-07-29 - `#requires -Version 3` added and live-verified; original repro INVALID on this host (see below) |
+| E5 | **PowerShell 2.0** | `powershell -Version 2` | Refuse; v2 lacks the language features | ✅ CLOSED 2026-07-29 - `#requires -Version 3` added and live-verified; original repro INVALID on this host (see below) |
 
 ---
 
@@ -96,7 +96,7 @@ fastest path, copy only the script to a scratch directory so no `tools/` payload
 afterwards:
 
 ```powershell
-mkdir $env:TEMP\irtest; copy kit\IR-Collect.ps1 $env:TEMP\irtest\   # no tools\ alongside it
+mkdir $env:TEMP\irtest; copy collectors\IR-Collect.ps1 $env:TEMP\irtest\   # no tools\ alongside it
 & $env:TEMP\irtest\IR-Collect.ps1 -RapidOnly -Scenario A -CaseId LOCAL -Dest $env:TEMP\irtest\out
 Remove-Item $env:TEMP\irtest -Recurse -Force
 ```
@@ -632,7 +632,7 @@ named `IR-DC01.lab.local`. Clock restored and confirmed at `+0.01s` vs the DC.
 is how the inverted label was found. A failing assertion on working code is worth reading before
 "fixing" the assertion.
 
-## E3 - domain unreachable (PARTIAL 2026-07-29)
+## E3 - domain unreachable (CLOSED 2026-07-29)
 
 **Setup.** Outbound firewall rules on WS02 blocking TCP 389/636/445/88/3268 and UDP 88/123/389 to
 `10.20.50.233`. Baseline asserted reachable first, the block asserted effective
@@ -1008,3 +1008,51 @@ The chrony **large-offset** path is still not proven live. `range-linux-web` has
 only host on the range that runs it is the Proxmox hypervisor - skewing a production hypervisor's
 clock to exercise a string parse remains a bad trade. It stays covered by real chronyc output
 shapes plus a drift guard asserting the shipped parse still matches the mirrored copy.
+
+## Audit pass over this page (2026-07-29)
+
+First end-to-end review of the catalogue as a whole. It had grown to ~1010 lines across many
+sessions, and status was being written in three places - the section tables, the per-scenario
+headings, and the prose - with nothing keeping them agreeing. Four defects, all of them the
+documentation form of the bug this project keeps finding in the collector: **a status claiming
+more, or less, than the evidence underneath it.**
+
+**1. E3's heading contradicted its own body.** `## E3 - domain unreachable (PARTIAL 2026-07-29)`,
+while the table row said CLOSED and the section itself ended with `### E3 - CLOSED 2026-07-29, both
+controls passing`. A reader skimming headings would have concluded the scenario was unfinished.
+The heading was written mid-investigation and never updated when the fix landed.
+
+**2. A live instruction pointed at a directory that no longer exists.** The testing-hygiene recipe
+said `copy kit\IR-Collect.ps1 ...` - `kit/` was renamed to `collectors/` and the block two lines
+above it already said `collectors/tools`. Anyone following it copies nothing and then runs a
+collector that is not there. Note the irony recorded at line 663: this page documents finding and
+fixing *exactly this class of bug* in the collector's own resume hint, while carrying it here.
+
+**3. E5 was the only closed row with no status glyph**, against the legend at the top of the page.
+
+**4. E1 was marked ✅ while its own text described an open gap.** The row read "`wmi_failure` still
+never fires because the steps do not error, they return nothing". Verified still true: the
+classifier only matches error TEXT (`collectors/IR-Collect.ps1:510`), so when WMI is broken and the
+steps return empty rather than throwing, nothing ever classifies as `wmi_failure`.
+
+The scenario's stated requirement *is* met - emptiness detection stops the run claiming COMPLETE -
+so the ✅ was not baseless. But the consequence is real and worth its own harden pass:
+`collectors/IR-Collect.ps1:618` defines a fix ladder for `wmi_failure` (`restart-wmi`,
+`native-source`, `skip`) that **can never be offered to an operator**, because the only path that
+would select it is unreachable in the one scenario it exists for. The tool detects the condition and
+still fails to hand the responder the remediation - the same shape as E1/A3/E3 and the clock work.
+Re-marked ⚠️ per this page's own legend, with the gap stated rather than trailing off.
+
+### Mechanical checks now run over this page
+
+Worth keeping because all four defects above were found by cross-checking, not by reading prose:
+
+- every `tests/`, `collectors/`, `docs/` path the page mentions must exist in the repo
+- no section heading may carry a status its table row contradicts
+- every closed row carries a glyph from the legend
+
+The path check was itself wrong on the first attempt - the character class `[/\]` escapes the
+bracket, so the pattern matched garbage and reported three nonexistent "missing" files while
+missing the real one. Re-run with a self-test asserting the pattern finds a known-present and a
+known-absent path before its output was trusted. **A checking script needs a positive control as
+much as a scenario does.**
