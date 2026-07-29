@@ -1524,3 +1524,71 @@ because `[` is a wildcard metacharacter.
 Both are the same mistake in different syntax: **a check that cannot match is indistinguishable
 from a condition that is absent.** Windows paths go through PowerShell `.Replace()`/`.Contains()`
 or `chr(92)` - never a bare Python string literal - and any replace must assert it applied.
+
+## Linux parity - the LUKS gate had the same two-state collapse (FIXED 2026-07-29)
+
+Predicted from the Windows fix and confirmed. The volatile gate decided the encryption risk in one
+line:
+
+```bash
+local enc=0; grep -q '^ENCRYPTED=yes' "$D_META/encryption.txt" 2>/dev/null && enc=1
+```
+
+**Three situations collapsed into "not encrypted"**, and only one of them is safe:
+
+1. the disk really is unencrypted
+2. `meta-crypto` never ran, timed out (30 s bound), or its artifact is missing/unreadable
+3. the probe ran on a host with **no `lsblk`** - the step printed a flat `ENCRYPTED=no` from a tool
+   that never executed
+
+Case 3 is the exact BitLocker defect in shell: a probe that cannot run reports the safe answer.
+
+**What was actually lost.** Unlike Windows, an undetermined host did not go silent - it fell to the
+generic `else`, which prints an amber about artifact counts and RAM. So the operator saw *an*
+amber, but never the one that matters:
+
+> Do NOT power off without the key or the disk image is unreadable.
+
+The generic banner says nothing about power-off. The specific, loss-preventing instruction was
+exactly what a failed probe removed - and this is the one failure in this tool no later analysis
+can undo.
+
+**Fix**, mirroring `Get-EncryptionRiskVerdict` so the collectors use the same state names:
+
+- `meta-crypto` now emits `ENCRYPTED=unknown` plus a `REASON=` when `lsblk` is absent, and again
+  when `lsblk` is present but fails - two distinct branches, because a mutation reverting either
+  one alone left the whole suite green (see below)
+- `encryption_risk_verdict <yes|no|unknown> <mem_ok>` is a pure function returning
+  `encrypted-no-ram` / `unknown-no-ram` / `ok`; captured RAM clears the host in every case, since
+  the master key is then in the bundle
+- the gate reads `ENCRYPTED=no` **explicitly** rather than treating "not yes" as no, so a missing
+  file lands in `unknown`
+- a third banner for `unknown-no-ram` that does **not** claim encryption it never observed - it
+  says the probe could not determine the state and refuses to assume the disk is clear
+- `encryption_risk` now appears in **both** `run_state` emitters (main and the ENOSPC fallback
+  rollup), not just on the console
+
+### Verification
+
+22 assertions, driving the SHIPPED function extracted by `sed` with a bounded-range guard.
+Five mutations, all caught:
+
+| mutation | failures |
+|---|---|
+| **re-introduce the original bug (unknown -> safe)** | **5** |
+| captured RAM no longer clears the host | 2 |
+| wiring: the gate stops calling the verdict | 1 |
+| wiring: the unknown banner becomes unreachable | 1 |
+| a host without `lsblk` claims "not encrypted" again | 1 |
+
+That last one **passed 0 failures on the first attempt** - a bare `grep ENCRYPTED=unknown` still
+matched the *other* undetermined branch, so reverting either one alone was invisible. The test now
+asserts each branch by its `REASON=` string. A mutation that survives is the only reliable way to
+find an assertion that is weaker than it looks.
+
+`Test-FixLadders` (which audits both collectors and enforces parity) passes, so this did not open a
+parity hole in the other direction. Full shell unit suite green.
+
+**Not live-verified**, and recorded as such: producing `unknown` needs a host with no working
+`lsblk`, which none of the range VMs is. The encrypted path itself (a real LUKS volume) remains
+D5's untested gap on both platforms.

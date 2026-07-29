@@ -808,7 +808,7 @@ rapid_volatile() {
   run_sh   meta-clock       clock_provenance.txt "$D_META" 30 1 'echo "Host local: $(date +%FT%T%z 2>/dev/null || date)"; echo "Host UTC:   $(date -u +%FT%T.%3NZ 2>/dev/null || date -u)"; src=""; ahead=""; if command -v chronyc >/dev/null 2>&1; then t="$(chronyc tracking 2>/dev/null)"; if [ -n "$t" ]; then src="chronyc ($(printf "%s" "$t" | awk -F": *" "/Reference ID/{print \$2; exit}"))"; ahead="$(printf "%s" "$t" | awk "/System time/{v=\$4; if (\$0 ~ /slow/) v=\"-\" v; print v; exit}")"; fi; fi; if [ -z "$src" ] && command -v ntpq >/dev/null 2>&1; then o="$(ntpq -pn 2>/dev/null | awk "/^\*/{print \$9; exit}")"; if [ -n "$o" ]; then src="ntpq"; ahead="$(awk -v m="$o" "BEGIN{printf \"%.6f\", -m/1000}")"; fi; fi; sync=""; if command -v timedatectl >/dev/null 2>&1; then sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"; fi; if [ -z "$src" ] && [ -n "$sync" ]; then src="timedatectl (NTPSynchronized=$sync)"; fi; clock_verdict "$src" "$ahead" "$sync"'
   # CRITICAL while live: LUKS/dm-crypt status. A dead-box image of an encrypted disk is unreadable
   # without the key - capture encryption state (and note master keys live in RAM we are imaging).
-  run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; if lsblk -o FSTYPE,TYPE 2>/dev/null | grep -qiE "crypto_LUKS|(^|[[:space:]])crypt([[:space:]]|$)"; then echo "ENCRYPTED=yes"; else echo "ENCRYPTED=no"; fi; echo "NOTE: if encrypted, the master key is in the RAM image; extract before shutdown."'
+  run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; if lsblk -o FSTYPE,TYPE 2>/dev/null | grep -qiE "crypto_LUKS|(^|[[:space:]])crypt([[:space:]]|$)"; then echo "ENCRYPTED=yes"; elif ! command -v lsblk >/dev/null 2>&1; then echo "ENCRYPTED=unknown"; echo "REASON=lsblk absent - encryption state was never determined on this host"; elif ! lsblk -o FSTYPE,TYPE >/dev/null 2>&1; then echo "ENCRYPTED=unknown"; echo "REASON=lsblk present but failed - encryption state was never determined"; else echo "ENCRYPTED=no"; fi; echo "NOTE: if encrypted, the master key is in the RAM image; extract before shutdown."'
 
   # --- VOLUME ENCRYPTION KEYS, while the volumes are still unlocked --------------------------
   # The step above records that a disk is encrypted; that alone does not make a dead-box image
@@ -1352,6 +1352,7 @@ EOF
   "ended_utc":"$end","status":"$( [ "$verdict" = COMPLETE ] && echo complete || echo partial )","resumed":$( [ -n "${RESUME_DIR:-}" ] && echo true || echo false ),
   "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
   "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
+  "encryption_risk":"$(encryption_risk_verdict "$(if [ -r "$D_META/encryption.txt" ]; then grep -m1 -oE '^ENCRYPTED=(yes|no|unknown)' "$D_META/encryption.txt" 2>/dev/null | cut -d= -f2; fi)" "${MEM_OK:-0}")",
   "completeness":{"verdict":"$verdict","incomplete":"$incomplete"},
   "diagnostics":{"exec_mode":"$EXEC_MODE","hash_backend":"$HASH_BACKEND","by_error_class":{$diag_cls_json},"remediations":{$diag_rem_json}} }
 RSEOF
@@ -1379,6 +1380,7 @@ RSEOF
   "ended_utc":"$end","status":"partial","rollup_location":"fallback - evidence filesystem was not writable",
   "counts":{"planned":$nplan,"ok":$nok,"failed":$nfail,"timeout":$ntmo,"skipped":$nskip},
   "memory_verified":$( [ "${MEM_OK:-0}" = 1 ] && echo true || echo false ),
+  "encryption_risk":"$(encryption_risk_verdict "$(if [ -r "$D_META/encryption.txt" ]; then grep -m1 -oE '^ENCRYPTED=(yes|no|unknown)' "$D_META/encryption.txt" 2>/dev/null | cut -d= -f2; fi)" "${MEM_OK:-0}")",
   "completeness":{"verdict":"$verdict","incomplete":"$incomplete"},
   "diagnostics":{"exec_mode":"$EXEC_MODE","hash_backend":"$HASH_BACKEND","by_error_class":{$diag_cls_json},"remediations":{$diag_rem_json}} }
 RSFB
@@ -1514,9 +1516,48 @@ MREOF
 # slow non-volatile phase. This is the checkpoint the operator waits for.
 # ---------------------------------------------------------------------------
 SEALED=0
+
+# encryption_risk_verdict <enc_state:yes|no|unknown> <mem_ok:0|1> -> one of
+#   encrypted-no-ram | unknown-no-ram | ok
+#
+# PARITY with the Windows twin's Get-EncryptionRiskVerdict, which closed the same defect there.
+# The gate used to compute this inline as
+#
+#     local enc=0; grep -q '^ENCRYPTED=yes' "$D_META/encryption.txt" 2>/dev/null && enc=1
+#
+# so THREE different situations collapsed into "not encrypted": the disk really is unencrypted; the
+# meta-crypto step never ran, timed out (30s bound) or its file is missing; and the probe ran on a
+# host with no lsblk, where the old code printed a flat ENCRYPTED=no from a tool that never
+# executed. Only the first is safe. The step now emits ENCRYPTED=unknown for the last case.
+#
+# Why this matters more than a wrong label: the specific banner tells the responder NOT TO POWER
+# OFF because the LUKS master key is only in RAM. Lose that and the disk image is unreadable
+# forever - the one failure mode in this tool that no later analysis can undo. An unrun probe must
+# never resolve to the safe side here.
+encryption_risk_verdict() {
+  local enc="${1:-unknown}" mem="${2:-0}"
+  # Captured RAM holds the master key, so encryption stops being a power-off risk. This is the only
+  # branch that clears the host, and it turns on a fact that was measured.
+  if [ "$mem" = "1" ]; then echo "ok"; return 0; fi
+  case "$enc" in
+    yes)     echo "encrypted-no-ram" ;;
+    no)      echo "ok" ;;
+    *)       echo "unknown-no-ram" ;;   # unknown, empty, or any unrecognised value
+  esac
+}
+
 volatile_green_gate() {
   local vol_files; vol_files=$(find "$D_VOL" "$D_NET" -type f 2>/dev/null | wc -l | tr -d ' ')
-  local enc=0; grep -q '^ENCRYPTED=yes' "$D_META/encryption.txt" 2>/dev/null && enc=1
+  # THREE-STATE, read from the artifact the step actually wrote. A missing file is "unknown", not
+  # "no" - the distinction the old two-state grep destroyed.
+  local encstate='unknown'
+  if [ -r "$D_META/encryption.txt" ]; then
+    if grep -q '^ENCRYPTED=yes' "$D_META/encryption.txt" 2>/dev/null; then encstate='yes'
+    elif grep -q '^ENCRYPTED=no' "$D_META/encryption.txt" 2>/dev/null; then encstate='no'
+    fi
+  fi
+  local encverdict; encverdict=$(encryption_risk_verdict "$encstate" "${MEM_OK:-0}")
+  local enc=0; [ "$encverdict" = 'encrypted-no-ram' ] && enc=1
   local memnote; [ "${MEM_OK:-0}" = "1" ] && memnote="RAM: VERIFIED ($((MEM_BYTES/1024/1024)) MB)" || memnote="RAM: NOT verified - capture failed/absent"
   echo
   if [ "$enc" = "1" ] && [ "${MEM_OK:-0}" != "1" ]; then
@@ -1527,6 +1568,19 @@ volatile_green_gate() {
     echo "  !!  is unreadable. See 00_metadata/encryption.txt.       !!"
     echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     audit "VOLATILE AMBER | encrypted disk + no verified RAM | files=$vol_files"
+  elif [ "$encverdict" = "unknown-no-ram" ]; then
+    # Deliberately does NOT claim the disk is encrypted - nothing observed that. It refuses to
+    # assume the opposite, because that assumption is the unrecoverable one. Without this branch a
+    # host whose encryption probe failed fell through to the generic amber below, which talks about
+    # artifact counts and never mentions power-off.
+    echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "  !!  VOLATILE: AMBER - ENCRYPTION UNKNOWN + NO VERIFIED RAM !!"
+    echo "  !!  The encryption probe could NOT determine this disk's   !!"
+    echo "  !!  state. If it IS encrypted the master key is in RAM you !!"
+    echo "  !!  did not capture. Do NOT assume it is unencrypted.      !!"
+    echo "  !!  Check 00_metadata/encryption.txt before powering off.  !!"
+    echo "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    audit "VOLATILE AMBER | encryption UNDETERMINED + no verified RAM | files=$vol_files"
   elif [ "$vol_files" -ge 10 ] && [ "${MEM_OK:-0}" = "1" ]; then
     echo "  ############################################################"
     echo "  #   VOLATILE CAPTURE: GREEN  ($vol_files artifacts, OK=$STEPS_OK FAIL=$STEPS_FAIL)"
