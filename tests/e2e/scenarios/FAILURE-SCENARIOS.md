@@ -52,7 +52,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | D2 | **Junction loops** | legacy `Application Data` reparse points | No duplicate artifacts, no infinite recursion | ✅ |
 | D3 | **Multi-GB Security.evtx on a DC** | the range DC | Priority channels secured before the bulk copy | ✅ |
 | D4 | **Hidden/system evidence files** | copied `NTUSER.DAT` | Present in the manifest with real hashes | ✅ |
-| D5 | **Encrypted volume** | BitLocker on, or LUKS | Keys captured while unlocked; AMBER if no verified RAM | ✅ CLOSED 2026-07-29 - exercised live on a LUKS loopback, both controls: encrypted -> `encrypted-no-ram` + the do-not-power-off banner + a real LUKS header backup; closed -> `ok` + generic amber only |
+| D5 | **Encrypted volume** | BitLocker on, or LUKS | Keys captured while unlocked; AMBER if no verified RAM | ✅ CLOSED 2026-07-29 - exercised live on a LUKS loopback, both controls: encrypted -> `encrypted-no-ram` + the do-not-power-off banner + a real LUKS header backup; closed -> `ok` + generic amber only. **Scope: this verified CAPTURE, not USABILITY** - whether the captured material can actually open an image is a separate question, answered in "Running the recovery procedure" below, where it turned out to be no on modern LUKS2 |
 | D6 | **Filenames with spaces / `%4` / Unicode** | winevt channel names | Quoted correctly | ✅ |
 
 ## E. Platform / environment
@@ -1712,6 +1712,55 @@ reporting an absence**.
 
 The Linux `unknown` state also remains un-exercised live (it needs a host with no working `lsblk`);
 a PATH-shadowed stub is the cheap way in.
+
+## Running the recovery procedure - the master-key capture captures a pointer (2026-07-29)
+
+D5 proved the collector **captures** key material. Nobody had ever checked whether that material can
+be **used**, and those are different questions. `00_metadata/DECRYPTION-KEYS.md` is the whole point
+of taking the keys: an analyst reads it months later, on a different box, with the subject host long
+gone. So it was executed end to end against a LUKS2 loopback on `range-linux-web` (cryptsetup 2.7.0).
+
+It failed at the first step - and not because of the command:
+
+```
+0 163840 crypt aes-xts-plain64 :64:logon:cryptsetup:b8875a97-cfd1-4c30-a78e-5b0d916e8355-d0 0 7:0 32768 1 sector_size:4096
+```
+
+Since cryptsetup 2.x, a LUKS2 volume opened normally keeps its key in the **kernel keyring**, so
+`dmsetup table --showkeys` yields a *reference*, not the key. Measured both ways: a normal open gives
+that pointer; only `--disable-keyring` gives the 128-hex-character key. Which one you get depends on
+how the custodian's system opened the volume, so the collector cannot choose it and retrying changes
+nothing.
+
+The collector was writing that pointer into `volume_master_keys.txt` beneath a banner reading *"these
+are VOLUME MASTER KEYS - they decrypt the evidence"*. A file that exists, is non-empty, and does not
+contain what it claims - the signature failure of this project, sitting in its most expensive place.
+
+**Two more defects fell out of the same run**, both invisible to reading:
+
+| defect | why reading missed it |
+|---|---|
+| the header-damaged fallback dropped the trailing `1 sector_size:4096` | `dmsetup create` **returns 0**; the mapping is built at 512-byte sectors and only the *mount* fails, as `bad superblock` - which reads like a corrupt image, not a wrong table |
+| `luksHeaderRestore` example named `luks_header_dev_sda3.img` | the generator turns every `/` into `_`, so the real name is `luks_header__dev_sda3.img`; the doubled underscore looks like a typo and had been "corrected" by eye |
+
+**Verified working** once given a genuine hex key, so the primary route is sound: `printf | xxd -r -p`
+→ 64-byte key; `cryptsetup open --type luks --volume-key-file --readonly` opens with no passphrase;
+`mount -o ro,noload` reaches the plaintext canary. The header-damaged route works too, but only when
+the captured table is reused verbatim with the device field substituted.
+
+**Not established:** whether `keyctl` could extract a keyring-held key. `keyctl` is not installed on
+the test host, so that is untested rather than ruled out - it is the obvious next question if this
+is ever revisited.
+
+Fixed in `collectors/ir-collect.sh`: `volume_key_shape()` classifies the field as
+`hex` / `keyring-reference` / `absent`, and the artifact now states which, naming the consequence
+where it is a reference. Pinned by `tests/unit/test-volume-key-shape.sh`, which extracts the function
+from the collector rather than copying it, and asserts that nothing ambiguous is ever classified as
+`hex` - being wrong in that direction tells a responder a key was captured when none was.
+
+The lesson generalises past encryption: **run the document, do not read it.** Three defects in one
+pass, every one of which had survived repeated readings, because reading tests whether text is
+plausible and running tests whether it is true.
 
 ## Linux `unknown` encryption control - INVALID, defeated by the collector's own PATH hardening (2026-07-29)
 
