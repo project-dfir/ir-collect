@@ -836,3 +836,34 @@ that happen to lack .NET 2.0, so `#requires -Version 3` makes the refusal univer
 Zero stdout lines is the part that matters: it refuses *before* collecting anything, which is the
 scenario's actual bar. Two mutations - dropping the directive, and weakening it to `-Version 2` -
 each fail the suite.
+
+
+## Linux parity for E4 - clock offset measurement (2026-07-29)
+
+`ir-collect.sh` had the identical gap the Windows collector had: `clock_provenance.txt` recorded
+the host's own local and UTC time plus *"NOTE: compare to trusted time source; record offset for
+timeline defensibility."* It measured nothing.
+
+`clock_verdict` is now a pure function (unit-tested without a time daemon) fed by chronyc, ntpq or
+timedatectl, whichever is present. **Three-state**, per the E3 lesson: *measured* / *UNAVAILABLE*
+(a daemon exists but reported no offset) / *UNKNOWN* (no time tooling at all). An unmeasured clock
+never reads as a correct one.
+
+**Every source is normalised to host-minus-reference before it reaches the formatter**, so the
+sign convention lives in one place per tool: chronyc reports fast/slow in words, ntpq reports
+reference-minus-host in milliseconds and is negated. E4 shipped an inverted label for exactly this
+reason, so the artifact also spells the direction out in words.
+
+**Live on rick-pve.** Positive control: `Measured offset : 0.000242663s`,
+*"this host agrees with the reference"*, **no** false warning. **The negative control is INVALID** -
+`date -s "+200 seconds"` was corrected by `chronyd` before the collector measured, so the clock was
+never actually skewed at measurement time and nothing about detection was proven. Recorded rather
+than claimed; a real skew test needs chronyd stopped first.
+
+**A defect the invalid run still exposed:** chrony reported `-0.000000000`, and the string-shaped
+`case` matched `-*` first, printing *"BEHIND the reference by 0.000000000s"* - a direction asserted
+on a measurement showing agreement. Agreement is now decided numerically with a sub-millisecond
+band, and a mutation that checks the sign first fails the suite.
+
+**E5 parity needs nothing:** `ir-collect.sh` already requires bash 4+ and, better than refusing,
+re-execs a carried static bash from `tools/bin` when the host's is too old.

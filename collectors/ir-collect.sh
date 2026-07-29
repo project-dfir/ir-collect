@@ -801,7 +801,11 @@ rapid_volatile() {
   run_sh   meta-date        time.txt         "$D_META" 30 1 'echo "UTC: $(date -u)"; echo "Local: $(date)"; echo "Uptime: $(uptime)"; timedatectl 2>/dev/null'
   run_step meta-env         environment.txt  "$D_META" 30 1 printenv
   run_sh   meta-mounts      mounts.txt       "$D_META" 30 1 'mount; echo "---FSTAB---"; cat /etc/fstab; echo "---DF---"; df -h; echo "---LSBLK---"; lsblk -f 2>/dev/null'
-  run_sh   meta-clock       clock_provenance.txt "$D_META" 20 1 'echo "Host local: $(date +%FT%T%z 2>/dev/null || date)"; echo "Host UTC:   $(date -u +%FT%T.%3NZ 2>/dev/null || date -u)"; echo "NOTE: compare to trusted time source; record offset for timeline defensibility."'
+  # Each source is normalised to HOST MINUS REFERENCE (positive = host ahead) before it reaches
+  # clock_verdict, so the sign convention lives in exactly one place per tool rather than being
+  # re-derived by the reader. chronyc says "fast/slow" in words; ntpq reports reference-minus-host
+  # in milliseconds, so it is negated.
+  run_sh   meta-clock       clock_provenance.txt "$D_META" 30 1 'echo "Host local: $(date +%FT%T%z 2>/dev/null || date)"; echo "Host UTC:   $(date -u +%FT%T.%3NZ 2>/dev/null || date -u)"; src=""; ahead=""; if command -v chronyc >/dev/null 2>&1; then t="$(chronyc tracking 2>/dev/null)"; if [ -n "$t" ]; then src="chronyc ($(printf "%s" "$t" | awk -F"= *" "/Reference ID/{print \$2; exit}"))"; ahead="$(printf "%s" "$t" | awk "/System time/{v=\$4; if (\$0 ~ /slow/) v=\"-\" v; print v; exit}")"; fi; fi; if [ -z "$src" ] && command -v ntpq >/dev/null 2>&1; then o="$(ntpq -pn 2>/dev/null | awk "/^\*/{print \$9; exit}")"; if [ -n "$o" ]; then src="ntpq"; ahead="$(awk -v m="$o" "BEGIN{printf \"%.6f\", -m/1000}")"; fi; fi; if [ -z "$src" ] && command -v timedatectl >/dev/null 2>&1; then st="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"; if [ -n "$st" ]; then src="timedatectl (NTPSynchronized=$st)"; fi; fi; clock_verdict "$src" "$ahead"'
   # CRITICAL while live: LUKS/dm-crypt status. A dead-box image of an encrypted disk is unreadable
   # without the key - capture encryption state (and note master keys live in RAM we are imaging).
   run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; if lsblk -o FSTYPE,TYPE 2>/dev/null | grep -qiE "crypto_LUKS|(^|[[:space:]])crypt([[:space:]]|$)"; then echo "ENCRYPTED=yes"; else echo "ENCRYPTED=no"; fi; echo "NOTE: if encrypted, the master key is in the RAM image; extract before shutdown."'
@@ -991,6 +995,50 @@ enough_space() {  # enough_space <need_kib> <what>
 # a file, BEFORE the stability signal - stability is only meaningful once a file exists. Getting
 # that order wrong is what made the Windows side report "file still growing" and blame Secure Boot
 # on hosts where no imager had ever been staged.
+# clock_verdict <source> <host_ahead_seconds|empty> -> the clock_provenance lines.
+# Pure (no I/O) so it is unit-testable without a time daemon - see tests/unit/test-clock-verdict.sh.
+#
+# Parity with the Windows twin (scenario E4), which had the identical gap: the artifact recorded
+# the host's own local and UTC time plus a note telling the analyst to "compare to a trusted time
+# source", which records nothing about whether the clock is WRONG and leaves the one measurement
+# that makes a timeline defensible as homework.
+#
+# THREE-STATE, per the E3 lesson: measured / unavailable (a daemon exists but reported no offset)
+# / unknown (no time tooling at all). An unmeasured clock must never read as a correct one.
+#
+# SIGN CONVENTION IS STATED, NOT ASSUMED. E4 shipped an inverted label because w32tm reports
+# reference-minus-host; here the caller normalises to HOST-MINUS-REFERENCE, so positive means this
+# host is ahead, and the direction is also spelled out in words.
+clock_verdict() {
+  local src="$1" ahead="$2"
+  if [ -z "$src" ]; then
+    echo "Time source     : NONE FOUND (no chrony, ntpd or timedatectl)"
+    echo "Measured offset : UNKNOWN - no time daemon on this host, so this bundle carries no independent evidence that the clock is correct. Compare these timestamps against a trusted source before building a timeline."
+    return 0
+  fi
+  echo "Time source     : $src"
+  if [ -z "$ahead" ]; then
+    echo "Measured offset : UNAVAILABLE - $src is present but reported no offset (no reachable peer). This bundle carries no independent evidence that the clock is correct."
+    return 0
+  fi
+  echo "Measured offset : ${ahead}s  (host minus reference; positive = this host is AHEAD)"
+  # numeric, not string-shaped: "-0.000000000" is a negative ZERO and previously fell into the
+  # BEHIND branch, printing "BEHIND the reference by 0.000000000s" - a direction asserted on a
+  # measurement that shows agreement. Sub-millisecond differences are agreement, not drift.
+  if awk -v a="$ahead" 'BEGIN{ if (a<0) a=-a; exit !(a<0.001) }' 2>/dev/null; then
+    echo "Interpretation  : this host agrees with the reference"
+  elif case "$ahead" in -*) true;; *) false;; esac; then
+    echo "Interpretation  : this host is BEHIND the reference by ${ahead#-}s"
+  else
+    echo "Interpretation  : this host is AHEAD of the reference by ${ahead}s"
+  fi
+  # awk, not bash arithmetic: the offset is fractional and bash cannot compare floats
+  if awk -v a="$ahead" 'BEGIN{ if (a<0) a=-a; exit !(a>60) }' 2>/dev/null; then
+    echo "WARNING: this host is more than 60s from its time source. Timestamps in this bundle are NOT directly comparable with other hosts until the offset above is applied."
+  fi
+}
+export -f clock_verdict 2>/dev/null || true   # exported HERE, not with the hashing helpers: run_sh runs steps through `bash -c`, which inherits only exported functions, and `export -f` on a not-yet-defined function silently does nothing.
+
 resolve_mem_verdict() {
   local bytes="$1" need="$2" have="$3" stable="$4" imager="$5"
   local blocked="Secure Boot / kernel lockdown / module signing may have blocked it."
