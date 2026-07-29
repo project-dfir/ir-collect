@@ -1247,3 +1247,70 @@ Two things this changed:
 
 The wider number is the one to keep: **91 of 149 catch clauses discard what they caught.** Defect A
 is one instance of a habit, and the habit is what produces "the tool saw it and said nothing".
+
+## Defect A CLOSED - a WMI outage now reaches the verdict layer (2026-07-29)
+
+**Static finding that shaped the fix.** 13 CIM-backed `Collect` steps: **8 carry a native fallback,
+5 do not**. That settled two questions without spending a live run:
+
+- the `-Auto` negative control would ALSO have come back invalid for `Get-SubsystemFailureVerdict`,
+  because the 8 fallback steps always write data
+- and it exposed a flaw in that verdict: it treats any step that produced data as proof the
+  subsystem answered, but a fallback step produces data **from a native source**. Output existing
+  is not evidence that CIM produced it, so the verdict could never fire on a CIM outage at all.
+
+**One mechanism fixes both.** `Get-CimEvidenceVerdict` asks a different question - did CIM actually
+produce this bundle's evidence? Three-state (`cim-sourced` / `cim-unavailable` / `unknown`, plus
+`degraded` when CIM answers at seal yet steps still fell back), fed by a seal-time CIM probe and a
+scan of the artifacts for the fallback banner the steps already write.
+
+The scan happens **at seal, not in the steps**: a step scriptblock may run in a background-job
+runspace where `$script:` writes never return to the collector's scope. The artifact is the only
+carrier that crosses that boundary - which is also why banner-based detection was the right call
+rather than a tracker variable.
+
+### Live verification, WS02, condition asserted before AND after
+
+```
+BASELINE     Winmgmt=Running  Win32_Process rows=130
+AFTER BREAK  Winmgmt=Stopped  rows=0        <- condition live
+AT MEASUREMENT TIME  Stopped  rows=0        <- still live, result valid
+TEARDOWN     Winmgmt=Running  rows=132 HEALTHY, evidence dirs=3
+```
+
+```
+cim_evidence.state=cim-unavailable
+cim_evidence.fallback_steps=7 -> drivers.txt, local_users.txt, process_owners.txt,
+                                 processes.txt, tasklist_services.txt, tcp_connections.txt, ...
+cim_evidence.note=CIM did not answer at seal; 7 step(s) fell back to native sources ...
+                  Native data is equivalent in content but NOT proof the host's WMI was healthy
+report names the CIM evidence source: True
+```
+
+The same run that previously read `COMPLETE ok=33 empty_outputs=0` with nothing to distinguish it
+from a healthy host now names the outage and lists the seven artifacts that are native-sourced.
+
+### The live run caught a wiring bug the unit test could not
+
+`SUMMARY names the evidence source: False`.
+
+The unit assertion `$src -match '## Evidence source...'` passed the whole time - **the string was
+present and the code was unreachable.** The block had been placed inside the diagnostics guard:
+
+```powershell
+if (($script:DiagClass.Count -gt 0) -or (-not $script:JobsOk) -or ($script:HashBackend -ne 'Get-FileHash')) {
+```
+
+which fires only when something *else* already went wrong. On a host whose WMI is simply dead none
+of those is true - the fallbacks absorb it - so **the finding was suppressed by exactly the
+condition it exists to report.** The same shape as the defect being fixed, one level up.
+
+Hoisted out of the guard, and the test now asserts the STRUCTURE (the block must appear before the
+guard, not inside it) rather than the presence of a string. **A string being present is not a wiring
+assertion** - that is the lesson, and only the live run could have produced it.
+
+### Status
+
+`run_state.json` and `DIAGNOSTIC-REPORT.md` are verified live. The SUMMARY.md hoist is verified
+structurally and by unit test but **has not been re-run live** - recorded as such rather than
+claimed. 51 unit assertions; 6 mutations (2 logic, 4 wiring) all caught, unmutated clean.

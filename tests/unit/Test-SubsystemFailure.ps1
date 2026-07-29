@@ -132,5 +132,59 @@ Check (($states | Select-Object -Unique).Count -eq 3) 'the three situations prod
 
 Check ($src -match 'subsystem_probe=') 'run_state.json carries the three-state census, not just the verdict'
 
+# --- CIM EVIDENCE CENSUS (Defect A) ------------------------------------------------------------
+# 8 of the 13 CIM-backed steps carry a native fallback, so on a WMI-dead host they still write data
+# and every layer above reads that as success. The artifacts DO carry a fallback banner (9 sites),
+# but the fact reached nothing: run_state/SUMMARY/report showed COMPLETE with no finding. Measured
+# live 2026-07-29 with Winmgmt stopped: COMPLETE ok=33 empty_outputs=0, identical to healthy.
+$fn3 = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                      $n.Name -eq 'Get-CimEvidenceVerdict' }, $true) | Select-Object -First 1
+if (-not $fn3) { Write-Host 'FAIL  Get-CimEvidenceVerdict not found in the shipped collector'; exit 2 }
+. ([scriptblock]::Create($fn3.Extent.Text))
+
+# POSITIVE CONTROL FIRST: a healthy host must stay silent, or every bundle grows a false finding.
+$v = Get-CimEvidenceVerdict -CimAvailable $true -FallbackSteps @() -EmptyCimSteps @()
+Check ($v.state -eq 'cim-sourced') 'CIM answered and nothing fell back -> cim-sourced (healthy stays quiet)'
+
+$v = Get-CimEvidenceVerdict -CimAvailable $false -FallbackSteps @('processes.txt','services.txt') -EmptyCimSteps @('vss-list')
+Check ($v.state -eq 'cim-unavailable')        'CIM down + fallbacks -> cim-unavailable'
+Check (@($v.fallback_steps).Count -eq 2)      'the census names the artifacts that fell back'
+Check ($v.note -match 'finding in its own right') 'the note tells the responder a dead WMI is itself a finding'
+Check ($v.note -notmatch 'equivalent in content but' -or $v.note -match 'NOT proof') `
+      'the note refuses to let native data stand as proof WMI was healthy'
+
+# THREE-STATE: an unrun probe must never read as a healthy one.
+$v = Get-CimEvidenceVerdict -CimAvailable $null -FallbackSteps @('processes.txt') -EmptyCimSteps @()
+Check ($v.state -eq 'unknown')            'a probe that did not run -> unknown, not healthy'
+Check ($v.state -ne 'cim-sourced')        'unknown is never reported as cim-sourced'
+Check ($v.note -match 'cannot say')       'the unknown note says plainly that it cannot say'
+
+# CIM answered yet steps still fell back - an intermittent outage, not a clean bill of health
+$v = Get-CimEvidenceVerdict -CimAvailable $true -FallbackSteps @('drivers.txt') -EmptyCimSteps @()
+Check ($v.state -eq 'degraded')           'CIM up at seal but a step fell back -> degraded, not cim-sourced'
+Check ($v.note -match 'intermittent')     'the degraded note offers the intermittent explanation'
+
+# hygiene: blanks discarded, duplicates collapsed
+$v = Get-CimEvidenceVerdict -CimAvailable $false -FallbackSteps @('a.txt','a.txt','',$null) -EmptyCimSteps @()
+Check (@($v.fallback_steps).Count -eq 1)  'duplicate and blank step names are collapsed, not counted twice'
+
+# --- WIRING: all three operator-facing layers, plus the seal-time inputs ---
+Check ($src -match 'Get-CimEvidenceVerdict\s+-CimAvailable') 'the collector CALLS the CIM evidence verdict'
+Check ($src -match 'cim_evidence=\$script:CimEvidence')      'run_state.json carries the CIM evidence census'
+Check ($src -match '## Evidence source: CIM/WMI was')        'the DIAGNOSTIC REPORT surfaces it'
+Check ($src -match '## Evidence source`n- CIM/WMI:')         'SUMMARY.md surfaces it'
+# A STRING BEING PRESENT IS NOT A WIRING ASSERTION. The assertion above passed while the SUMMARY
+# block sat inside the diagnostics guard - which only fires when something ELSE went wrong - so on
+# a WMI-dead host it never executed. The live run caught what the source scan could not. Assert the
+# structure: the CIM block must come BEFORE the guard, not inside it.
+$iBlock = $src.IndexOf('## Evidence source`n- CIM/WMI:')
+$iGuard = $src.IndexOf("if ((`$script:DiagClass.Count -gt 0) -or (-not `$script:JobsOk)")
+Check (($iBlock -gt 0) -and ($iGuard -gt 0) -and ($iBlock -lt $iGuard)) `
+      'the SUMMARY evidence block is NOT nested inside the "something else went wrong" guard'
+Check ($src -match 'Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; \$script:CimProbeOk = \$true') `
+      'the seal-time CIM probe actually runs (otherwise the state is always unknown)'
+Check ($src -match "unavailable\.\*\(native fallback\|fallback chain\)") `
+      'the seal scans artifacts for the fallback banner (the reliable carrier across job runspaces)'
+
 Write-Host ''
 if ($fail -eq 0) { Write-Host 'all assertions passed'; exit 0 } else { Write-Host "$fail failed"; exit 1 }

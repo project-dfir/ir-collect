@@ -560,6 +560,44 @@ function Get-SubsystemFailureVerdict {
     }
 }
 
+# Get-CimEvidenceVerdict - did CIM actually produce this bundle's evidence, or did fallbacks?
+#
+# THE DEFECT THIS CLOSES. Eight of the thirteen CIM-backed steps carry a native fallback, so on a
+# host with WMI stopped they still write data - and every layer above them reads that as success.
+# The artifacts DO say so (nine sites emit a "CIM/WMI unavailable ... native fallback" banner) but
+# that fact reaches nothing: run_state.json, SUMMARY.md and the diagnostic report all present a
+# WMI-dead host as COMPLETE with no finding. Measured live 2026-07-29 with Winmgmt stopped:
+# COMPLETE ok=33 failed=0 empty_outputs=0, indistinguishable from a healthy run. Adversaries
+# disable WMI, so "six core steps switched to native sources" is itself a finding.
+#
+# It also fixes Get-SubsystemFailureVerdict, which could never fire on a CIM outage: it treats any
+# step that produced data as proof the subsystem answered, and a fallback step ALWAYS produces
+# data - from a native source. Output existing is not evidence that CIM produced it.
+#
+# THREE-STATE on the probe, per the E3 lesson: an unrun probe must not read as a healthy one.
+function Get-CimEvidenceVerdict {
+    param(
+        [System.Nullable[bool]]$CimAvailable,   # $null = the probe did not run
+        [string[]]$FallbackSteps = @(),
+        [string[]]$EmptyCimSteps = @()
+    )
+    $fb = @($FallbackSteps | Where-Object { $_ } | Sort-Object -Unique)
+    $mt = @($EmptyCimSteps  | Where-Object { $_ } | Sort-Object -Unique)
+    if ($fb.Count -eq 0 -and $mt.Count -eq 0 -and $CimAvailable -eq $true) {
+        return [ordered]@{ state='cim-sourced'; fallback_steps=@(); empty_steps=@()
+                           note='CIM answered and no step needed a fallback' }
+    }
+    $state = 'degraded'
+    if ($null -eq $CimAvailable)      { $state = 'unknown' }
+    elseif ($CimAvailable -eq $false) { $state = 'cim-unavailable' }
+    $note = switch ($state) {
+        'cim-unavailable' { "CIM did not answer at seal; $($fb.Count) step(s) fell back to native sources and $($mt.Count) produced nothing. Native data is equivalent in content but NOT proof the host's WMI was healthy - treat a dead WMI as a finding in its own right." }
+        'unknown'         { "the CIM probe did not run, so this bundle cannot say whether WMI was healthy; $($fb.Count) step(s) fell back and $($mt.Count) produced nothing." }
+        default           { "CIM answered at seal, but $($fb.Count) step(s) still fell back to native sources and $($mt.Count) produced nothing - the outage may have been intermittent." }
+    }
+    [ordered]@{ state=$state; fallback_steps=$fb; empty_steps=$mt; note=$note }
+}
+
 # THREE-STATE census of the same probe. Get-SubsystemFailureVerdict returns $null for THREE
 # different situations - the subsystem answered, it was cleared because one step returned data, or
 # too few subsystem-backed steps ran to say anything - and a bare null in run_state.json cannot be
@@ -2079,6 +2117,27 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     # standard user, 2026-07-28: ok=33 fail=0 skip=0, verdict COMPLETE, with drivers.txt at 155 B.
     if (-not $isAdmin) { $incomplete += 'unelevated(privileged artifacts unobtainable without Administrator)' }
     $verdict = if ($incomplete.Count -gt 0) { 'INCOMPLETE' } else { 'COMPLETE' }
+    # --- CIM evidence census -------------------------------------------------------------------
+    # Done HERE, at seal, not inside the steps: a step scriptblock may run in a background-job
+    # runspace, where $script: writes never come back to this scope. The artifacts are the reliable
+    # carrier, and the banner is already written by the fallback branches themselves.
+    $script:CimProbeOk = $null
+    try { $null = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; $script:CimProbeOk = $true }
+    catch { $script:CimProbeOk = $false }
+    $script:FallbackSteps = @()
+    try {
+        foreach ($d in @($Dirs.volatile, $Dirs.system, $Dirs.network) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
+            foreach ($f in Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue) {
+                if ($f.Length -gt 2MB) { continue }   # banners are written at the top of small text artifacts
+                $head = ''
+                try { $head = (Get-Content -LiteralPath $f.FullName -TotalCount 40 -ErrorAction Stop) -join "`n" } catch { continue }
+                if ($head -match 'unavailable.*(native fallback|fallback chain)') { $script:FallbackSteps += $f.Name }
+            }
+        }
+    } catch {}
+    $cimEmpty = @($script:EmptySteps | Where-Object { $script:CimStepsRan -contains $_.name } | ForEach-Object { $_.name })
+    $script:CimEvidence = Get-CimEvidenceVerdict -CimAvailable $script:CimProbeOk -FallbackSteps $script:FallbackSteps -EmptyCimSteps $cimEmpty
+
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$script:CaseIdRaw; case_path_token=$script:CaseIdSafe; host=$hostName; output_dir=$OutDir
         ended_utc=$endUtc; status=$(if($verdict -eq 'COMPLETE'){'complete'}else{'partial'}); resumed=[bool]$Resume
@@ -2096,7 +2155,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
             # where at least one CIM step returned data - emptiness alone never sets it.
             $sf = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
             if ($sf) { [ordered]@{ subsystem=$sf.subsystem; error_class=$sf.class; steps=$sf.steps; ladder=@($script:FixLadders[$sf.class]); inferred_from='every subsystem-backed step empty (no error was raised)' } } else { $null }
-        ); subsystem_probe=$(
+        ); cim_evidence=$script:CimEvidence; subsystem_probe=$(
             # Never a bare null: says WHICH of the three situations produced it.
             Get-SubsystemProbeState -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
         ) }
@@ -2135,6 +2194,15 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
     } elseif ($script:DegradedSteps.Count) {
         $comp += "`n## Access-denied artifacts`n"
         foreach ($d in $script:DegradedSteps) { $comp += "- ``$($d.name)`` -> $($d.file) ($($d.bytes) B): $($d.reason)`n" }
+    }
+    # NOT inside the diagnostics guard below. That guard fires only when something ELSE already
+    # went wrong (an error was classified, jobs failed, or the hash backend fell back). On a host
+    # whose WMI is simply dead none of those is true - the fallbacks absorb it - so the finding was
+    # suppressed by exactly the condition it exists to report. Caught live 2026-07-29: the report
+    # named the outage and SUMMARY.md stayed silent.
+    if ($script:CimEvidence -and $script:CimEvidence.state -ne 'cim-sourced') {
+        $comp += "`n## Evidence source`n- CIM/WMI: **$($script:CimEvidence.state)** - $($script:CimEvidence.note)"
+        if (@($script:CimEvidence.fallback_steps).Count) { $comp += "`n- artifacts collected via native fallback: $(@($script:CimEvidence.fallback_steps) -join ', ')" }
     }
     if (($script:DiagClass.Count -gt 0) -or (-not $script:JobsOk) -or ($script:HashBackend -ne 'Get-FileHash')) {
         $comp += "`n## Diagnostics (self-diagnosis)`n- exec mode: $(if($script:JobsOk){'background-job'}else{'in-process fallback (job subsystem unavailable)'})`n"
@@ -2241,6 +2309,25 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         # A whole subsystem being down is a different finding from a list of empty steps, and it is
         # the one with an actionable fix. Without this the responder gets the symptom table above
         # and no name for the cause - the ladder for it existed but nothing could ever select it.
+        # A WMI outage that the fallbacks papered over is invisible in the counts above - the run
+        # looks COMPLETE because every step wrote something. Say so plainly, because a host whose
+        # WMI was dead during collection is a finding, not a formatting note.
+        if ($script:CimEvidence -and $script:CimEvidence.state -ne 'cim-sourced') {
+            [void]$rep.AppendLine("")
+            [void]$rep.AppendLine("## Evidence source: CIM/WMI was $($script:CimEvidence.state)")
+            [void]$rep.AppendLine("")
+            [void]$rep.AppendLine($script:CimEvidence.note)
+            $fbs = @($script:CimEvidence.fallback_steps)
+            if ($fbs.Count) {
+                [void]$rep.AppendLine("")
+                [void]$rep.AppendLine("Collected via a native fallback rather than CIM ($($fbs.Count)):")
+                [void]$rep.AppendLine("")
+                foreach ($f in $fbs) { [void]$rep.AppendLine("- ``$f``") }
+                [void]$rep.AppendLine("")
+                [void]$rep.AppendLine("The content is equivalent; the provenance is not. Do not read these as evidence that")
+                [void]$rep.AppendLine("the host's WMI was healthy, and consider a disabled Winmgmt an indicator in its own right.")
+            }
+        }
         $subFail = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
         if ($subFail) {
             [void]$rep.AppendLine("")
