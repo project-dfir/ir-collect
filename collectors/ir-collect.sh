@@ -855,19 +855,66 @@ rapid_volatile() {
   # SENSITIVITY: these outputs ARE the keys to the evidence. Handle the bundle accordingly - see
   # the generated 00_metadata/DECRYPTION-KEYS.md. Pass --no-keys to skip if the engagement's
   # authority does not extend to extracting key material.
+  # volume_key_shape <key-field-from-dmsetup-table> -> hex | keyring-reference | absent
+  #
+  # `dmsetup table --showkeys` does NOT always show a key. Since cryptsetup 2.x the volume key for
+  # a LUKS2 device normally lives in the KERNEL KEYRING, and the table then carries a REFERENCE of
+  # the form ":64:logon:cryptsetup:<uuid>-d0" in place of the hex. MEASURED on range-linux-web with
+  # cryptsetup 2.7.0 (2026-07-29): a normal open yields the reference, and only `--disable-keyring`
+  # yields the 128-hex-char key - and how the volume was opened is the custodian's business, not
+  # ours. So on an ordinarily-booted host this step CANNOT capture the master key.
+  #
+  # That matters more than anything else in this file. The banner below says "these are VOLUME
+  # MASTER KEYS - they decrypt the evidence" and DECRYPTION-KEYS.md tells the analyst to hex-decode
+  # the field. Writing a keyring pointer under that banner is precisely the failure this project
+  # exists to prevent: a file that exists, is non-empty, and does not contain what it claims. The
+  # responder discovers it months later with the host long gone. So say it, in the artifact, at the
+  # moment it is true.
+  #
+  # Defined HERE rather than beside the other verdict helpers because bash runs top-down and this
+  # step executes long before those definitions; exported because run_sh bodies get a fresh `bash -c`.
+  # Pure (no I/O) so it is unit-testable - see tests/unit/test-volume-key-shape.sh.
+  volume_key_shape() {
+    local k="${1:-}"
+    case "$k" in
+      '')             echo "absent" ;;
+      *:*)            echo "keyring-reference" ;;   # ":64:logon:cryptsetup:<uuid>-d0"
+      *[!0-9a-fA-F]*) echo "absent" ;;              # neither hex nor a reference - nothing usable
+      ??*)            echo "hex" ;;
+      *)              echo "absent" ;;
+    esac
+  }
+  export -f volume_key_shape
+
   if [ "${NO_KEYS:-0}" = "1" ]; then
     audit "KEY CAPTURE SKIPPED (--no-keys): volume master keys / LUKS headers NOT collected."
     run_sh meta-keys-skipped ENCRYPTION_KEYS_SKIPPED.txt "$D_META" 10 0 'echo "Volume-encryption key capture was disabled with --no-keys. A dead-box image of an encrypted volume will NOT be readable without the custodian passphrase."'
   else
     run_sh meta-volkeys volume_master_keys.txt "$D_META" 60 1 '
-      echo "*** SENSITIVE: these are VOLUME MASTER KEYS - they decrypt the evidence. ***"
+      echo "*** SENSITIVE: this file may contain VOLUME MASTER KEYS - they decrypt the evidence. ***"
       echo "=== dm-crypt targets (table --showkeys) ==="
       if command -v dmsetup >/dev/null 2>&1; then
         dmsetup ls --target crypt 2>/dev/null | grep -v "No devices found" | while read -r nm _; do
           [ -z "$nm" ] && continue
           echo "--- $nm ---"
-          dmsetup table --showkeys "$nm" 2>/dev/null
-          echo "    (fields: start len crypt <cipher> <MASTER-KEY-HEX> <iv-offset> <device> <offset> ...)"
+          t=$(dmsetup table --showkeys "$nm" 2>/dev/null)
+          echo "$t"
+          echo "    (fields: start len crypt <cipher> <KEY-OR-KEYRING-REF> <iv-offset> <device> <offset> ...)"
+          # Say what was actually obtained. A reader must never have to infer this by eye.
+          case "$(volume_key_shape "$(echo "$t" | awk "{print \$5}")")" in
+            hex)
+              echo "    KEY SHAPE: hex - this IS the master key. Handle accordingly." ;;
+            keyring-reference)
+              echo "    KEY SHAPE: KEYRING REFERENCE - *** NO MASTER KEY WAS CAPTURED FOR $nm ***"
+              echo "    The volume key is held in the kernel keyring (cryptsetup 2.x default for"
+              echo "    LUKS2), so the table shows a pointer, not the key. That pointer is useless"
+              echo "    once this host is powered off. DO NOT treat this file as a decryption key"
+              echo "    for $nm. Recover the key from the RAM image instead - see"
+              echo "    DECRYPTION-KEYS.md, 'If no master key was captured'. If RAM was not"
+              echo "    captured either, this evidence may be UNREADABLE after shutdown." ;;
+            *)
+              echo "    KEY SHAPE: absent/unrecognised - no usable key material in this line." ;;
+          esac
         done
       else echo "dmsetup not present - cannot read live master keys"; fi
       echo "=== cipher/keysize per active LUKS mapping ==="
@@ -918,8 +965,23 @@ custody. If your authority did not extend to key extraction, the collector suppo
 | `encryption.txt` | Which volumes are encrypted, `luksDump` metadata |
 | `../03_memory/` | RAM image - the master key is also recoverable from here if the above failed |
 
+## FIRST: check whether a master key was actually captured
+`dmsetup table --showkeys` does not always show a key. Since cryptsetup 2.x, a LUKS2 volume opened
+normally keeps its key in the **kernel keyring**, and the table carries a reference instead:
+
+    0 163840 crypt aes-xts-plain64 :64:logon:cryptsetup:b8875a97-...-d0 0 7:0 32768
+
+If the fifth field contains colons, **no master key was captured** - that pointer died with the
+host. Only a volume opened with `--disable-keyring` shows the 128-hex-character key. Which of the
+two you get depends on how the custodian's system opened the volume, not on anything the collector
+can choose, so this is not a collection error and retrying will not change it. Go straight to
+"If no master key was captured" below. `volume_master_keys.txt` labels each mapping with its KEY
+SHAPE so you do not have to judge this by eye.
+
+(Measured on cryptsetup 2.7.0: normal open -> keyring reference; `--disable-keyring` -> hex.)
+
 ## Using a master key against an acquired image (no passphrase needed)
-The `dmsetup table` line looks like:
+Only applies when the fifth field is hex. The `dmsetup table` line then looks like:
 
     0 1953125 crypt aes-xts-plain64 <MASTER-KEY-HEX> 0 8:2 32768
 
@@ -935,16 +997,27 @@ sectors**, here 32768 = 16 MiB), then on the analysis box:
 `--volume-key-file` is the current spelling; on cryptsetup older than 2.7 use its obsolete alias
 `--master-key-file`. Both open a LUKS device with no passphrase at all.
 
-If the LUKS header is missing or damaged, map the raw payload directly instead - note the offset
-is applied to the LOOP device, and `dmsetup` sizes are in 512-byte sectors:
+If the LUKS header is missing or damaged, map the raw payload directly instead. **Reuse the table
+line captured in `volume_master_keys.txt` verbatim and change only the device field** - do not
+retype it from the parts:
 
-    SZ=$(blockdev --getsz /dev/loopN)
-    echo "0 $((SZ-32768)) crypt aes-xts-plain64 <MASTER-KEY-HEX> 0 /dev/loopN 32768" \
+    # captured:  0 163840 crypt aes-xts-plain64 <KEY> 0 7:0 32768 1 sector_size:4096
+    # substitute field 7 (the device) with your loop device, leave everything else alone:
+    echo "0 163840 crypt aes-xts-plain64 <KEY> 0 /dev/loopN 32768 1 sector_size:4096" \
       | dmsetup create decrypted --readonly
+
+The trailing `1 sector_size:4096` is why. LUKS2 commonly formats with 4096-byte sectors, and a
+table rebuilt without that option silently maps at 512 - `dmsetup create` SUCCEEDS and the mount
+then fails with "bad superblock", which reads like a corrupt image rather than a wrong mapping.
+Both routes were exercised on cryptsetup 2.7.0 (2026-07-29): copying the captured table reached the
+plaintext; reconstructing the line by hand created a mapping that would not mount.
 
 Restore a header first if you have one and prefer the normal path:
 
-    cryptsetup luksHeaderRestore /dev/loopN --header-backup-file luks_header_dev_sda3.img
+    cryptsetup luksHeaderRestore /dev/loopN --header-backup-file luks_header__dev_sda3.img
+
+(The doubled underscore is not a typo: the backup filename is the device path with every `/`
+turned into `_`, and `/dev/sda3` begins with one. Use the name as it appears in `00_metadata/`.)
 
 ## If no master key was captured
 Recover it from the RAM image instead - the key is resident in kernel memory while the volume is
