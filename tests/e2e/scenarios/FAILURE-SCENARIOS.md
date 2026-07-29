@@ -1853,3 +1853,51 @@ defect is bounded on both platforms.**
 
 Both detectors are now in `tests/tools/` rather than a scratch directory, so the next sweep starts
 from a calibrated tool instead of a new regex.
+
+## Error-class reachability: the static approach does not work, and the calibration proved it (2026-07-29)
+
+Question: besides `wmi_failure`, can `dns_blocked` / `net_unreachable` / `job_subsystem` and the
+rest ever actually be produced, or are their ladders stranded too?
+
+The attempt: read the 14 classes out of the shipped `Get-ErrorClass`, map each to the commands whose
+failure would carry its text, and count how many of those call sites can surface an error versus
+how many are silenced.
+
+**It produced a clean-looking table of 13 verdicts. None of them are publishable.**
+
+### The calibration killed it
+
+`wmi_failure` is *known* to be unreachable in practice - the CIM steps return **empty** rather than
+throwing, so no text ever reaches the classifier. That is the finding this whole line of work came
+from. The instrument called it **reachable**.
+
+That is not a tuning problem. A line-based count of call sites fundamentally cannot see
+emptiness-instead-of-error, which is the precise mechanism that strands a class. Every "reachable"
+verdict it emits is therefore an upper bound - "a site exists that could throw" - and not an answer
+to the question asked.
+
+### Its one actionable verdict was also wrong
+
+The table flagged `tool_missing` as **STRANDED (all sites silenced)**. It is not.
+`tool_missing` is assigned **directly** at seal time, bypassing the classifier entirely:
+
+```powershell
+$msg = "TOOLKIT TAMPERED DURING RUN: ..."
+$ec = 'tool_missing'          # IR-Collect.ps1:2127
+```
+
+So the class fires whenever `Compare-ToolInventory` sees a carried tool vanish or change hash - a
+path the instrument never modelled, because it only looked at commands feeding `Get-ErrorClass`.
+Two independent errors, in opposite directions, in a thirteen-row table.
+
+### What would actually answer this
+
+Runtime, not static. Instrument `Get-ErrorClass` **and** the direct-assignment sites to append every
+class they emit to a file, then run the existing scenario corpus and read which classes ever
+appear. The scenarios already exist and already induce most of these conditions - a broken WMI, a
+dead DNS path, a full disk, a yanked destination, a killed job subsystem. That converts "can this
+fire" from a guess about code shape into a list of classes observed firing.
+
+Recorded here so the next iteration does not rebuild the same static instrument. **No verdicts are
+carried forward from this attempt** - the one fact worth keeping is that `tool_missing` has a
+direct-assignment path at seal, which nothing else in this catalogue had recorded.
