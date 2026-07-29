@@ -1807,3 +1807,49 @@ That is the same defect as the collector's, in the tool built to police it: **a 
 run is indistinguishable from a check that passed.** It is worth noticing how persistent this shape
 is - it has now appeared in the product, in three scenario harnesses, in the path auditor, and here
 in a mutation runner.
+
+## The Linux collector is clean of the signature shape - and the first detector that said so was lying (2026-07-29)
+
+The last untouched seam was `ir-collect.sh`. Shell hides the signature defect differently from
+PowerShell: there is no `catch {}`, so the swallowing is `2>/dev/null`, `|| true`, `|| :` or
+`|| echo <default>`. **199 lines** of this collector contain one.
+
+### The detector reported zero, and zero was worthless
+
+The first version looked only for
+
+```bash
+VAR=default ; VAR=$(probe 2>/dev/null) ; if [ "$VAR" ... ]
+```
+
+It passed its own synthetic self-test, ran over the collector, and reported **0 hits**. That would
+have been published as "the Linux side is clean, risk bounded".
+
+It was checked first against the collector as it stood *before* the LUKS fix - a file that
+provably contained the defect - and reported **0 there too**. The shape this codebase actually uses
+is different:
+
+```bash
+local enc=0; grep -q '^ENCRYPTED=yes' "$D_META/encryption.txt" 2>/dev/null && enc=1
+```
+
+A safe default, then a **conditional assignment gated on a swallowed probe**. The regex required
+`VAR=$(...)` and never matched it.
+
+**A synthetic self-test only proves a detector finds the shape you imagined.** Calibrating against a
+known positive from the real codebase is what separates a real zero from an empty one - and git
+history makes that calibration free: `git show <fix>~1:<file>` is a guaranteed known-positive.
+
+### The measurement, once the detector could find the bug
+
+```
+pre-fix collector  (known positive): 1 hit - line 1519, `enc`, shape 2   <- correct
+current collector                  : 0 hits across 199 swallowing constructs
+```
+
+So the Linux side really is clean: the only instance of the shape was the LUKS gate, and it is
+fixed. Combined with the Windows result (4 of 60, three failing conservatively), **the signature
+defect is bounded on both platforms.**
+
+Both detectors are now in `tests/tools/` rather than a scratch directory, so the next sweep starts
+from a calibrated tool instead of a new regex.
