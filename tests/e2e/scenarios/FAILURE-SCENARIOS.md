@@ -2243,3 +2243,64 @@ for removal, so a future site reusing that name cannot inherit an excuse it was 
 
 Both platforms are now guarded by an instrument that must prove it can still find a real defect
 before its zero - or its baseline - is believed.
+
+## A1 preparation: escape hatch proven, and the real risk located (2026-07-29)
+
+A1 is the last unrun scenario - the collector under a **real** AppLocker rule set rather than a
+session language-mode switch. Its gate has existed for a long time; only the live proof is missing.
+It also carries the only irreversible-access risk in the catalogue, so this pass built and proved
+the way out **before** any policy exists. **No policy was applied and nothing was left changed.**
+
+### Baseline
+
+```
+AppIDSvc            present=True  status=Stopped  startType=Manual
+SrpV2 policy key    exists=False
+effective policy    (empty)
+```
+
+AppLocker is available but idle, and there is no existing policy to preserve or restore.
+
+### The escape hatch works
+
+A `.bat` driven by a scheduled task, deliberately **not** PowerShell - a PowerShell-based recovery
+is worthless if the thing being recovered from is a PowerShell block:
+
+```
+escape-hatch ran as WS02$ at Wed 07/29/2026 16:46:13
+ERROR: The system was unable to find the specified registry key or value.
+[SC] ControlService FAILED 1062: The service has not been started.
+escape-hatch complete
+```
+
+The errors are the *expected* ones - there was no policy key to delete and the service was already
+stopped. The mechanism executed as SYSTEM and ran to completion, which is what needed proving.
+Post-check: PowerShell still runs, service unchanged, no key, task removed.
+
+### The finding that actually matters
+
+```
+OpenSSH DefaultShell = C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+```
+
+**The only remote path to this VM runs PowerShell.** An AppLocker *Exe* rule that blocks
+`powershell.exe` would take ssh with it, leaving recovery entirely dependent on the pre-armed task
+firing on schedule - with the Proxmox console as the only fallback, and no way for this session to
+drive it.
+
+That was worth learning before the run rather than during it.
+
+### It also makes A1 safely scopeable
+
+A1's condition is that **the collector** - a `.ps1` - is blocked. That is a **Script** rule, not an
+Exe rule. A policy that denies `C:\ir\*.ps1` while allowing `%WINDIR%` and `%PROGRAMFILES%` blocks
+the collector precisely, and leaves `powershell.exe` free to start, so ssh keeps working and
+inline commands still run. The scenario's condition is fully induced and remote access survives.
+
+Residual risk after that scoping: AppLocker enforcement requires starting `AppIDSvc`, and a
+mis-scoped rule could still deny more than intended. The escape task stays armed throughout, and
+the service is returned to `Stopped`/`Manual` afterwards.
+
+**Not run.** The plan is now specific, the way out is proven, and the residual risk is named - but
+locking a range VM out of remote access is the user's call to make, not one to take silently on
+their behalf.
