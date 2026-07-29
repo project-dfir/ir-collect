@@ -68,5 +68,22 @@ Check ($sh  -match '\.ship\.json') 'Linux writes a ship-result file'
 Check ($win -match 'preflight_ok') 'Windows records the preflight outcome in it'
 Check ($sh  -match 'preflight_ok') 'Linux records the preflight outcome in it'
 
+# --- minimum engine version (scenario E5) --------------------------------------------------
+# The collector uses [pscustomobject], Get-CimInstance and [ordered] hashtables - none of which
+# exist in PowerShell 2.0. Without a #requires it PARSES under v2, starts collecting, and dies
+# partway with errors that look like a broken host rather than a wrong interpreter. Verified live
+# 2026-07-29 by temporarily requiring v99: exit 1, zero stdout, zero bundles - it refuses before
+# doing anything. Guard the directive so a refactor cannot drop it.
+$winLines = [IO.File]::ReadAllLines($WinCollector)
+$req = @($winLines | Where-Object { $_ -match '^\s*#requires\s+-Version\s+(\d+)' })
+Check ($req.Count -ge 1) 'the Windows collector declares a minimum engine version (#requires)'
+if ($req.Count) {
+    $v = [int]([regex]::Match($req[0], '-Version\s+(\d+)').Groups[1].Value)
+    Check ($v -ge 3) "the declared minimum is v3 or higher (got v$v) - v2 lacks [pscustomobject], Get-CimInstance and [ordered]"
+    $idx = [array]::FindIndex($winLines, [Predicate[string]]{ param($l) $l -match '^\s*#requires' })
+    $codeBefore = @($winLines[0..([Math]::Max(0,$idx-1))] | Where-Object { $_.Trim() -and $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*<#' })
+    Check ($codeBefore.Count -eq 0) 'nothing executable precedes the #requires directive'
+}
+
 Write-Host "`n$fail failed" -ForegroundColor $(if($fail){'Red'}else{'Green'})
 exit $(if ($fail) { 1 } else { 0 })

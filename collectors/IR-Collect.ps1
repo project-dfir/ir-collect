@@ -1,3 +1,15 @@
+#requires -Version 3
+# ^ Refuse to START on PowerShell 2.0 rather than half-run on it. The script uses
+# [pscustomobject] (12x), Get-CimInstance (25x) and [ordered] hashtables (21x), none of which
+# exist in v2 - so without this it parses, begins collecting, and dies partway through with
+# errors that look like a broken host rather than a wrong interpreter.
+#
+# Scenario E5, measured on range-WS02 2026-07-29: the PS 2.0 FEATURE is Enabled there, but
+# .NET 2.0 is absent, so `powershell -Version 2` refuses on its own ("Version v2.0.50727 of the
+# .NET Framework is not installed"). That refusal is host-specific - on a legacy host that does
+# have .NET 2.0 (Server 2008 R2, Win7 - exactly the machines a live-response collector still
+# meets) nothing would have stopped it. #requires makes the refusal universal and immediate,
+# which is what the A6 precedent asks for: let the host refuse, but only if it actually will.
 <#
 .SYNOPSIS
     IR-Collect - Self-healing incident-response collector for Windows (two-stage: rapid volatile + menu).

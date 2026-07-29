@@ -806,3 +806,33 @@ boolean would have shipped a confident false cause into an evidence bundle.
 
 Range restored to baseline: 0 firewall rules, DC reachable, 0 E3 bundles, 3 evidence dirs, tasks
 deleted.
+
+## E5 - PowerShell 2.0 (CLOSED 2026-07-29)
+
+**The original repro is INVALID on this host, and that was measured rather than assumed.** The
+PS 2.0 *feature* is `Enabled` on range-WS02, but .NET 2.0 is not installed, so
+`powershell -Version 2` refuses on its own: *"Version v2.0.50727 of the .NET Framework is not
+installed and it is required to run version 2 of Windows PowerShell."* The collector never starts,
+so nothing about its behaviour under v2 could be observed here.
+
+**That refusal is host-specific, and the gap behind the scenario was real.** The collector had no
+`#requires` and no version check, while using `[pscustomobject]` (12x), `Get-CimInstance` (25x) and
+`[ordered]` hashtables (21x) - none of which exist in v2. On a legacy host that *does* have .NET
+2.0 - Server 2008 R2, Windows 7, exactly the machines a live-response collector still meets -
+nothing would have stopped it. It would parse, begin collecting, and die partway through with
+errors that read like a broken host rather than a wrong interpreter.
+
+This is where E5 differs from A6. In A6 the host refuses on *every* machine with AllSigned, so
+adding collector logic would have duplicated the host's job. Here the host only refuses on machines
+that happen to lack .NET 2.0, so `#requires -Version 3` makes the refusal universal and immediate.
+
+**Verified live without needing a v2 host**, by temporarily requiring an impossible version:
+
+| control | directive | exit | stdout lines | bundles |
+|---|---|---|---|---|
+| negative | `#requires -Version 99` | 1 | **0** | **0** |
+| positive | `#requires -Version 3` | 0 | normal | 1 (49 files) |
+
+Zero stdout lines is the part that matters: it refuses *before* collecting anything, which is the
+scenario's actual bar. Two mutations - dropping the directive, and weakening it to `-Version 2` -
+each fail the suite.
