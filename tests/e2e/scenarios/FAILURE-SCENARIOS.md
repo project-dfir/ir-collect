@@ -1640,3 +1640,64 @@ This is the third time a defect I was hunting turned up in my own code for it (t
 the subsystem probe, the empty-result-asserts-a-cause in the encryption harness, and now this).
 Worth stating plainly rather than filing quietly: the detector should always be run over the fix,
 not only over the original.
+
+## D5 CLOSED - the encrypted code path finally exercised, both controls (2026-07-29)
+
+D5 has been ⚠️ since the catalogue began: "code paths never run against a *real* encrypted volume".
+A LUKS **loopback** volume on range-linux-web closes it - no real disk touched, fully reversible,
+and it exercises the key-capture path that exists so a dead-box image of an encrypted disk stays
+readable.
+
+Condition asserted live before judging (`lsblk` crypt rows = 2, `dmsetup` crypt maps = 1):
+
+**NEGATIVE - encrypted volume present:**
+
+```
+artifact:          ENCRYPTED=yes
+encryption_risk:   encrypted-no-ram        memory_verified=false
+banner:            SPECIFIC (encrypted + no RAM, do-not-power-off)
+key capture:       luks_header_backups=1   (+ DECRYPTION-KEYS.md written)
+```
+
+**POSITIVE CONTROL - same host, volume closed:**
+
+```
+artifact:          ENCRYPTED=no
+encryption_risk:   ok
+banner:            GENERIC amber only (no power-off warning)
+key capture:       luks_header_backups=0
+```
+
+The discrimination is exactly right: the power-off warning appears **only** when a volume is
+actually encrypted, and the generic amber (RAM not captured) still fires on the clear host without
+borrowing the encryption language. A warning that fired on both would be noise.
+
+**A LUKS header backup was captured for the first time.** That path has shipped since the beginning
+and had never once run - it is what makes a passphrase usable against an acquired image.
+
+Teardown verified: 0 crypt maps, 0 loop devices, image gone.
+
+### Three near-miss FALSE defects, all mine
+
+The first run reported `ENCRYPTED=<missing>`, `NO run_state.json` and `luks_header_backups=0`. All
+three were wrong. The collector runs as root and its artifacts are root-owned; the harness read them
+as `labadmin`, got nothing, and printed exactly what a genuinely missing marker would look like.
+Reading with `sudo` produced the results above from the *same* collector build.
+
+`rc=15` was also nearly recorded as a failure. It is `RUN_INCOMPLETE` - the documented exit for a
+run whose memory capture did not verify, which is precisely what this VM does. Correct behaviour.
+
+Both are the same rule the collector itself keeps violating, now caught in the test rig: **an empty
+result from a check that could not run is not a finding.** Three defects were nearly filed against
+working code in a single run.
+
+### Not concluded
+
+`volume_keys_bytes=0` in the encrypted case - the dm-crypt master key file was looked for at a
+**guessed** filename (`volume_keys.txt`) that the metadata listing does not obviously contain. Given
+the three false defects above, this is recorded as *unverified*, not as a gap: the header backup
+demonstrably worked, and whether the `dmsetup --showkeys` capture landed under a different name has
+not been established. Next iteration should read the actual filename before judging.
+
+The Linux `unknown` state also remains un-exercised live (it needs a host with no working `lsblk`);
+a PATH-shadowed stub is the cheap way in.
