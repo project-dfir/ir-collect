@@ -69,9 +69,12 @@ check "$([ "$(has "$o" 'WARNING')" = 0 ] && echo 1 || echo 0)" 'a healthy clock 
 # --- the chronyc PARSE, against real output shapes -------------------------------------------
 # The live positive control proved end-to-end extraction works for a ~0s offset, and clock_verdict
 # is unit-tested above for direction and the 60s warning. What neither covers is whether the awk
-# parse handles chronyc's LARGE-offset output, and that could not be proven live: no Linux VM on
-# the range is ssh-reachable, and the only other host is the Proxmox hypervisor - skewing a
-# production hypervisor's clock to test a string parse is not a trade worth making.
+# parse handles chronyc's LARGE-offset output, and that still cannot be proven live. The original
+# reason recorded here ("no Linux VM on the range is ssh-reachable") was WRONG and is corrected:
+# range-linux-web (10.20.50.60) answers ssh with passwordless sudo. It simply has no chrony - only
+# systemd-timesyncd, the Ubuntu default - so it cannot exercise the chrony branch at all. The only
+# host on the range running chrony is the Proxmox hypervisor, and skewing a production hypervisor's
+# clock to test a string parse is not a trade worth making.
 #
 # So the parse is extracted from the shipped collector and driven with real chronyc output shapes.
 # The convention: chronyc says "fast" (host ahead -> positive) or "slow" (host behind -> negated).
@@ -122,6 +125,68 @@ v="$(clock_verdict "chronyc (dc01)" "$(printf 'System time     : 200.5 seconds f
 ' | chrony_parse)")"
 check "$(has "$v" 'is AHEAD of the reference by 200.5s')" 'parse + verdict together describe a large fast clock as AHEAD'
 check "$(has "$v" 'WARNING')" 'parse + verdict together warn on a large offset'
+
+# --- the Reference ID parse -------------------------------------------------------------------
+# Shipped as awk -F"= *" while chronyc separates fields with ':', so $2 was ALWAYS empty and every
+# bundle recorded "Time source : chronyc ()" - a parenthetical asserting a reference the code never
+# extracted. Confirmed against real bytes from rick-pve 2026-07-29:
+#   Reference ID    : 4540E102 (cambria.bitsrc.net)
+refid_parse() { awk -F": *" '/Reference ID/{print $2; exit}'; }
+if grep -qF 'awk -F": *" "/Reference ID/' "$COLLECTOR"; then
+    printf 'ok    the collector still ships the Reference ID parse this test mirrors\n'
+else
+    printf 'FAIL  the Reference ID parse has drifted from the copy under test\n'; FAIL=$((FAIL+1))
+fi
+check "$([ "$(grep -cF 'awk -F"= *"' "$COLLECTOR")" = 0 ] && echo 1 || echo 0)" \
+      'the wrong "=" field separator is gone from the collector'
+o="$(printf 'Reference ID    : 4540E102 (cambria.bitsrc.net)\nStratum         : 3\n' | refid_parse)"
+check "$([ "$o" = "4540E102 (cambria.bitsrc.net)" ] && echo 1 || echo 0)" \
+      "the real chronyc Reference ID line yields the id and peer (got '$o')"
+# mutation: the OLD separator against the same real bytes must produce nothing, or this test proves
+# nothing about the fix
+o="$(printf 'Reference ID    : 4540E102 (cambria.bitsrc.net)\n' | awk -F"= *" '/Reference ID/{print $2; exit}')"
+check "$([ -z "$o" ] && echo 1 || echo 0)" "the old '=' separator really did extract nothing (got '$o')"
+
+# --- synchronisation state must reach the verdict ----------------------------------------------
+# Same class as E3/A3: the collector already read NTPSynchronized and then threw it away, printing
+# "(no reachable peer)" - a CAUSE it never established - for every offset-less daemon. Live on
+# range-linux-web: NTPSynchronized=no, Server: n/a, Packet count: 0, i.e. a clock never anchored
+# to anything, reported as if a daemon were merely quiet.
+o="$(clock_verdict "timedatectl (NTPSynchronized=no)" "" "no")"
+check "$(has "$o" 'NOT SYNCHRONISED')" 'a never-synchronised clock is called out, not filed as UNAVAILABLE'
+check "$(has "$o" 'UNVERIFIED')"       'a never-synchronised clock says its timestamps are unverified'
+check "$(has "$o" 'WARNING')"          'a never-synchronised clock WARNS - the error is unbounded'
+check "$([ "$(has "$o" 'no reachable peer')" = 0 ] && echo 1 || echo 0)" \
+      'the unestablished "no reachable peer" cause is not asserted'
+
+o="$(clock_verdict "timedatectl (NTPSynchronized=yes)" "" "yes")"
+check "$(has "$o" 'IS synchronised')" 'a synchronised daemon with no numeric offset says so'
+check "$([ "$(has "$o" 'WARNING')" = 0 ] && echo 1 || echo 0)" \
+      'a synchronised clock does NOT warn merely for lacking a number'
+check "$([ "$(has "$o" 'no reachable peer')" = 0 ] && echo 1 || echo 0)" \
+      'a synchronised clock is never blamed on an unreachable peer'
+
+# THREE-STATE, per the E3 lesson: a probe that did not run must say so rather than pick a side.
+o="$(clock_verdict "chronyc (dc01)" "" "")"
+check "$(has "$o" 'could not be read')" 'an unread sync state is reported as unknown, not as a cause'
+check "$([ "$(has "$o" 'NOT SYNCHRONISED')" = 0 ] && echo 1 || echo 0)" \
+      'an unknown sync state is NOT reported as unsynchronised'
+check "$([ "$(has "$o" 'no reachable peer')" = 0 ] && echo 1 || echo 0)" \
+      'an unknown sync state invents no cause either'
+
+# a measured offset outranks the sync flag - the number is the stronger evidence
+o="$(clock_verdict "chronyc (dc01)" "200.5" "no")"
+check "$(has "$o" 'is AHEAD of the reference by 200.5s')" 'a real measurement still wins over the sync flag'
+
+# The false cause must be gone from what the collector PRINTS, not merely from this function's
+# return value. Scoped to emitting lines: the comment above the fix quotes the old wording to
+# explain it, and a flat grep for the string matched that comment - a test failing on correct code.
+check "$([ "$(grep -F 'no reachable peer' "$COLLECTOR" | grep -cE '^[[:space:]]*(echo|printf)') " = "0 " ] && echo 1 || echo 0)" \
+      'no echo/printf in the collector still claims "no reachable peer"'
+
+# the step must actually PASS the sync argument, or every case above is dead code in production
+check "$([ "$(grep -cF 'clock_verdict "$src" "$ahead" "$sync"' "$COLLECTOR")" = 1 ] && echo 1 || echo 0)" \
+      'the meta-clock step passes the sync state through to clock_verdict'
 
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi

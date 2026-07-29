@@ -805,7 +805,7 @@ rapid_volatile() {
   # clock_verdict, so the sign convention lives in exactly one place per tool rather than being
   # re-derived by the reader. chronyc says "fast/slow" in words; ntpq reports reference-minus-host
   # in milliseconds, so it is negated.
-  run_sh   meta-clock       clock_provenance.txt "$D_META" 30 1 'echo "Host local: $(date +%FT%T%z 2>/dev/null || date)"; echo "Host UTC:   $(date -u +%FT%T.%3NZ 2>/dev/null || date -u)"; src=""; ahead=""; if command -v chronyc >/dev/null 2>&1; then t="$(chronyc tracking 2>/dev/null)"; if [ -n "$t" ]; then src="chronyc ($(printf "%s" "$t" | awk -F"= *" "/Reference ID/{print \$2; exit}"))"; ahead="$(printf "%s" "$t" | awk "/System time/{v=\$4; if (\$0 ~ /slow/) v=\"-\" v; print v; exit}")"; fi; fi; if [ -z "$src" ] && command -v ntpq >/dev/null 2>&1; then o="$(ntpq -pn 2>/dev/null | awk "/^\*/{print \$9; exit}")"; if [ -n "$o" ]; then src="ntpq"; ahead="$(awk -v m="$o" "BEGIN{printf \"%.6f\", -m/1000}")"; fi; fi; if [ -z "$src" ] && command -v timedatectl >/dev/null 2>&1; then st="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"; if [ -n "$st" ]; then src="timedatectl (NTPSynchronized=$st)"; fi; fi; clock_verdict "$src" "$ahead"'
+  run_sh   meta-clock       clock_provenance.txt "$D_META" 30 1 'echo "Host local: $(date +%FT%T%z 2>/dev/null || date)"; echo "Host UTC:   $(date -u +%FT%T.%3NZ 2>/dev/null || date -u)"; src=""; ahead=""; if command -v chronyc >/dev/null 2>&1; then t="$(chronyc tracking 2>/dev/null)"; if [ -n "$t" ]; then src="chronyc ($(printf "%s" "$t" | awk -F": *" "/Reference ID/{print \$2; exit}"))"; ahead="$(printf "%s" "$t" | awk "/System time/{v=\$4; if (\$0 ~ /slow/) v=\"-\" v; print v; exit}")"; fi; fi; if [ -z "$src" ] && command -v ntpq >/dev/null 2>&1; then o="$(ntpq -pn 2>/dev/null | awk "/^\*/{print \$9; exit}")"; if [ -n "$o" ]; then src="ntpq"; ahead="$(awk -v m="$o" "BEGIN{printf \"%.6f\", -m/1000}")"; fi; fi; sync=""; if command -v timedatectl >/dev/null 2>&1; then sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"; fi; if [ -z "$src" ] && [ -n "$sync" ]; then src="timedatectl (NTPSynchronized=$sync)"; fi; clock_verdict "$src" "$ahead" "$sync"'
   # CRITICAL while live: LUKS/dm-crypt status. A dead-box image of an encrypted disk is unreadable
   # without the key - capture encryption state (and note master keys live in RAM we are imaging).
   run_sh   meta-crypto      encryption.txt   "$D_META" 30 1 'echo "=== encrypted volumes ==="; lsblk -o NAME,FSTYPE,MOUNTPOINT,TYPE 2>/dev/null | grep -iE "crypt|luks"; echo "=== dm-crypt maps ==="; dmsetup ls --target crypt 2>/dev/null; for d in $(lsblk -pno NAME,FSTYPE 2>/dev/null | awk "\$2==\"crypto_LUKS\"{print \$1}"); do echo "== $d =="; cryptsetup luksDump "$d" 2>/dev/null; done; if lsblk -o FSTYPE,TYPE 2>/dev/null | grep -qiE "crypto_LUKS|(^|[[:space:]])crypt([[:space:]]|$)"; then echo "ENCRYPTED=yes"; else echo "ENCRYPTED=no"; fi; echo "NOTE: if encrypted, the master key is in the RAM image; extract before shutdown."'
@@ -1010,7 +1010,11 @@ enough_space() {  # enough_space <need_kib> <what>
 # reference-minus-host; here the caller normalises to HOST-MINUS-REFERENCE, so positive means this
 # host is ahead, and the direction is also spelled out in words.
 clock_verdict() {
-  local src="$1" ahead="$2"
+  # ${3:-}: defaulted, not required. The collector does not run under `set -u`, so an absent third
+  # argument would silently become empty here anyway - but the unit suite DOES, and a bare "$3"
+  # aborts the function mid-output there, which reads as a logic failure rather than a call-shape
+  # one. An omitted sync state is a legitimate input meaning "unknown"; it must behave like one.
+  local src="$1" ahead="$2" sync="${3:-}"
   if [ -z "$src" ]; then
     echo "Time source     : NONE FOUND (no chrony, ntpd or timedatectl)"
     echo "Measured offset : UNKNOWN - no time daemon on this host, so this bundle carries no independent evidence that the clock is correct. Compare these timestamps against a trusted source before building a timeline."
@@ -1018,7 +1022,27 @@ clock_verdict() {
   fi
   echo "Time source     : $src"
   if [ -z "$ahead" ]; then
-    echo "Measured offset : UNAVAILABLE - $src is present but reported no offset (no reachable peer). This bundle carries no independent evidence that the clock is correct."
+    # THE CAUSE MUST BE ESTABLISHED, NOT ASSUMED. This branch used to state "(no reachable peer)"
+    # unconditionally, which is a diagnosis the code never made: an absent offset only means the
+    # daemon did not expose a number. systemd-timesyncd - the DEFAULT on Ubuntu, so the common
+    # case for Linux targets - never exposes one through the probe above even when it is happily
+    # synchronised. So report the sync flag we actually read, and nothing more.
+    case "$sync" in
+      no|NO|No)
+        # Same class as E3/A3: the tool already SAW this fact and let it die before the verdict.
+        # A host that has never synchronised is the strongest clock finding this step can make -
+        # every timestamp in the bundle is unanchored - so it must not read as a quiet daemon.
+        echo "Measured offset : NOT SYNCHRONISED - $src reports this clock has never been synchronised against a time source, so no offset exists to report."
+        echo "Interpretation  : this host's timestamps are UNVERIFIED - the clock could be off by any amount in either direction."
+        echo "WARNING: this clock is not synchronised. Timestamps in this bundle are NOT safely comparable with other hosts, and the error is unbounded rather than merely unmeasured."
+        ;;
+      yes|YES|Yes)
+        echo "Measured offset : UNAVAILABLE - $src reports the clock IS synchronised but does not expose a numeric offset, so the size of any residual error is unknown (it is bounded by the daemon's own discipline, not by this measurement)."
+        ;;
+      *)
+        echo "Measured offset : UNAVAILABLE - $src is present but reported no offset, and its synchronisation state could not be read. This bundle carries no independent evidence that the clock is correct."
+        ;;
+    esac
     return 0
   fi
   echo "Measured offset : ${ahead}s  (host minus reference; positive = this host is AHEAD)"

@@ -62,7 +62,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 | E1 | **WMI/CIM broken** | `sc config Winmgmt start= disabled` + stop, on a range VM | Run must not claim COMPLETE when core volatile evidence is missing | ✅ tested on WS02 — found the worst defect of the session (see below); `wmi_failure` still never fires because the steps do not error, they return nothing — emptiness detection is what catches it |
 | E2 | **No `sha256sum`** (stock macOS/BSD/busybox) | `HASH_BACKEND` forced per backend | shasum/sha256/openssl/digest/python3 fallback | ✅ unit-tested across 4 backends |
 | E3 | **Domain unreachable** for AD enumeration | block LDAP/SMB/Kerberos/NTP to the DC | Skip cleanly, mark incomplete, do not hang | ✅ CLOSED 2026-07-29 - defect found AND fixed; both controls pass (see below) |
-| E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to |
+| E4 | **Clock skew** | shift VM clock | Recorded in `clock_provenance.txt` for timeline defensibility | ✅ CLOSED 2026-07-29 - validated under a live skew; the artifact now MEASURES the offset instead of asking the analyst to; Linux second pass 2026-07-29 found 3 more defects (empty Reference ID, a fabricated "no reachable peer" cause, and NTPSynchronized=no reported as a working source) - all fixed, both controls live |
 | E5 | **PowerShell 2.0** | `powershell -Version 2` | Refuse; v2 lacks the language features | CLOSED 2026-07-29 - `#requires -Version 3` added and live-verified; original repro INVALID on this host (see below) |
 
 ---
@@ -896,3 +896,115 @@ Anchoring that guard took three attempts: `grep` patterns for the shipped text k
 *correct* code because the awk program is embedded with backslash-escaped `$`. Fixed by reading the
 exact bytes out of the file and matching fragments confirmed to exist, rather than guessing the
 escaping - the same trap that has now cost time in five separate iterations.
+
+## E4 Linux, second pass - the clock evidence a synchronised-looking host actually carries (CLOSED 2026-07-29)
+
+The first Linux pass measured the offset and got the sign convention right. This pass asked a
+different question - what the step reports on hosts where no offset exists - and found three
+defects, two of them the tool's recurring failure mode: **the collector already held the fact and
+did not let it reach the verdict** (same class as E1/WMI, A3, E3).
+
+**How the premise that blocked this was wrong.** The carried state said the Linux clock work could
+not be verified live because "no Linux VM on the range answers ssh". That was false: it came from
+probing with `qm guest cmd` (no guest agent is installed anywhere) and as `root` rather than the
+real accounts. `range-linux-web` (10.20.50.60) answers ssh with passwordless sudo. It has no chrony
+- only `systemd-timesyncd`, the Ubuntu default - which is precisely why it exposed these defects.
+
+### Defect 1 - the Reference ID was never extracted (asserted nothing, every run)
+
+`awk -F"= *" "/Reference ID/{print $2; exit}"`, but `chronyc tracking` separates with `:`. `$2` was
+always empty, so every Linux bundle from a chrony host recorded:
+
+```
+Time source     : chronyc ()
+```
+
+An empty parenthetical claiming a reference the code never read. Confirmed against real bytes from
+rick-pve - `Reference ID    : 4540E102 (cambria.bitsrc.net)` - and by mutation: the old separator
+extracts nothing from that exact line.
+
+### Defect 2 - "(no reachable peer)", a cause the code never established
+
+Whenever no numeric offset was available the step printed `is present but reported no offset (no
+reachable peer)`. Nothing in the probe determines peer reachability. It is stated unconditionally,
+so a perfectly synchronised host that simply exposes no number through this probe was reported as
+having an unreachable peer. **`systemd-timesyncd` never exposes an offset through this probe at
+all**, so on the default Ubuntu configuration this false cause was the normal output.
+
+### Defect 3 - `NTPSynchronized=no` was reported as a working time source
+
+The worst of the three for a forensic bundle. The step read the sync flag, used it only to build a
+display string, and then discarded it. A host whose clock has **never been anchored to anything**
+produced:
+
+```
+Time source     : timedatectl (NTPSynchronized=no)
+Measured offset : UNAVAILABLE - ... is present but reported no offset (no reachable peer).
+```
+
+No warning. That reads as a quiet daemon on an otherwise fine host. The truth is stronger and worse:
+every timestamp in the bundle is unanchored and the error is *unbounded*, not merely unmeasured -
+which is the difference between a timeline that can be corrected later and one that cannot.
+
+### Fix
+
+`clock_verdict` takes the sync state as a third, defaulted argument and stays pure/unit-testable.
+Three-state per the E3 lesson - `no` / `yes` / unread - and the unread case invents no cause:
+
+| sync | verdict |
+|---|---|
+| `no` | `NOT SYNCHRONISED` + timestamps `UNVERIFIED` + `WARNING` (error unbounded) |
+| `yes` | synchronised but no numeric offset; residual error bounded by the daemon, not by this measurement |
+| unread | offset unavailable and sync state `could not be read` - no cause asserted |
+
+A real measured offset still outranks the flag. The step now reads `NTPSynchronized` regardless of
+which daemon won, so the fact survives to the verdict.
+
+### Verification - both controls, live, condition asserted at measurement time
+
+Driven by extracting the **shipped** step text and the **shipped** `clock_verdict` from
+`collectors/ir-collect.sh` and running them verbatim, so this tests the artifact, not a copy.
+
+**Positive control - rick-pve, chrony, synchronised.** Live condition confirmed at measurement time
+(`Reference ID : 4540E102 (cambria.bitsrc.net)`, `System time : 0.000049317 seconds fast`):
+
+```
+Time source     : chronyc (4540E102 (cambria.bitsrc.net))
+Measured offset : 0.000049315s  (host minus reference; positive = this host is AHEAD)
+Interpretation  : this host agrees with the reference
+```
+
+Reference ID present, offset measured, agreement, and critically **no spurious warning** - the E3
+lesson that a fix must not degrade a healthy host.
+
+**True negative - range-linux-web, timesyncd, never synchronised.** Live condition confirmed at
+measurement time (`NTPSynchronized=no`, `Server: n/a`, `Packet count: 0`):
+
+```
+Time source     : timedatectl (NTPSynchronized=no)
+Measured offset : NOT SYNCHRONISED - ... has never been synchronised against a time source ...
+Interpretation  : this host's timestamps are UNVERIFIED - the clock could be off by any amount ...
+WARNING: this clock is not synchronised. Timestamps in this bundle are NOT safely comparable ...
+```
+
+Previously this host produced the fabricated-cause line and **no warning at all**.
+
+### Mutation testing
+
+Each mutation attacks the mechanism, not a threshold; the unmutated file fails nothing.
+
+| mutation | result |
+|---|---|
+| `sync=no` branch made unmatchable | 3 failures |
+| Reference ID separator reverted to `=` | 2 failures |
+| step stops passing `sync` through to `clock_verdict` | 1 failure |
+
+That last one matters most: without it the whole feature could be dead in production while every
+in-function assertion still passed.
+
+### Still not done, and why
+
+The chrony **large-offset** path is still not proven live. `range-linux-web` has no chrony, and the
+only host on the range that runs it is the Proxmox hypervisor - skewing a production hypervisor's
+clock to exercise a string parse remains a bad trade. It stays covered by real chronyc output
+shapes plus a drift guard asserting the shipped parse still matches the mirrored copy.
