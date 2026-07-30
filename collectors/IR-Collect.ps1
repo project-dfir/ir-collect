@@ -700,6 +700,60 @@ function Get-EncryptionRiskVerdict {
 # data - from a native source. Output existing is not evidence that CIM produced it.
 #
 # THREE-STATE on the probe, per the E3 lesson: an unrun probe must not read as a healthy one.
+# Get-BitLockerKeyVerdict - did bitlocker_recovery_keys.csv actually capture usable keys?
+#
+# The Linux twin taught this the expensive way. There, `dmsetup table --showkeys` was assumed to
+# yield a master key and on modern LUKS2 it yields a KEYRING POINTER instead; the collector wrote
+# the pointer under a banner promising it decrypts the evidence, and nobody found out until the
+# procedure was executed against a real volume (2026-07-29). The Windows side captures the genuine
+# article - a 48-digit recovery password - so it is NOT the same defect. But it shares the shape of
+# the mistake: the CSV row is emitted with no check that the password field is populated, so a
+# blank one produces a file that exists, has headers, has a row per protector, and contains no key.
+# An analyst reading a CSV with a MountPoint and a KeyProtectorId has every reason to believe the
+# volume is recoverable.
+#
+# A recovery password is 8 hyphen-separated groups of exactly 6 digits. Anything else is not one.
+# Being wrong toward "captured" is the expensive direction - it tells a responder the evidence can
+# be opened when it cannot - so only the exact form counts.
+#
+# Pure (no I/O) so it is unit-testable - see tests/unit/Test-BitLockerKeyVerdict.ps1.
+function Get-RecoveryPasswordShape {
+    param([string]$Password)
+    if ([string]::IsNullOrWhiteSpace($Password)) { return 'absent' }
+    if ($Password -match '^\d{6}(-\d{6}){7}$') { return 'recovery-password' }
+    'malformed'
+}
+
+function Get-BitLockerKeyVerdict {
+    param(
+        [string[]]$Rows = @(),          # CSV data rows, header already removed
+        [System.Nullable[bool]]$ScanOk  # $null = the CSV could not be read at all
+    )
+    if ($null -eq $ScanOk -or $ScanOk -eq $false) {
+        return [ordered]@{ state='unknown'; captured=0; missing=0
+            note='the recovery-key artifact could not be read at seal, so this bundle cannot say whether any key was captured. This is NOT a statement that none was.' }
+    }
+    $rows = @($Rows | Where-Object { $_ -and $_.Trim() })
+    if ($rows.Count -eq 0) {
+        return [ordered]@{ state='no-protectors'; captured=0; missing=0
+            note='no BitLocker recovery-password protectors were reported. On a host with no encrypted volume that is expected; on one with BitLocker enabled it means the protectors were not readable and NO key was captured.' }
+    }
+    $ok = 0; $bad = @()
+    foreach ($r in $rows) {
+        $f = $r -split ','
+        $pw = if ($f.Count -ge 4) { $f[3] } else { '' }
+        if ((Get-RecoveryPasswordShape $pw) -eq 'recovery-password') { $ok++ }
+        else { $bad += $(if ($f.Count -ge 1 -and $f[0]) { $f[0] } else { '?' }) }
+    }
+    if ($bad.Count -eq 0) {
+        return [ordered]@{ state='captured'; captured=$ok; missing=0
+            note="$ok recovery password(s) captured in full. These ARE the keys to the evidence - handle at the classification of the data they protect." }
+    }
+    $state = if ($ok -gt 0) { 'partial' } else { 'no-key-captured' }
+    [ordered]@{ state=$state; captured=$ok; missing=$bad.Count
+        note="$($bad.Count) protector row(s) carry NO usable recovery password (volume(s): $($bad -join ', ')). A row without a 48-digit password does not open anything - the volume may be UNRECOVERABLE from a dead-box image unless RAM was captured. Commonly the collector was not elevated enough to read the protector." }
+}
+
 function Get-CimEvidenceVerdict {
     param(
         [System.Nullable[bool]]$CimAvailable,   # $null = the probe did not run
@@ -2306,6 +2360,25 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
         $script:CimEvidence.note = $script:CimEvidence.note + ' NOTE: the fallback scan itself failed, so the list of native-sourced artifacts below is INCOMPLETE - absence from it is not evidence a step used CIM.'
     }
 
+    # Did the BitLocker capture actually get keys? Read the shipped artifact rather than trusting
+    # that the step exited 0 - the step succeeds whether or not the password field came back empty.
+    # Three outcomes, and a read failure is 'unknown', never a clean bill of health.
+    $blRows = $null; $blScanOk = $null
+    try {
+        $blCsv = Join-Path $M 'bitlocker_recovery_keys.csv'
+        if (Test-Path -LiteralPath $blCsv) {
+            $all = @(Get-Content -LiteralPath $blCsv -ErrorAction Stop)
+            $blRows = @($all | Select-Object -Skip 1)
+            $blScanOk = $true
+        } elseif ($NoKeyCapture) {
+            $blScanOk = $true; $blRows = @()      # deliberately not collected; not a failure
+        }
+    } catch { $blScanOk = $false }
+    $script:BitLockerKeys = Get-BitLockerKeyVerdict -Rows $blRows -ScanOk $blScanOk
+    if ($script:BitLockerKeys.state -in @('no-key-captured','partial')) {
+        Write-Audit "KEY CAPTURE INCOMPLETE: $($script:BitLockerKeys.note)"
+    }
+
     $rs = [ordered]@{
         schema='ir-collect/run-state@1'; tool='IR-Collect.ps1'; case=$script:CaseIdRaw; case_path_token=$script:CaseIdSafe; host=$hostName; output_dir=$OutDir
         ended_utc=$endUtc; status=$(if($verdict -eq 'COMPLETE'){'complete'}else{'partial'}); resumed=[bool]$Resume
@@ -2323,7 +2396,7 @@ $(if($NoKeyCapture){'- **Encryption keys:** NOT captured (-NoKeyCapture). An ima
             # where at least one CIM step returned data - emptiness alone never sets it.
             $sf = Get-SubsystemFailureVerdict -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
             if ($sf) { [ordered]@{ subsystem=$sf.subsystem; error_class=$sf.class; steps=$sf.steps; ladder=@($script:FixLadders[$sf.class]); inferred_from='every subsystem-backed step empty (no error was raised)' } } else { $null }
-        ); encryption_risk=$script:EncVerdict; cim_evidence=$script:CimEvidence; subsystem_probe=$(
+        ); encryption_risk=$script:EncVerdict; cim_evidence=$script:CimEvidence; bitlocker_keys=$script:BitLockerKeys; subsystem_probe=$(
             # Never a bare null: says WHICH of the three situations produced it.
             Get-SubsystemProbeState -Ran $script:CimStepsRan -Empty @($script:EmptySteps | ForEach-Object { $_.name })
         ) }
