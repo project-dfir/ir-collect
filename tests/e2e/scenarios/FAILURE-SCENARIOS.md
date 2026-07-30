@@ -2537,3 +2537,59 @@ What it cannot do, and never will without a different kind of instrument:
 The honest summary: this test proves the page does not contradict *itself*. It proves nothing about
 whether the page is right. That is a real but narrow guarantee, and it is exactly the distinction
 this project keeps having to make about its own checks.
+
+---
+
+## Is the chain-of-custody record itself sealed? (2026-07-30) — NO DEFECT
+
+`-Authorizer` / `-LegalBasis` / `-ScopeNote` (Windows) and `--authorizer` / `--legal` / `--scope`
+(Linux) are what an operator types to make a collection defensible. The question worth asking after
+the ledger defect: **if those fields land in a file the manifest does not cover, the custody record
+is unprotected** — and someone could rewrite who authorised a collection without leaving a trace.
+
+Checked live rather than by reading, because "nothing excludes that file" is an inference about an
+exclusion list, not an observation of a manifest — and that is precisely the shape of the ledger
+defect, where a file sat in the tree looking covered while its digest was worthless.
+
+```
+=== 1. do the values reach collection_info.json? ===
+  present [Det. R. Sorz, Badge 4417]        : 1
+  present [Consent - engagement 2026-118]   : 1
+  present [Single host, volatile only]      : 1
+  file is valid JSON: yes
+
+=== 2. is collection_info.json LISTED IN THE MANIFEST? ===
+  manifest entries: 42
+  collection_info.json listed: 1
+  1034652d73ca86e50ba7f115c17a61e5d8a125890184429fa9a5fd81963b898b  ./00_metadata/collection_info.json
+
+=== 3. does rewriting the authorizer get caught? ===
+  baseline                        exit=0   RESULT: VERIFIED
+  after rewriting the authorizer  exit=1   MISMATCH: 1, RESULT: FAILED
+  restored                        exit=0   RESULT: VERIFIED
+```
+
+**The custody record is sealed and tamper-evident.** The decisive assertion is the third one:
+laundering a collection's authorizer — the exact edit someone would want to make — produces a
+MISMATCH. A bundle whose custody metadata has been altered no longer verifies.
+
+Both platforms record the fields, both write them to `00_metadata/collection_info.json`, and
+neither manifest excludes that file. The state also reaches `run_state.json` and `SUMMARY.md`, so a
+reader does not have to open the raw JSON to find it.
+
+**A prediction of mine that the artifact disproved.** Before running this I had grepped the
+collectors' source for lines mentioning both "summary" and "custody", found none, and concluded the
+custody state never reaches `SUMMARY.md`. The rendered artifact mentions it four times — the
+generator simply does not put those words on the same line. A line-scoped grep over source is the
+wrong instrument for a question about output, and it produced a confident false negative. This is
+the same failure as reporting a host down from ICMP: the probe could not have found what was there.
+
+**A real asymmetry, recorded but not "fixed":** the flag names differ between platforms —
+`-LegalBasis` vs `--legal`, `-ScopeNote` vs `--scope`. That is a usability wart for anyone running
+both collectors from one runbook, not a defect in the evidence. Renaming either side would break
+existing invocations, so it stays as-is and is written down here instead.
+
+**What this does not establish:** that an operator *supplied* the fields. Both collectors warn to
+the audit trail when `-Authorizer` is absent, and that trail is itself hashed — but a bundle
+collected with empty custody fields still verifies, correctly, because nothing was tampered with.
+Whether a collection is admissible is a question about the operator's process, not about the tool.
