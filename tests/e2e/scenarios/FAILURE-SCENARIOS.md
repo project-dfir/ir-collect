@@ -2635,3 +2635,53 @@ was me, to ignore it.
 with stderr captured rather than discarded, and record the rc together with what `ls` actually
 complained about. Not a fix based on the guess above — the guess failed its first reproduction
 attempt, and a fix built on it would be a change whose effect nobody measured.
+
+---
+
+## DIAGNOSTIC-REPORT.md is Windows-only — a GAP, not a deliberate asymmetry (2026-07-30)
+
+Carried as an open question for several iterations: `DIAGNOSTIC-REPORT.md` appears 3 times in
+`IR-Collect.ps1` and 0 times in `ir-collect.sh`. Decidable by reading both collectors, so here is
+the decision.
+
+**What the Windows artifact is for**, from its own comment: *"the one file to hand to whoever fixes
+the tool… run_state.json is machine-readable and SUMMARY.md is about the EVIDENCE; neither is a
+troubleshooting artifact."* Its defining property is the next line: **"SAFE TO SHARE BY
+CONSTRUCTION: metadata only. No collected evidence, no file contents, no key material, no IOC
+values — so it can be sent to a tool maintainer without a data-handling review."**
+
+**What Linux has instead.** Everything it writes into `99_logs/`:
+
+```
+MANIFEST-README.txt  audit.frozen.log  audit.log  errors.log
+run_state.frozen.jsonl  run_state.json  run_state.jsonl
+```
+
+No diagnostic report. Its self-diagnosis exists — `SUMMARY.md` carries a Diagnostics block with
+exec mode, hash backend, unknown-step examples and self-heal actions — but it lives *inside a
+case-specific document*. And the phrases "safe to share" / "metadata only" appear **5 times in the
+Windows collector and 0 times in the Linux one**, which is the tell: the Linux side was never
+designed with a shareable-by-construction artifact in mind.
+
+**Verdict: a gap.** The consequence is concrete and asymmetric. A Windows operator who hits a tool
+bug can attach `DIAGNOSTIC-REPORT.md` to a report and be confident it carries no case data. A Linux
+operator in the same position has three bad options: send `SUMMARY.md` (contains case ID, host,
+paths), send `run_state.jsonl` (contains `error_msg` fields that can quote target filesystem paths),
+or write the report by hand from an audit log. In an engagement where the collected data is
+sensitive, that difference decides whether a bug gets reported at all.
+
+**Not built here, deliberately.** The range host has been unreachable for three iterations, and this
+project's standard is that a change of this size gets live verification rather than a static-only
+ship — the Windows ledger seal earned that treatment and turned up a `MANIFEST-README` requirement
+nothing in the code predicted. Building it blind would repeat the mistake this catalogue keeps
+recording.
+
+**What building it requires**, so the next attempt does not rediscover it:
+- the same three sources the Windows version reduces: failed/timeout rows and remediation rows from
+  the ledger, plus host and destination facts;
+- a reduction rule per field, not a copy — anything that could carry case data becomes a count or a
+  bare path, which is what makes "safe by construction" true rather than aspirational;
+- a test that asserts the *rendered* report contains no case-specific values, seeded with a
+  collection whose case ID, hostname and a planted IOC string are known, so the assertion can fail;
+- and the artifact declared in `MANIFEST-README.txt` if it is written after the manifest, or it
+  will be reported UNLISTED by the verifier — the exact trap the frozen ledger hit.
