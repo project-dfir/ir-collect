@@ -1,8 +1,8 @@
 # --- Downloaded tool payload (fetched by fetch-tools.*, NOT committed) ---
 # Third-party binaries are not redistributed here; build the kit with fetch-tools.
-kit/tools/**
-!kit/tools/README.md
-!kit/tools/.gitkeep
+collectors/tools/**
+!collectors/tools/README.md
+!collectors/tools/.gitkeep
 
 # --- Collection output / evidence (never commit real evidence) ---
 _staging/
@@ -36,3 +36,10 @@ mobile/tools/
 # python bytecode
 **/__pycache__/
 *.pyc
+
+# --- graphify knowledge-graph output (local analysis artifact, not project source) ---
+graphify-out/
+
+# --- Python bytecode cache ---
+__pycache__/
+*.py[cod]

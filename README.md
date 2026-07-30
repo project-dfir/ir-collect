@@ -20,15 +20,17 @@ collection, **[docs/RUNBOOK.md](docs/RUNBOOK.md)** before a real collection (pre
 authorization), **[docs/GAPS.md](docs/GAPS.md)** for what a single-box tool can't see (network/identity/cloud
 vantage points), **[docs/DETECTION.md](docs/DETECTION.md)** for turning a capture into Splunk ES / Security
 Onion content, and **[docs/ENTERPRISE.md](docs/ENTERPRISE.md)** for deployment at scale (signing/CLM, EDR
-deconfliction, fleet bridge). Build the tool payload once with `kit/fetch-tools.*`.
+deconfliction, fleet bridge). Build the tool payload once with `collectors/fetch-tools.*`.
 
 ### Repository layout
 ```
-kit/                                the shippable, path-coupled collector kit (archive its CONTENTS)
+collectors/                                the shippable, path-coupled collector kit (archive its CONTENTS)
   IR-Collect.ps1 / ir-collect.sh      collectors (Windows / Linux)    -- run on the compromised host
   fetch-tools.ps1 / fetch-tools.sh    one-time kit builder            -- run on a trusted box
   loader.ps1 / loader.sh              in-guest bootstrap (read-only ISO / share launch)
   tools/                              open-source payload (fetched, not committed)
+tools/verify-bundle.py              verify a RECEIVED bundle against its manifest  -- analyst box
+                                    (note: distinct from collectors/tools/, which is the payload)
 detection/Build-DetectionContent.ps1  capture -> Splunk/Sigma/Suricata/Zeek + Navigator  -- analyst box
 mobile/                             mobile forensics                  -- run on the examiner box
   mobile-collect.sh / Mobile-Collect.ps1   Android + iOS logical acquisition + MVT triage
@@ -68,8 +70,27 @@ docs/ENTERPRISE.md                  deployment at scale (signing/CLM, EDR deconf
 | **Two-stage: fast then slow** | Stage 1 (automatic) secures volatile data quickly → **VOLATILE GREEN** confirmation → Stage 2 menu for the hours-long non-volatile jobs. |
 | **Chain of custody** | UTC audit log of every command (exit code, duration, retries), SHA-256 manifest of all output, acquisition GUID, collector identity, host-clock provenance, tool hashes, sealed zip hash on ship. |
 | **Ground-truth caveat** | Live results from a compromised host can be faked by a kernel/eBPF/LD_PRELOAD rootkit. **The RAM image + a dead-box disk image are ground truth**; live enumeration is corroboration. |
+| **Keys are volatile too** | Order of volatility applies to **encryption keys**, not just data: power the box off and the volume master key is gone from kernel memory, leaving the image unreadable unless a custodian supplies a passphrase. While volumes are unlocked the collector captures them — see below. |
 
 Standards followed: **RFC 3227**, **NIST SP 800-86**, **SWGDE**, **ISO/IEC 27037**.
+
+### Volume encryption keys — captured by default
+
+| | Windows | Linux |
+|---|---|---|
+| Key material | BitLocker recovery passwords (`bitlocker_recovery_keys.csv`, machine-readable) + **key packages** for `repair-bde` | live dm-crypt **volume master keys** (`dmsetup table --showkeys`) — decrypt the image with no passphrase at all |
+| Container metadata | protector detail per volume | **LUKS header backups** — without the header even a *correct* passphrase fails, and header destruction is a known ransomware move |
+| Also | EFS certs, DPAPI master-key paths, VeraCrypt/TrueCrypt indicators | `/etc/crypttab` + keyfile inventory, kernel keyring (fscrypt/eCryptfs) |
+
+Everything lands in `00_metadata/`, alongside **`DECRYPTION-KEYS.md`** — what was captured plus the
+actual verified commands to apply it months later (`--volume-key-file`, `dmsetup` mapping with the
+sector offset, `luksHeaderRestore`, `manage-bde`/`dislocker`, `repair-bde`), and the
+RAM-recovery route if no key was captured.
+
+> **These outputs are the keys to the evidence.** Anyone holding the bundle can decrypt the imaged
+> volumes, so store and transfer it at the classification of the data it protects and record its
+> custody. The SUMMARY carries a handling banner to that effect. Where extracting key material is
+> outside the engagement's authority, pass **`-NoKeyCapture`** / **`--no-keys`**.
 
 ---
 
@@ -99,29 +120,29 @@ the **RAM image + a dead-box disk image are ground truth**; live enumeration cor
 ### Windows
 ```powershell
 # to an external drive, interactive menu for the slow jobs
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
 
 # fully unattended - rapid volatile + ALL heavy jobs, no prompts
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -Auto
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest E:\evidence -Auto
 
 # volatile only (fastest), then seal
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -RapidOnly
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest E:\evidence -RapidOnly
 
 # ship to a network collector at an IP (stages locally, zips+hashes, SMB copy)
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
 
 # TRAINING / range mode: mark EXERCISE, VM-aware, POST the bundle to a lab collector (see docs/RANGE.md)
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
 ```
 Run **as Administrator**. Key switches: `-Auto`, `-RapidOnly`, `-SkipAD`, `-DeferMemory`, `-Lab`, `-StepTimeoutSec N`, `-Share <name>`, `-Cred`. `-Dest` accepts a drive path, `\\host\share`, a bare IP, or `http(s)://collector/`.
 
 ### Linux
 ```bash
-sudo ./kit/ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + menu
-sudo ./kit/ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
-sudo ./kit/ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
-sudo ./kit/ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
-sudo ./kit/ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
+sudo ./collectors/ir-collect.sh -d /mnt/evidence -c CASE001          # external drive + menu
+sudo ./collectors/ir-collect.sh -d /mnt/usb --auto                   # unattended, all jobs
+sudo ./collectors/ir-collect.sh -d /mnt/usb --rapid-only             # volatile only
+sudo ./collectors/ir-collect.sh -d user@10.0.0.5:/evidence -c C1     # ship over ssh (rsync/scp)
+sudo ./collectors/ir-collect.sh --lab --auto -d http://collector:8000/  # TRAINING/range: mark EXERCISE, HTTP POST (docs/RANGE.md)
 ```
 
 ### Mobile (Android / iPhone) - runs on the EXAMINER box with the device on USB
@@ -147,8 +168,8 @@ only detects what's already in `tools/`. Build the kit **once on a trusted works
 included one-time builder, then carry the drive:
 
 ```
-powershell -ExecutionPolicy Bypass -File .\kit\fetch-tools.ps1     # Windows payload -> tools\
-bash ./kit/fetch-tools.sh                                          # Linux payload  -> tools/bin\
+powershell -ExecutionPolicy Bypass -File .\collectors\fetch-tools.ps1     # Windows payload -> tools\
+bash ./collectors/fetch-tools.sh                                          # Linux payload  -> tools/bin\
 ```
 
 These pull **open-source, license-free, professionally-proven** tools from their **official GitHub
@@ -198,6 +219,60 @@ KAPE, FTK Imager, Magnet RAM. **Python** tools install on your *analysis* box vi
   99_logs/         audit.log (every command, UTC, exit code, duration), errors.log, MANIFEST-SHA256
   SUMMARY.md
 ```
+
+### Reading the verdict — `99_logs/run_state.json`
+
+The bundle's machine-readable answer to *"can I trust this collection, and what do I do next?"*
+Beyond `completeness.verdict` and the step counts, `diagnostics` carries findings that a responder
+should read **before acting on the evidence or on the host**:
+
+| field | says |
+|---|---|
+| `encryption_risk` | **`encrypted-no-ram`** — the disk is encrypted and RAM was not captured: the volume key exists only in memory that is about to be lost. **`unknown-no-ram`** — the encryption probe could not answer *and* RAM was not captured; this is **not** a claim the disk is encrypted, it is a refusal to assume it is not. **`ok`** — either nothing encrypted, or RAM was captured so the key is in the bundle. Anything but `ok` means **do not power the host off** until a recovery key is in hand. |
+| `cim_evidence` | whether CIM/WMI actually produced this evidence. `cim-unavailable` with `fallback_steps` listed means those artifacts came from **native sources**, not WMI — the content is equivalent, the provenance is not, and a host whose WMI was dead during collection is itself a finding. |
+| `subsystem_probe` | three-state census behind `subsystem_failure`: `not-answering` / `answered` / `insufficient-evidence`. The last one means the bundle says nothing either way — it is not a clean bill of health. |
+| `by_error_class` | which failure classes were assigned, with a sample. Empty on a healthy run. Note that several conditions are handled *before* a class could be assigned (a refused destination, a transparent in-process fallback), so an empty map does not mean nothing went wrong — read `ship`, `exec_mode` and the verdict too. |
+| `ship` | `preflight_ok`, `preflight_reason`, and whether the transfer succeeded. A failed ship leaves the **collection intact locally** and exits ≥ 10; `<bundle>.ship.json` beside the archive is the machine-readable record, written outside the sealed container so the manifest stays valid. |
+
+`SUMMARY.md` carries the same findings in prose, and `99_logs/DIAGNOSTIC-REPORT.md` explains what
+failed, what self-heal attempted, and how to reproduce it.
+
+
+---
+
+### Verifying a bundle you received
+
+Do this **before** you analyse anything. A manifest nobody checks is a claim, not evidence.
+
+```
+python tools/verify-bundle.py /path/to/CASE001_HOST_20260730_051500Z
+```
+
+It needs only Python 3 — no dependencies, and deliberately **not** the collector's own hashing
+code. A verifier built from the code that produced the digests can only show that code is
+self-consistent, which is not the question you are asking.
+
+Exit `0` verified · `1` verification FAILED · `2` could not verify (say so; do not record a pass).
+
+| Result | What it means | What to do |
+|---|---|---|
+| `MISMATCH` | a listed file's content changed since sealing | Stop. Note it in the custody record before anything else. |
+| `MISSING` | the manifest lists a file that is not present | Usually an incomplete transfer — re-copy from source and re-verify. |
+| `UNLISTED` | a file is present that the manifest does not list **and** the bundle does not declare as excluded | The one a hash check alone never catches: every listed file still matches while something was *added*. |
+| `custody trail` | `99_logs/audit.frozen.log` and `99_logs/run_state.frozen.jsonl`, hashed separately | These are the record of what the collector did. Treat a mismatch here as seriously as one in the evidence. |
+
+Legitimately-unlisted files (the live `audit.log`, the manifest itself, and a few others) are read
+from the bundle's own `99_logs/MANIFEST-README.txt` — the tool never carries its own copy of that
+list, so the two cannot drift apart. If that note is missing or unreadable the tool exits `2`
+rather than guessing, because an unlisted file whose status cannot be established is exactly what
+tampering looks like.
+
+**The limit, stated plainly.** The manifest cannot cover itself — nothing can hash itself — so
+anyone able to alter a file can recompute the manifest to match. This detects damage, truncation,
+partial transfer and casual tampering. It does **not** prove authenticity. For that you need a
+signature over the manifest, or its digest recorded out-of-band at collection time and carried
+separately from the bundle. Record that digest when you take custody; it costs one line and it is
+the only thing that closes this gap.
 
 ---
 

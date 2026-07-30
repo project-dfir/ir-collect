@@ -130,7 +130,7 @@ RUSER=irlab; RSUDO="sudo "; RPREP=""
 if [ "$DISTRO" = freebsd ]; then RUSER=root; RSUDO=""; RPREP="env ASSUME_ALWAYS_YES=yes pkg install -y bash >/dev/null 2>&1; "; fi
 # ---- 4) UNIVERSAL channel: scp kit in, run, scp bundle out -------------------------
 log "pushing collector + running (scenario $SCEN) ..."
-scp -i "$KEY" $SSHO "$LAB/kit/ir-collect.sh" $RUSER@"$G":/tmp/ir-collect.sh >/dev/null 2>&1 \
+scp -i "$KEY" $SSHO "$LAB/collectors/ir-collect.sh" $RUSER@"$G":/tmp/ir-collect.sh >/dev/null 2>&1 \
   || { log "FAIL: scp kit in"; exit 1; }
 EXITCODE="$(ssh -i "$KEY" $SSHO $RUSER@"$G" \
   "${RPREP}${RSUDO}bash /tmp/ir-collect.sh --rapid-only --scenario $SCEN --host-role server -c VME2E -d /tmp/vmout </dev/null >/tmp/collector.log 2>&1; rc=\$?; ${RSUDO}chmod -R a+rX /tmp/vmout /tmp/collector.log 2>/dev/null; echo \$rc" \
