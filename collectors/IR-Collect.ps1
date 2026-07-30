@@ -2646,7 +2646,9 @@ Deliberately NOT listed, and why:
                                 hashed separately into MANIFEST-audit-log.sha256
   99_logs/run_state.jsonl       the completion ledger, appended to by seal's own steps, so any
                                 digest taken during the manifest is stale before the bundle closes
-  MANIFEST-audit-log.sha256     created after the manifest; holds the hash above
+  99_logs/run_state.frozen.jsonl  created after the manifest - a frozen snapshot of the ledger,
+                                hashed into MANIFEST-audit-log.sha256 alongside the audit trail
+  MANIFEST-audit-log.sha256     created after the manifest; holds the hashes above (one per line)
 
 Anything else absent from the manifest was NOT excluded by design - treat it as unexplained.
 "@
@@ -2664,6 +2666,28 @@ Anything else absent from the manifest was NOT excluded by design - treat it as 
         [IO.File]::WriteAllText((Join-Path $OutDir 'MANIFEST-audit-log.sha256'), "$ah  99_logs/audit.frozen.log`n", (New-Object Text.UTF8Encoding($false)))
         Write-Audit "Custody trail frozen + hashed: $ah"
     } catch { Write-Audit "Could not freeze/hash audit.log: $($_.Exception.Message)" }
+
+    # Same treatment for the COMPLETION LEDGER, and for the same reason.
+    #
+    # run_state.jsonl is excluded from the manifest above because seal's own steps append to it, so
+    # any digest taken during the manifest is stale before the bundle closes. Excluding it was only
+    # half the fix: it left the record of what the collector actually did with NO integrity seal at
+    # all, so an analyst could not detect modification of it. Linux had already been given both
+    # halves; this side had only the exclusion, and the asymmetry was found by verifying a real
+    # Windows bundle rather than by reading either script.
+    #
+    # Appended as a second line - MANIFEST-audit-log.sha256 is one entry per line, and the verifier
+    # reads it that way.
+    try {
+        $rsLive = Join-Path $L 'run_state.jsonl'
+        if (Test-Path -LiteralPath $rsLive) {
+            $rsFrozen = Join-Path $L 'run_state.frozen.jsonl'
+            Copy-Item -LiteralPath $rsLive -Destination $rsFrozen -Force -ErrorAction Stop
+            $rh = Get-IRSha256 $rsFrozen
+            [IO.File]::AppendAllText((Join-Path $OutDir 'MANIFEST-audit-log.sha256'), "$rh  99_logs/run_state.frozen.jsonl`n", (New-Object Text.UTF8Encoding($false)))
+            Write-Audit "Completion ledger frozen + hashed: $rh"
+        } else { Write-Audit 'Completion ledger absent at seal - nothing to freeze.' }
+    } catch { Write-Audit "Could not freeze/hash run_state.jsonl: $($_.Exception.Message)" }
 
     # --- ship the sealed bundle: SMB/UNC share and/or HTTP(S) POST to a lab collector ---
     if ($NetworkDest -or $HttpDest) {
