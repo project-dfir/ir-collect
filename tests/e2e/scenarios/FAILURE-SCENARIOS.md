@@ -13,6 +13,102 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 
 ---
 
+## Finding your way around this page
+
+56 sections, appended one investigation at a time. This index is GENERATED from the
+headings (`tests/tools/build-catalogue-index.py`) and its anchors are checked in CI, because a
+hand-maintained index drifts and a stale index is worse than none - it sends a reader
+somewhere wrong while looking authoritative.
+
+**Start here**
+
+- [Verify the condition is actually in flight before acting](#verify-the-condition-is-actually-in-flight-before-acting)
+- [Testing hygiene — do not run this on your own workstation](#testing-hygiene-do-not-run-this-on-your-own-workstation)
+- [How to run one](#how-to-run-one)
+
+**Scenario families**
+
+- [A. Host lockdown (the hardened-endpoint family)](#a-host-lockdown-the-hardened-endpoint-family)
+- [B. Destination](#b-destination)
+- [C. Process lifetime](#c-process-lifetime)
+- [D. Data-shape surprises](#d-data-shape-surprises)
+- [E. Platform / environment](#e-platform-environment)
+
+**Closed scenarios**
+
+- [A3 - not elevated (CLOSED 2026-07-28)](#a3---not-elevated-closed-2026-07-28)
+- [A5 - AV quarantines a carried tool (CLOSED 2026-07-28)](#a5---av-quarantines-a-carried-tool-closed-2026-07-28)
+- [B6 - MAX_PATH exceeded (CLOSED 2026-07-28)](#b6---max_path-exceeded-closed-2026-07-28)
+- [B5 - UNC auth failure (CLOSED 2026-07-28)](#b5---unc-auth-failure-closed-2026-07-28)
+- [B4 - network destination dies mid-ship (CLOSED 2026-07-28)](#b4---network-destination-dies-mid-ship-closed-2026-07-28)
+- [B3 - destination yanked mid-run (CLOSED 2026-07-28, Linux)](#b3---destination-yanked-mid-run-closed-2026-07-28-linux)
+- [B3 half (a) - Windows yanked destination: NOT SCORED, but it found something worse](#b3-half-a---windows-yanked-destination-not-scored-but-it-found-something-worse)
+- [A6 - execution policy AllSigned (CLOSED 2026-07-29)](#a6---execution-policy-allsigned-closed-2026-07-29)
+- [C4 - no TTY / fully detached (CLOSED 2026-07-29)](#c4---no-tty-fully-detached-closed-2026-07-29)
+- [E4 - clock skew (CLOSED 2026-07-29)](#e4---clock-skew-closed-2026-07-29)
+- [E3 - domain unreachable (CLOSED 2026-07-29)](#e3---domain-unreachable-closed-2026-07-29)
+- [E5 - PowerShell 2.0 (CLOSED 2026-07-29)](#e5---powershell-20-closed-2026-07-29)
+- [E4 Linux, second pass - the clock evidence a synchronised-looking host actually carries (CLOSED 2026-07-29)](#e4-linux-second-pass---the-clock-evidence-a-synchronised-looking-host-actually-carries-closed-2026-07-29)
+- [E1 follow-up - the fix ladder no condition could ever select (2026-07-29)](#e1-follow-up---the-fix-ladder-no-condition-could-ever-select-2026-07-29)
+- [E1 negative control - INVALID as designed, but it found two real defects (2026-07-29)](#e1-negative-control---invalid-as-designed-but-it-found-two-real-defects-2026-07-29)
+- [D5 CLOSED - the encrypted code path finally exercised, both controls (2026-07-29)](#d5-closed---the-encrypted-code-path-finally-exercised-both-controls-2026-07-29)
+- [C4 follow-up: the 270s was never the detached launch (2026-07-29)](#c4-follow-up-the-270s-was-never-the-detached-launch-2026-07-29)
+- [A1 preparation: escape hatch proven, and the real risk located (2026-07-29)](#a1-preparation-escape-hatch-proven-and-the-real-risk-located-2026-07-29)
+
+**The signature defect: two-state where it must be three**
+
+- [Audit: swallowed failures across the Windows collector (2026-07-29)](#audit-swallowed-failures-across-the-windows-collector-2026-07-29)
+- [Encryption risk was two-state, and being wrong destroys the evidence (FIXED 2026-07-29)](#encryption-risk-was-two-state-and-being-wrong-destroys-the-evidence-fixed-2026-07-29)
+- [Linux parity - the LUKS gate had the same two-state collapse (FIXED 2026-07-29)](#linux-parity---the-luks-gate-had-the-same-two-state-collapse-fixed-2026-07-29)
+- [Audit: how widespread is the signature defect, actually? (2026-07-29)](#audit-how-widespread-is-the-signature-defect-actually-2026-07-29)
+- [The Linux collector is clean of the signature shape - and the first detector that said so was lying (2026-07-29)](#the-linux-collector-is-clean-of-the-signature-shape---and-the-first-detector-that-said-so-was-lying-2026-07-29)
+- [The safe-default guard is now in CI, and its calibration is inside it (2026-07-29)](#the-safe-default-guard-is-now-in-ci-and-its-calibration-is-inside-it-2026-07-29)
+- [The Windows safe-default guard, with a justified baseline (2026-07-29)](#the-windows-safe-default-guard-with-a-justified-baseline-2026-07-29)
+
+**Encryption, keys and the evidence they unlock**
+
+- [Encryption-risk live control - ATTEMPT INVALID (2026-07-29)](#encryption-risk-live-control---attempt-invalid-2026-07-29)
+- [Encryption risk - LIVE VERIFIED, both controls (2026-07-29)](#encryption-risk---live-verified-both-controls-2026-07-29)
+- [Running the recovery procedure - the master-key capture captures a pointer (2026-07-29)](#running-the-recovery-procedure---the-master-key-capture-captures-a-pointer-2026-07-29)
+- [Linux `unknown` encryption control - INVALID, defeated by the collector's own PATH hardening (2026-07-29)](#linux-unknown-encryption-control---invalid-defeated-by-the-collectors-own-path-hardening-2026-07-29)
+
+**Error-class reachability and the fix ladders**
+
+- [Error-class reachability: the static approach does not work, and the calibration proved it (2026-07-29)](#error-class-reachability-the-static-approach-does-not-work-and-the-calibration-proved-it-2026-07-29)
+- [Error-class reachability, by runtime evidence this time (2026-07-29)](#error-class-reachability-by-runtime-evidence-this-time-2026-07-29)
+- [Error-class reachability: the complete map, and what it means for the ladders (2026-07-29)](#error-class-reachability-the-complete-map-and-what-it-means-for-the-ladders-2026-07-29)
+- [The reachability map, recorded where it will be read (2026-07-29)](#the-reachability-map-recorded-where-it-will-be-read-2026-07-29)
+
+**Bundle verification, custody and sealing**
+
+- [Verifying a bundle from the receiving end — the phase that found two real defects (2026-07-30)](#verifying-a-bundle-from-the-receiving-end-the-phase-that-found-two-real-defects-2026-07-30)
+- [What `test-catalogue-consistency.sh` structurally cannot check (2026-07-30)](#what-test-catalogue-consistencysh-structurally-cannot-check-2026-07-30)
+- [Is the chain-of-custody record itself sealed? (2026-07-30) — NO DEFECT](#is-the-chain-of-custody-record-itself-sealed-2026-07-30-no-defect)
+
+**Open questions and named gaps**
+
+- [proc-exe fails rc=2 on every Linux run — narrowed, NOT solved (2026-07-30)](#proc-exe-fails-rc2-on-every-linux-run-narrowed-not-solved-2026-07-30)
+- [DIAGNOSTIC-REPORT.md is Windows-only — a GAP, not a deliberate asymmetry (2026-07-30)](#diagnostic-reportmd-is-windows-only-a-gap-not-a-deliberate-asymmetry-2026-07-30)
+
+**When the instrument was the broken part**
+
+- [Audit-trail-order sweep (2026-07-28)](#audit-trail-order-sweep-2026-07-28)
+- [Audit pass over this page (2026-07-29)](#audit-pass-over-this-page-2026-07-29)
+- [Audit: the status cross-check is now a test, not a habit (2026-07-29)](#audit-the-status-cross-check-is-now-a-test-not-a-habit-2026-07-29)
+- [Audit: a stale code citation, and a check withdrawn for crying wolf (2026-07-29)](#audit-a-stale-code-citation-and-a-check-withdrawn-for-crying-wolf-2026-07-29)
+- [Audit: the tool grew five machine-readable findings and told nobody (2026-07-29)](#audit-the-tool-grew-five-machine-readable-findings-and-told-nobody-2026-07-29)
+
+**Other investigations**
+
+- [Linux ship parity (2026-07-28)](#linux-ship-parity-2026-07-28)
+- [Exit-contract audit (2026-07-28)](#exit-contract-audit-2026-07-28)
+- [Linux parity for E4 - clock offset measurement (2026-07-29)](#linux-parity-for-e4---clock-offset-measurement-2026-07-29)
+- [Defect A CLOSED - a WMI outage now reaches the verdict layer (2026-07-29)](#defect-a-closed---a-wmi-outage-now-reaches-the-verdict-layer-2026-07-29)
+- [SUMMARY hoist confirmed live, and the sweep finds the worst defect yet (2026-07-29)](#summary-hoist-confirmed-live-and-the-sweep-finds-the-worst-defect-yet-2026-07-29)
+
+
+---
+
 ## A. Host lockdown (the hardened-endpoint family)
 
 | # | Scenario | Reproduce on a range VM | Correct behaviour | Status |

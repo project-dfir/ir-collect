@@ -109,6 +109,41 @@ check "$([ "$INV" -ge 3 ] && echo 1 || echo 0)" "invalid-control records are sti
 # tagged with its file and line), rather than a heuristic guessing which nearby backtick refers to
 # the cited line. Until the page carries that, citation drift is caught by hand.
 
+# --- 7. every in-page anchor link must resolve to a real heading -------------------------------
+# The page carries a generated navigation index (tests/tools/build-catalogue-index.py). An index
+# that points at sections which no longer exist is worse than no index: it sends a reader
+# somewhere wrong while looking authoritative, which is the same failure as the drifted code
+# citation this page already records. The index is generated, so this asserts the page and the
+# generator agree - and it must also fail when a section is RENAMED without regenerating.
+if [ -n "$PY_BIN" ]; then
+    "$PY_BIN" - "$DOC" <<'PYEOF' > /tmp/anchors.$$ 2>&1
+import io, re, sys
+s = io.open(sys.argv[1], encoding='utf-8').read()
+
+def anchor(t):
+    a = t.strip().lower().replace('`', '')
+    a = re.sub(r'[^\w\s-]', '', a, flags=re.UNICODE)
+    return re.sub(r'\s+', '-', a.strip())
+
+heads = {anchor(l[3:]) for l in s.split('\n') if l.startswith('## ')}
+links = re.findall(r'\]\(#([^)]+)\)', s)
+missing = sorted({l for l in links if l not in heads})
+print('LINKS %d' % len(links))
+print('MISSING %d' % len(missing))
+for m in missing[:10]:
+    print('  BROKEN %s' % m)
+PYEOF
+    LINKS=$(awk '/^LINKS /{print $2}' /tmp/anchors.$$)
+    MISS=$(awk '/^MISSING /{print $2}' /tmp/anchors.$$)
+    rm -f /tmp/anchors.$$
+    check "$([ "${LINKS:-0}" -ge 20 ] && echo 1 || echo 0)" \
+          "the page carries a navigation index (${LINKS:-0} anchor links, expect >=20)"
+    check "$([ "${MISS:-1}" -eq 0 ] && echo 1 || echo 0)" \
+          "every anchor link resolves to a real heading (${MISS:-?} broken)"
+else
+    echo "ok    anchor check SKIPPED - no python (reported, not silently passed)"
+fi
+
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)
