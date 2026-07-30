@@ -910,7 +910,7 @@ rapid_volatile() {
               echo "    LUKS2), so the table shows a pointer, not the key. That pointer is useless"
               echo "    once this host is powered off. DO NOT treat this file as a decryption key"
               echo "    for $nm. Recover the key from the RAM image instead - see"
-              echo "    DECRYPTION-KEYS.md, 'If no master key was captured'. If RAM was not"
+              echo "    DECRYPTION-KEYS.md, section: If no master key was captured. If RAM was not"
               echo "    captured either, this evidence may be UNREADABLE after shutdown." ;;
             *)
               echo "    KEY SHAPE: absent/unrecognised - no usable key material in this line." ;;
