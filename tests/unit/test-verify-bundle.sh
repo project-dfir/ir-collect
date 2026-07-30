@@ -76,9 +76,16 @@ MRE
         local rel="${f#./}"
         local d; d="$(hash_of "$B/$rel")"
         if [ "$KIND" = csv ]; then
-            printf '%s,%s,%s\n' "$d" "$(wc -c <"$B/$rel" | tr -d ' ')" "$rel" >> "$MF"
+            # THE WINDOWS SPELLING, verbatim: backslash separators AND a LEADING backslash, e.g.
+            # \00_metadata\bitlocker_keys.txt. The first version of this fixture used the Linux
+            # form, the verifier passed all 27 assertions, and then reported every file in a real
+            # Windows bundle as MISSING - os.path.join treats '/00_metadata/x' as absolute and
+            # discards the bundle root. The fixture has to spell paths the way the collector does,
+            # or it only tests the assumptions the code was written with.
+            win=$(printf '%s' "$rel" | tr '/' '\\')
+            printf '%s,%s,\\%s\n' "$d" "$(wc -c <"$B/$rel" | tr -d ' ')" "$win" >> "$MF"
         else
-            printf '%s  %s\n' "$d" "$rel" >> "$MF"
+            printf '%s  ./%s\n' "$d" "$rel" >> "$MF"
         fi
     done
     # frozen custody trail, hashed separately - exactly as the collectors do it
@@ -95,6 +102,16 @@ for KIND in csv txt; do
     # --- 0. a clean bundle must VERIFY, or every failure below proves nothing ----------------
     build_bundle "$B" "$KIND"
     rc=$(run_verify "$B")
+    # Prove the fixture really is in the dialect it claims, or "it verified" says nothing about
+    # whether that dialect is handled. This is the assertion whose absence let the path bug ship.
+    if [ "$KIND" = csv ]; then
+        if grep -q '^[0-9a-f]*,[0-9]*,\\' "$B/99_logs/MANIFEST-SHA256.csv"; then
+            printf 'ok    %s\n' "[csv] the fixture uses the real Windows path spelling (leading backslash)"
+        else
+            printf 'FAIL  %s\n' "[csv] fixture is NOT in the Windows dialect - the test below proves nothing"
+            FAIL=$((FAIL+1))
+        fi
+    fi
     check "$([ "$rc" = 0 ] && echo 1 || echo 0)" "[$KIND] an untampered bundle VERIFIES (exit $rc)"
     if [ "$rc" != 0 ]; then
         echo "      the baseline does not verify, so the tamper controls below are meaningless:"

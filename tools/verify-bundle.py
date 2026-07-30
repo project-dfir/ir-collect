@@ -50,6 +50,22 @@ def norm(p):
     return p.lower()
 
 
+def to_fs(rel):
+    """Manifest path -> a path that can be joined onto the bundle root.
+
+    The two collectors disagree about the leading separator: Linux writes './00_metadata/x' and
+    Windows writes '\\00_metadata\\x'. Translating the Windows form naively gives '/00_metadata/x',
+    which os.path.join treats as ABSOLUTE and silently discards the bundle root - so every lookup
+    landed at the filesystem root and every file in a real Windows bundle was reported MISSING.
+    A verifier that cries tampering over a path-separator convention is worse than useless, so
+    strip the leading separators before joining rather than trusting the manifest's spelling.
+    """
+    r = rel.replace('\\', '/').lstrip('/')
+    while r.startswith('./'):
+        r = r[2:]
+    return r.replace('/', os.sep)
+
+
 def parse_exclusions(root):
     """Read the bundle's own statement of what it deliberately left out."""
     note = os.path.join(root, '99_logs', 'MANIFEST-README.txt')
@@ -147,7 +163,7 @@ def main(argv):
 
     ok, mismatch, missing, unreadable = 0, [], [], []
     for key, (digest, rel) in sorted(entries.items()):
-        full = os.path.join(root, rel.replace('\\', os.sep).replace('/', os.sep))
+        full = os.path.join(root, to_fs(rel))
         if not os.path.isfile(full):
             missing.append(rel)
             continue
@@ -199,7 +215,7 @@ def main(argv):
             for line in lines:
                 want, rel = line.split(None, 1)
                 rel = rel.strip()
-                target = os.path.join(root, rel.replace('/', os.sep))
+                target = os.path.join(root, to_fs(rel))
                 if not os.path.isfile(target):
                     print("custody trail : MISSING - %s is named by MANIFEST-audit-log.sha256 but absent" % rel)
                     audit_bad = True
