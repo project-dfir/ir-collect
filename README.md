@@ -120,19 +120,19 @@ the **RAM image + a dead-box disk image are ground truth**; live enumeration cor
 ### Windows
 ```powershell
 # to an external drive, interactive menu for the slow jobs
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest E:\evidence -CaseId CASE001
 
 # fully unattended - rapid volatile + ALL heavy jobs, no prompts
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -Auto
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest E:\evidence -Auto
 
 # volatile only (fastest), then seal
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest E:\evidence -RapidOnly
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest E:\evidence -RapidOnly
 
 # ship to a network collector at an IP (stages locally, zips+hashes, SMB copy)
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Dest 10.0.0.5 -Share evidence -CaseId C1
 
 # TRAINING / range mode: mark EXERCISE, VM-aware, POST the bundle to a lab collector (see docs/RANGE.md)
-powershell -ExecutionPolicy Bypass -File .\kit\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
+powershell -ExecutionPolicy Bypass -File .\collectors\IR-Collect.ps1 -Lab -Auto -Dest http://collector:8000/
 ```
 Run **as Administrator**. Key switches: `-Auto`, `-RapidOnly`, `-SkipAD`, `-DeferMemory`, `-Lab`, `-StepTimeoutSec N`, `-Share <name>`, `-Cred`. `-Dest` accepts a drive path, `\\host\share`, a bare IP, or `http(s)://collector/`.
 
@@ -168,7 +168,7 @@ only detects what's already in `tools/`. Build the kit **once on a trusted works
 included one-time builder, then carry the drive:
 
 ```
-powershell -ExecutionPolicy Bypass -File .\kit\fetch-tools.ps1     # Windows payload -> tools\
+powershell -ExecutionPolicy Bypass -File .\collectors\fetch-tools.ps1     # Windows payload -> tools\
 bash ./collectors/fetch-tools.sh                                          # Linux payload  -> tools/bin\
 ```
 

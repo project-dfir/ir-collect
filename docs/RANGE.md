@@ -80,7 +80,7 @@ orchestrator can choose the matching `deploy-*` helper. The collector records th
 
 When the kit is on a read-only ISO or a share and you just want to launch it from inside the guest:
 ```
-D:\kit\loader.ps1 -Auto -CaseId EXERCISE1          # Windows
+D:\collectors\loader.ps1 -Auto -CaseId EXERCISE1          # Windows
 /mnt/cdrom/collectors/loader.sh --auto -c EXERCISE1       # Linux
 ```
 It finds the collector next to itself, resolves a writable output (evidence disk → `$IR_OUT` → default),
