@@ -187,20 +187,27 @@ def main(argv):
     # the separately-hashed custody trail
     aud = os.path.join(root, 'MANIFEST-audit-log.sha256')
     audit_bad = False
+    # One entry per line: the audit trail, and the completion ledger beside it. Both are frozen
+    # after the manifest runs, because both are still being appended to while it runs.
     if os.path.isfile(aud):
         try:
             with open(aud, 'r', encoding='utf-8', errors='replace') as fh:
-                line = fh.read().strip()
-            want, rel = line.split(None, 1)
-            target = os.path.join(root, rel.strip().replace('/', os.sep))
-            if os.path.isfile(target):
-                got = sha256(target)
-                good = got.lower() == want.lower()
-                print("custody trail : %s (%s)" % ("VERIFIED" if good else "MISMATCH", rel.strip()))
-                audit_bad = not good
-            else:
-                print("custody trail : MISSING - %s is named by MANIFEST-audit-log.sha256 but absent" % rel.strip())
+                lines = [l.strip() for l in fh if l.strip()]
+            if not lines:
+                print("custody trail : UNCHECKED - MANIFEST-audit-log.sha256 is empty")
                 audit_bad = True
+            for line in lines:
+                want, rel = line.split(None, 1)
+                rel = rel.strip()
+                target = os.path.join(root, rel.replace('/', os.sep))
+                if not os.path.isfile(target):
+                    print("custody trail : MISSING - %s is named by MANIFEST-audit-log.sha256 but absent" % rel)
+                    audit_bad = True
+                    continue
+                good = sha256(target).lower() == want.lower()
+                print("custody trail : %s (%s)" % ("VERIFIED" if good else "MISMATCH", rel))
+                if not good:
+                    audit_bad = True
         except (OSError, ValueError) as e:
             print("custody trail : UNCHECKED - MANIFEST-audit-log.sha256 is unreadable or malformed (%s)" % e)
             audit_bad = True

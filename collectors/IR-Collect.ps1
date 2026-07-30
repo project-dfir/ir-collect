@@ -2216,7 +2216,7 @@ function New-ManifestScript {
     param([Parameter(Mandatory)][string]$Dir)
     $script:HashShimText + @"
 Get-ChildItem '$Dir' -Recurse -File -Force -ErrorAction SilentlyContinue |
-  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256\.csv$' -and `$_.FullName -notmatch '99_logs\\(audit|errors)\.log$' } |
+  Where-Object { `$_.FullName -notmatch 'MANIFEST-SHA256\.csv$' -and `$_.FullName -notmatch '99_logs\\(audit|errors)\.log$' -and `$_.FullName -notmatch '99_logs\\run_state\.jsonl$' } |
   ForEach-Object { try { `$h=Get-IRSha256 `$_.FullName } catch { `$h='ERR' }
     '{0},{1},{2}' -f `$h, `$_.Length, `$_.FullName.Replace('$Dir','') }
 "@
@@ -2644,6 +2644,8 @@ Deliberately NOT listed, and why:
   99_logs/errors.log            same
   99_logs/audit.frozen.log      created after the manifest - a frozen snapshot of audit.log,
                                 hashed separately into MANIFEST-audit-log.sha256
+  99_logs/run_state.jsonl       the completion ledger, appended to by seal's own steps, so any
+                                digest taken during the manifest is stale before the bundle closes
   MANIFEST-audit-log.sha256     created after the manifest; holds the hash above
 
 Anything else absent from the manifest was NOT excluded by design - treat it as unexplained.

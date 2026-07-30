@@ -1512,15 +1512,31 @@ Deliberately NOT listed, and why:
   99_logs/errors.log            same
   99_logs/audit.frozen.log      created after the manifest - a frozen snapshot of audit.log,
                                 hashed separately into MANIFEST-audit-log.sha256
-  MANIFEST-audit-log.sha256     created after the manifest; holds the hash above
+  99_logs/run_state.jsonl       the completion ledger, appended to by seal's own steps
+                                (manifest and ship both write records), so any digest taken
+                                during the manifest is stale before the bundle closes
+  99_logs/run_state.frozen.jsonl  created after the manifest - a frozen snapshot of the ledger,
+                                hashed into MANIFEST-audit-log.sha256 alongside the audit trail
+  MANIFEST-audit-log.sha256     created after the manifest; holds the hashes above (one per line)
 
 Anything else absent from the manifest was NOT excluded by design - treat it as unexplained.
 MREOF
   # manifest LAST so it covers SUMMARY.md
-  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' ! -path './99_logs/audit.frozen.log' -print | while IFS= read -r f; do printf '%s  %s\n' \"\$(irhash \"\$f\" 2>/dev/null || echo ERR)\" \"\$f\"; done"
+  run_sh manifest MANIFEST-SHA256.txt "$D_LOG" 1800 0 "cd '$OUTDIR' && find . -type f ! -name 'MANIFEST-SHA256.txt' ! -path './99_logs/audit.log' ! -path './99_logs/errors.log' ! -path './99_logs/audit.frozen.log' ! -path './99_logs/run_state.jsonl' -print | while IFS= read -r f; do printf '%s  %s\n' \"\$(irhash \"\$f\" 2>/dev/null || echo ERR)\" \"\$f\"; done"
   # freeze + hash the custody trail itself (excluded above because it is still being written)
+  #
+  # run_state.jsonl belongs in that same exclusion and was missing from it until 2026-07-30, when
+  # the first independent verification of a REAL bundle failed on exactly this file. The ledger is
+  # appended to by seal's OWN steps - manifest and ship both write records - so hashing it during
+  # the manifest guarantees the digest is stale before the bundle is even closed. Every Linux
+  # bundle failed its own manifest out of the box. That is the cries-wolf failure in the worst
+  # possible place: a check that always fails gets ignored, and then a real tamper is ignored too.
+  #
+  # Excluding it alone would leave the ledger unprotected, so it gets the audit.log treatment -
+  # frozen after the writing stops, and hashed into MANIFEST-audit-log.sha256 beside the trail.
   repair_ledger_tail   # seal's own steps append after the first pass; re-check before freezing custody
   cp -a "$AUDIT" "$D_LOG/audit.frozen.log" 2>/dev/null && ( cd "$OUTDIR" && printf '%s  %s\n' "$(irhash 99_logs/audit.frozen.log)" 99_logs/audit.frozen.log ) > "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Custody trail frozen + hashed."
+  cp -a "$D_LOG/run_state.jsonl" "$D_LOG/run_state.frozen.jsonl" 2>/dev/null && ( cd "$OUTDIR" && printf '%s  %s\n' "$(irhash 99_logs/run_state.frozen.jsonl)" 99_logs/run_state.frozen.jsonl ) >> "$OUTDIR/MANIFEST-audit-log.sha256" 2>/dev/null && audit "Completion ledger frozen + hashed."
 
   # ship the sealed bundle: scp/rsync to a collection server, and/or HTTP(S) POST to a lab collector
   if [ -n "$NETWORK_DEST" ] || [ -n "$HTTP_DEST" ]; then
