@@ -15,7 +15,7 @@ Status: ✅ tested & handled · ⚠️ tested, gap remains · ⬜ queued · 🔬
 
 ## Finding your way around this page
 
-56 sections, appended one investigation at a time. This index is GENERATED from the
+58 sections, appended one investigation at a time. This index is GENERATED from the
 headings (`tests/tools/build-catalogue-index.py`) and its anchors are checked in CI, because a
 hand-maintained index drifts and a stale index is worse than none - it sends a reader
 somewhere wrong while looking authoritative.
@@ -100,11 +100,13 @@ somewhere wrong while looking authoritative.
 
 **Other investigations**
 
+- [Finding your way around this page](#finding-your-way-around-this-page)
 - [Linux ship parity (2026-07-28)](#linux-ship-parity-2026-07-28)
 - [Exit-contract audit (2026-07-28)](#exit-contract-audit-2026-07-28)
 - [Linux parity for E4 - clock offset measurement (2026-07-29)](#linux-parity-for-e4---clock-offset-measurement-2026-07-29)
 - [Defect A CLOSED - a WMI outage now reaches the verdict layer (2026-07-29)](#defect-a-closed---a-wmi-outage-now-reaches-the-verdict-layer-2026-07-29)
 - [SUMMARY hoist confirmed live, and the sweep finds the worst defect yet (2026-07-29)](#summary-hoist-confirmed-live-and-the-sweep-finds-the-worst-defect-yet-2026-07-29)
+- [Should the snippet guard cover `run_step` too? No — and here is the bound (2026-07-30)](#should-the-snippet-guard-cover-run_step-too-no-and-here-is-the-bound-2026-07-30)
 
 
 ---
@@ -2781,3 +2783,39 @@ recording.
   collection whose case ID, hostname and a planted IOC string are known, so the assertion can fail;
 - and the artifact declared in `MANIFEST-README.txt` if it is written after the manifest, or it
   will be reported UNLISTED by the verifier — the exact trap the frozen ledger hit.
+
+---
+
+## Should the snippet guard cover `run_step` too? No — and here is the bound (2026-07-30)
+
+After the apostrophe regression, `tests/unit/test-snippet-syntax.sh` syntax-checks every shell
+string handed to `bash -c`. It extracts `run_sh` snippets only, which raised a fair coverage
+question: the collector also has `run_step`, and a shell string hiding there would be unguarded.
+
+Counted rather than assumed:
+
+| | |
+|---|---|
+| `run_step` matches in the file | 17 |
+| of which are comment lines | 3 — two documenting the signature at 417-418, one prose at 1558 |
+| actual call sites | 14 |
+| call sites invoking a shell interpreter | **1** — line 743, which *is* `run_sh`'s implementation |
+| `eval` anywhere in the collector | **0** |
+
+`run_step` takes **literal argv**, not a shell string: `uname -a`, `ps auxww`, `ip route`,
+`curl -fsS --max-time 3600 -T "$zip" "$url"`. There is no text for a shell to parse, so there is no
+syntax to check — the argument vector is passed straight to the process. The single site that does
+build a shell string is `run_sh` itself, which the guard already covers.
+
+**So the guard's coverage is complete for this defect class, and extending it would add nothing.**
+That is worth stating explicitly rather than leaving the question open: an unanswered "should we
+also check X?" reads like an admission of a gap, and this one is not.
+
+**The bound, stated so it can be re-checked.** The claim rests on there being no other way to reach
+an interpreter. Searched for and absent: `sh -c`, `$SHELL`, `zsh`, `dash`, and `eval`. If any of
+those appears later, or if a `run_step` site is ever changed to pass a command *string* rather than
+argv, this conclusion expires and the guard needs widening.
+
+**A different hazard that lives here and is deliberate:** line 1553 passes `$SSHOPT` unquoted, so
+it word-splits into separate options. That is intentional, and it is a word-splitting question, not
+a syntax one — `bash -n` would never have an opinion about it either way.
