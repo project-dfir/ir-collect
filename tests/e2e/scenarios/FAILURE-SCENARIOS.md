@@ -2399,3 +2399,141 @@ Twice in three iterations the gap has been **where a finding was recorded**, not
 correct: the reachability map was accurate in the catalogue and useless there until it moved next to
 `$script:FixLadders`; these fields were correct in `run_state.json` and unexplained until the README
 described them. Work that is right but unfindable is not finished.
+
+---
+
+## Verifying a bundle from the receiving end — the phase that found two real defects (2026-07-30)
+
+Every scenario above tests the collector while it *runs*. None of them asked the question the whole
+tool exists to answer: **when an analyst receives a sealed bundle, does it verify?**
+
+The README sold `SHA-256 manifest of all files` as the chain-of-custody feature. The words *verify*
+and *validate* appeared nowhere in it, no verifier shipped, and `Test-ManifestScript.ps1` tested the
+code that *writes* the manifest. A manifest nobody validates is a claim, not evidence.
+
+### The instrument
+
+`tools/verify-bundle.py` is for the receiving analyst, and is **independent by construction** —
+Python's `hashlib`, deliberately not `irhash` (Linux) or `Get-FileHash` (Windows). A verifier built
+from the code that produced the digests can only prove that code is self-consistent, which is not
+the question being asked.
+
+It reads both dialects, and reports three categories separately because they mean different things:
+
+| category | meaning |
+|---|---|
+| `MISMATCH` | a listed file's content changed since sealing |
+| `MISSING` | the manifest lists a file that is not present — usually an incomplete transfer |
+| `UNLISTED` | a file is present that the manifest does not list and the bundle does not declare as excluded — **the one a hash comparison alone never catches**, since every listed file still matches while something was *added* |
+
+The set of legitimately-unlisted files is read from the bundle's own
+`99_logs/MANIFEST-README.txt`, never hardcoded, so the tool and the document cannot drift apart. A
+missing or unparseable note is exit 2, not a pass: an unlisted file whose status cannot be
+established is exactly what tampering looks like.
+
+`tests/unit/test-verify-bundle.sh` is the positive control and it was written **first** — a verifier
+that cannot be made to fail proves nothing. It covers both dialects, all five tamper classes, the
+cries-wolf direction (a declared-excluded file must *not* raise an alarm), and the three
+cannot-verify cases.
+
+### Defect 1 — every bundle failed its own manifest (Linux)
+
+The first run against a real, freshly sealed, untampered bundle:
+
+```
+MISMATCH      : 1
+                ./99_logs/run_state.jsonl
+RESULT: FAILED
+```
+
+`run_state.jsonl` is the completion ledger, and the collector's own comment already knew why:
+*"seal's own steps (manifest, ship) append after the first pass."* The manifest hashed the ledger,
+then seal kept writing to it. `audit.log` and `errors.log` were excluded for exactly this reason;
+the ledger never was.
+
+So every bundle failed verification out of the box, on the file that records what happened — the
+cries-wolf failure in the worst available place. A check that always fails is a check that gets
+switched off, and then a real tamper goes unnoticed with it.
+
+### Defect 2 — the completion ledger was excluded but never sealed (Windows)
+
+Excluding the ledger was necessary but only half a fix. On Windows it was left with **no integrity
+seal at all**, so modification of the record of what the collector did was undetectable. Linux had
+been given both halves — exclude *and* freeze to `run_state.frozen.jsonl`, hashed into
+`MANIFEST-audit-log.sha256`. Windows now mirrors it.
+
+The seals were then proven **breakable and independent**, which matters more than both passing:
+
+```
+append to run_state.frozen.jsonl -> exit 1, ledger MISMATCH, audit trail still VERIFIED
+restore                          -> exit 0, both VERIFIED
+append to audit.frozen.log       -> exit 1, audit MISMATCH, ledger still VERIFIED
+```
+
+Independent failure rules out one shared failure mode being mistaken for two working protections.
+
+### What reality caught that the fixtures could not
+
+The verifier passed 27 synthetic assertions and then reported **every file in a real Windows bundle
+as MISSING**. Windows writes manifest paths with a *leading* backslash (`\00_metadata\x`);
+translated naively that becomes `/00_metadata/x`, which `os.path.join` treats as absolute and
+silently discards the bundle root, so every lookup landed at the filesystem root.
+
+**The fixture was the real defect.** It spelled Windows paths the Linux way, so the suite passed
+against a verifier that could not read an actual Windows manifest. It now writes the collector's
+exact spelling and *asserts that it does* — a fixture in the wrong dialect proves only that the code
+agrees with itself. This is the same lesson as Defect 1 from the other direction: fixtures are built
+from the same assumptions as the code, so they cannot contain the defects those assumptions cause.
+
+### Live results
+
+| bundle | result |
+|---|---|
+| Linux (redinfra01), after the fix | 42/42 hash-match, 0 MISMATCH / MISSING / UNLISTED, both custody trails VERIFIED |
+| Windows (WS02), after both fixes | 44/44 hash-match, 0 / 0 / 0, both custody trails VERIFIED |
+
+Each was tamper-controlled on the real artifact, not only in fixtures: one flipped byte gives exit 1
+and `RESULT: FAILED`; restoring gives exit 0 and `RESULT: VERIFIED`.
+
+### The limit, stated rather than implied
+
+**The manifest cannot cover itself** — nothing can hash itself — so anyone able to alter a file can
+recompute the manifest to match. This detects damage, truncation, partial transfer and casual
+tampering. It does **not** prove authenticity. That needs a signature over the manifest, or its
+digest recorded out-of-band when custody is taken. Every report the tool prints says so, and so does
+the README procedure, because a verifier that overstates what it proves is its own kind of defect.
+
+### What this phase cannot tell you
+
+The verifier compares a bundle against its own manifest. It cannot say whether the collection was
+*complete* or *correct* — only that what was sealed is what is present now. A bundle that verifies
+perfectly may still be missing evidence the collector never gathered.
+
+---
+
+## What `test-catalogue-consistency.sh` structurally cannot check (2026-07-30)
+
+This page is guarded in CI, and it is worth being precise about how far that guard reaches — a
+reader who assumes "the catalogue is tested" will trust it further than the test earns.
+
+The test compares the document **against itself and against the filesystem**. It catches a heading
+that contradicts its own table row, a `CLOSED` row missing its legend glyph, a referenced repo path
+that does not exist, a live-verified claim with no captured output anywhere on the page, and an
+`INVALID` control quietly losing its label. Every one of those is a *mechanical* property.
+
+What it cannot do, and never will without a different kind of instrument:
+
+- **Tell whether a claim is TRUE.** "Live-verified on WS02: 44/44" is checked only for the presence
+  of a fenced block somewhere below it. A fabricated block would pass. The defence against that is
+  the standing rule that every claim names what was measured, not a test.
+- **Tell whether a captured block belongs to the claim above it.** Fences and claims are counted,
+  not paired.
+- **Notice a scenario that is silently absent.** It asserts ≥20 rows, not that the rows describe
+  everything the collector can do. A failure mode nobody thought of leaves no trace here.
+- **Detect a stale citation.** Line numbers drift and the automated checker was withdrawn for
+  crying wolf (see the audit section above). Citation drift is still caught by hand.
+- **Judge whether a `CLOSED` row deserves it.** It reads the word, not the evidence.
+
+The honest summary: this test proves the page does not contradict *itself*. It proves nothing about
+whether the page is right. That is a real but narrow guarantee, and it is exactly the distinction
+this project keeps having to make about its own checks.
