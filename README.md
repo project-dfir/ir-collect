@@ -29,6 +29,8 @@ collectors/                                the shippable, path-coupled collector
   fetch-tools.ps1 / fetch-tools.sh    one-time kit builder            -- run on a trusted box
   loader.ps1 / loader.sh              in-guest bootstrap (read-only ISO / share launch)
   tools/                              open-source payload (fetched, not committed)
+tools/verify-bundle.py              verify a RECEIVED bundle against its manifest  -- analyst box
+                                    (note: distinct from collectors/tools/, which is the payload)
 detection/Build-DetectionContent.ps1  capture -> Splunk/Sigma/Suricata/Zeek + Navigator  -- analyst box
 mobile/                             mobile forensics                  -- run on the examiner box
   mobile-collect.sh / Mobile-Collect.ps1   Android + iOS logical acquisition + MVT triage
@@ -235,6 +237,42 @@ should read **before acting on the evidence or on the host**:
 `SUMMARY.md` carries the same findings in prose, and `99_logs/DIAGNOSTIC-REPORT.md` explains what
 failed, what self-heal attempted, and how to reproduce it.
 
+
+---
+
+### Verifying a bundle you received
+
+Do this **before** you analyse anything. A manifest nobody checks is a claim, not evidence.
+
+```
+python tools/verify-bundle.py /path/to/CASE001_HOST_20260730_051500Z
+```
+
+It needs only Python 3 — no dependencies, and deliberately **not** the collector's own hashing
+code. A verifier built from the code that produced the digests can only show that code is
+self-consistent, which is not the question you are asking.
+
+Exit `0` verified · `1` verification FAILED · `2` could not verify (say so; do not record a pass).
+
+| Result | What it means | What to do |
+|---|---|---|
+| `MISMATCH` | a listed file's content changed since sealing | Stop. Note it in the custody record before anything else. |
+| `MISSING` | the manifest lists a file that is not present | Usually an incomplete transfer — re-copy from source and re-verify. |
+| `UNLISTED` | a file is present that the manifest does not list **and** the bundle does not declare as excluded | The one a hash check alone never catches: every listed file still matches while something was *added*. |
+| `custody trail` | `99_logs/audit.frozen.log` and `99_logs/run_state.frozen.jsonl`, hashed separately | These are the record of what the collector did. Treat a mismatch here as seriously as one in the evidence. |
+
+Legitimately-unlisted files (the live `audit.log`, the manifest itself, and a few others) are read
+from the bundle's own `99_logs/MANIFEST-README.txt` — the tool never carries its own copy of that
+list, so the two cannot drift apart. If that note is missing or unreadable the tool exits `2`
+rather than guessing, because an unlisted file whose status cannot be established is exactly what
+tampering looks like.
+
+**The limit, stated plainly.** The manifest cannot cover itself — nothing can hash itself — so
+anyone able to alter a file can recompute the manifest to match. This detects damage, truncation,
+partial transfer and casual tampering. It does **not** prove authenticity. For that you need a
+signature over the manifest, or its digest recorded out-of-band at collection time and carried
+separately from the bundle. Record that digest when you take custody; it costs one line and it is
+the only thing that closes this gap.
 
 ---
 

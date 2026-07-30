@@ -165,6 +165,26 @@ rm -f "$B/99_logs/MANIFEST-SHA256.csv"
 rc=$(run_verify "$B")
 check "$([ "$rc" = 2 ] && echo 1 || echo 0)" "a bundle with no manifest is CANNOT-VERIFY, not VERIFIED"
 
+# --- 9. the procedure must be DOCUMENTED, or the verifier is unfindable --------------------
+# This project's recurring failure is not wrong work, it is work nobody can locate: a help block
+# Get-Help never rendered, diagnostics no README explained, a reachability map filed in the wrong
+# document. A verifier an analyst does not know to run protects nothing, so its documentation is a
+# tested property rather than a good intention.
+RM="$REPO/README.md"
+if [ ! -f "$RM" ] || [ "$(wc -l < "$RM")" -lt 100 ]; then
+    echo "FAIL  README.md missing or implausibly short - cannot judge documentation, NOT reporting clean"
+    exit 2
+fi
+docref() { # docref <fixed-string> <description>
+    if grep -qF -- "$1" "$RM"; then printf 'ok    %s\n' "$2"
+    else printf 'FAIL  %s\n' "$2"; FAIL=$((FAIL+1)); fi
+}
+docref 'tools/verify-bundle.py'        'README tells an analyst the verifier exists'
+docref 'MISMATCH'                      'README explains the MISMATCH category'
+docref 'UNLISTED'                      'README explains the UNLISTED category'
+docref 'cannot cover itself'           'README states the limit: the manifest cannot cover itself'
+docref 'does **not** prove authenticity' 'README says plainly that this is not proof of authenticity'
+
 echo
 if [ "$FAIL" = 0 ]; then echo "all assertions passed"; else echo "$FAIL failed"; fi
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)
