@@ -2593,3 +2593,45 @@ existing invocations, so it stays as-is and is written down here instead.
 the audit trail when `-Authorizer` is absent, and that trail is itself hashed — but a bundle
 collected with empty custody fields still verifies, correctly, because nothing was tampered with.
 Whether a collection is admissible is a question about the operator's process, not about the tool.
+
+---
+
+## proc-exe fails rc=2 on every Linux run — narrowed, NOT solved (2026-07-30)
+
+Every Linux collection reports `INCOMPLETE` with `proc-exe` in the failed list, and has done so
+since before the apostrophe regression. The step is:
+
+```
+run_sh proc-exe proc_exe.txt "$D_VOL" 60 1 'ls -l /proc/*/exe 2>/dev/null | grep -a deleted; echo "=== all exe links ==="; ls -l /proc/*/exe 2>/dev/null'
+```
+
+**Ruled out: a syntax error.** `rc=2` was the same code `meta-volkeys` returned when an apostrophe
+truncated its snippet, and the resemblance is what made this look like a second instance of that
+defect. It is not. `proc-exe` is a `run_sh` snippet, the extractor picks it up, and `bash -n`
+passes — the snippet guard reports it clean. **rc=2 is not a syntax code; it is just an exit
+status, and `ls` uses 2 for "serious trouble", which includes a file that vanished between glob
+expansion and `stat`.**
+
+**Hypothesis, and why it is only that.** `/proc/*/exe` is inherently racy: a process that exits
+between the glob and the stat makes `ls` fail. That would explain a step that fails on a busy host
+and passes on a quiet one. It could not be reproduced locally — 8 attempts under deliberate
+process churn (hundreds of short-lived children) all returned rc=0, and a plain run of the exact
+snippet also returned 0. So the mechanism is plausible and **unestablished**.
+
+**Why the cause is invisible in the bundle.** Both `ls` invocations carry `2>/dev/null`. That is
+deliberate — unreadable `/proc` entries are noise — but it means the step's own failure reason is
+discarded before the collector's per-step stderr capture can see it. `errors.log` can therefore
+only ever say `proc-exe : failed rc=2 cls=unknown`. Whatever the cause turns out to be, a step
+that fails on every run while destroying its own explanation is the harder half of this problem.
+
+**Why it matters more than one step.** A step that always fails makes `INCOMPLETE` the normal
+verdict for every Linux collection, and the run exits 15 (incomplete-critical) every time. That is
+the cries-wolf failure applied to the completeness verdict itself — and it is not hypothetical:
+it is exactly why two live runs during the verification phase were read past at `exit=15` while
+`meta-volkeys` was silently broken underneath. A permanently-red signal trained the reader, who
+was me, to ignore it.
+
+**What would settle it**, when the range host is reachable again: run the snippet on redinfra01
+with stderr captured rather than discarded, and record the rc together with what `ls` actually
+complained about. Not a fix based on the guess above — the guess failed its first reproduction
+attempt, and a fix built on it would be a change whose effect nobody measured.
